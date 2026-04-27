@@ -83,6 +83,33 @@ var _registered_editor_name: String = ""
 
 var _ctx: Dictionary = {}
 
+# ── Edge enumeration / overlay state ────────────────────────────────────────
+
+## Per-pane EdgeOverlay refs (the EdgeOverlayRoot Control nodes, scripted with
+## scripts/edge_overlay.gd). Map view_id (str) → Control. Untyped values for
+## off-tree class_name discipline.
+var _edge_overlays: Dictionary = {}
+
+## Last-known edge registry (Array of edge dicts). Built either from the IPC
+## mcad_list_edges reply or synthesised from the stub cube in _ready().
+var _edge_registry: Array = []
+
+## Last-known mesh data (passed to EdgeOverlay so it can rebuild silhouettes
+## on camera moves).
+var _last_mesh_data: Dictionary = {}
+
+## Currently selected edge id (mirrored to host + Tree). -1 = none.
+var _selected_edge_id: int = -1
+
+## Tree node in the wide sidebar listing all edges. Built in _ready().
+var _edge_tree: Tree = null
+
+## Map edge_id → TreeItem so we can sync selection both directions.
+var _edge_tree_items: Dictionary = {}
+
+## Re-entrancy guard for tree → panel selection routing.
+var _suppress_tree_selection: bool = false
+
 ## Projection dropdown options (id → preset string accepted by orbit_camera).
 const _PROJECTION_OPTIONS: Array = [
 	{"id": 0, "label": "Perspective", "preset": "Perspective"},
@@ -189,6 +216,33 @@ func _ready() -> void:
 	_iso_view_container.add_child(_canvas)
 	_annotation_host.set_active_viewport(_active_viewport_id)
 
+	# ── Edge overlay wiring (one EdgeOverlay per SubViewport) ──────────────
+	# Resolve and store refs to all five EdgeOverlayRoot Control nodes that
+	# already live in the .tscn under each SubViewport.
+	_edge_overlays["top"]   = get_node_or_null(grid + "/TopView/SubViewport/EdgeOverlayRoot")
+	_edge_overlays["front"] = get_node_or_null(grid + "/FrontView/SubViewport/EdgeOverlayRoot")
+	_edge_overlays["right"] = get_node_or_null(grid + "/RightView/SubViewport/EdgeOverlayRoot")
+	_edge_overlays["iso"]   = get_node_or_null(grid + "/IsoView/SubViewport/EdgeOverlayRoot")
+	_edge_overlays["single"] = get_node_or_null(
+		"ResponsiveContainer/NarrowLayout/SingleView/SubViewport/EdgeOverlayRoot")
+	for ov_id in _edge_overlays.keys():
+		var ov: Control = _edge_overlays[ov_id] as Control
+		if ov != null and ov.has_signal("edge_selected"):
+			ov.connect("edge_selected", Callable(self, "_on_edge_selected"))
+
+	# ── Synthesize an edge registry for the stub cube ──────────────────────
+	# When a real .mcad source is evaluated by the worker, a future grandchild
+	# will replace this with the worker's mcad_list_edges reply. For Round-3
+	# the cube is a deterministic 12-edge box and we can compute the registry
+	# locally — no IPC round-trip required.
+	_edge_registry = _synthesize_cube_edge_registry(stub_data)
+	_last_mesh_data = stub_data
+	_push_edges_to_overlays()
+
+	# ── Wide-mode sidebar: edge Tree + Prev/Next/Clear buttons ─────────────
+	_build_edge_sidebar()
+	_render_edge_tree(_edge_registry)
+
 	# ── Connect ResponsiveContainer width-class signal & apply initial mode
 	_responsive.width_class_changed.connect(_on_width_class_changed)
 	# Apply the initial layout state so toolbar/canvas are correctly placed
@@ -272,6 +326,12 @@ func _apply_width_class(cls: StringName) -> void:
 	# overlap between layouts but resolve to different SubViewports).
 	_register_host_viewports(is_narrow)
 
+	# Active edge-pick pane shifts wide↔narrow; ortho x-ray for the narrow
+	# single view also depends on the current dropdown selection.
+	if not _edge_overlays.is_empty():
+		_apply_active_overlay_filter()
+		_apply_mesh_visibility()
+
 
 ## Populate Cad_AnnotationHost's viewport map for the active layout. Called
 ## from _ready() (initial state) and _apply_width_class() (transitions).
@@ -348,6 +408,14 @@ func _on_projection_selected(index: int) -> void:
 	_active_viewport_id = _projection_preset_to_viewport_id(preset)
 	if _annotation_host != null and _annotation_host.has_method("set_active_viewport"):
 		_annotation_host.set_active_viewport(_active_viewport_id)
+	# Push the new preset down to the single-view EdgeOverlay (so it switches
+	# between perspective-pick mode and ortho x-ray rendering) and toggle the
+	# single-view mesh accordingly.
+	var single_ov: Control = _edge_overlays.get("single", null) as Control
+	if single_ov != null and single_ov.has_method("set_overlay_data"):
+		single_ov.call("set_overlay_data",
+			_single_view_camera, _edge_registry, preset, Vector3.ZERO, _last_mesh_data)
+	_apply_mesh_visibility()
 
 
 ## Return the preset string ("Perspective", "Top", ...) currently selected in
@@ -365,6 +433,337 @@ func _current_projection_preset() -> String:
 ## Cad_AnnotationHost.get_view_context().
 func _projection_preset_to_viewport_id(preset: String) -> String:
 	return preset.to_lower()
+
+
+# ── Edge overlay / sidebar wiring ───────────────────────────────────────────
+
+## Build the wide-mode edge Tree under WideSidebar (below AnnotationToolbar).
+## Three buttons (Prev / Next / Clear) sit beneath the tree. Both the tree
+## and the buttons live in the same VBoxContainer as the toolbar, so the
+## sidebar shows toolbar-then-edges in wide mode.
+func _build_edge_sidebar() -> void:
+	if _wide_sidebar == null:
+		return
+
+	var hr := HSeparator.new()
+	hr.name = "EdgeSidebarSeparator"
+	_wide_sidebar.add_child(hr)
+
+	var label := Label.new()
+	label.name = "EdgeSidebarHeader"
+	label.text = "Logical Edges"
+	label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_wide_sidebar.add_child(label)
+
+	_edge_tree = Tree.new()
+	_edge_tree.name = "EdgeTree"
+	_edge_tree.focus_mode = Control.FOCUS_NONE
+	_edge_tree.hide_root = true
+	_edge_tree.columns = 3
+	_edge_tree.set_column_title(0, "id")
+	_edge_tree.set_column_title(1, "len/r")
+	_edge_tree.set_column_title(2, "kind")
+	_edge_tree.set_column_titles_visible(true)
+	_edge_tree.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_edge_tree.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_edge_tree.custom_minimum_size = Vector2(0, 180)
+	_edge_tree.item_selected.connect(_on_edge_tree_item_selected)
+	_wide_sidebar.add_child(_edge_tree)
+
+	var btn_row := HBoxContainer.new()
+	btn_row.name = "EdgeButtons"
+	btn_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_wide_sidebar.add_child(btn_row)
+
+	var prev_btn := Button.new()
+	prev_btn.text = "Prev"
+	prev_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	prev_btn.pressed.connect(_on_prev_edge_pressed)
+	btn_row.add_child(prev_btn)
+
+	var next_btn := Button.new()
+	next_btn.text = "Next"
+	next_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	next_btn.pressed.connect(_on_next_edge_pressed)
+	btn_row.add_child(next_btn)
+
+	var clear_btn := Button.new()
+	clear_btn.text = "Clear"
+	clear_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	clear_btn.pressed.connect(_on_clear_edge_pressed)
+	btn_row.add_child(clear_btn)
+
+
+## Populate the edge Tree from the current edge_registry.
+func _render_edge_tree(edges: Array) -> void:
+	if _edge_tree == null:
+		return
+	_edge_tree.clear()
+	_edge_tree_items.clear()
+	var root := _edge_tree.create_item()
+	if edges.is_empty():
+		var empty_item := _edge_tree.create_item(root)
+		empty_item.set_text(0, "")
+		empty_item.set_text(1, "(no edges)")
+		empty_item.set_text(2, "")
+		return
+	# Sort by edge id ascending.
+	var sorted: Array = edges.duplicate()
+	sorted.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+		return int(a.get("id", 0)) < int(b.get("id", 0))
+	)
+	for edge_info in sorted:
+		if not (edge_info is Dictionary):
+			continue
+		var edge_id := int(edge_info.get("id", 0))
+		var kind := str(edge_info.get("kind", "straight"))
+		var measure_text := ""
+		if kind == "circle":
+			measure_text = "%.1f" % float(edge_info.get("radius", 0.0))
+		else:
+			measure_text = "%.1f" % float(edge_info.get("length", 0.0))
+		var item := _edge_tree.create_item(root)
+		item.set_text(0, str(edge_id))
+		item.set_metadata(0, edge_id)
+		item.set_text(1, measure_text)
+		item.set_text(2, kind)
+		_edge_tree_items[edge_id] = item
+
+
+## Push the current edge registry + mesh + active-pane wiring to every
+## EdgeOverlay. Called whenever a new mesh/edge set arrives or when layout
+## transitions change which pane is the active edge-pick target.
+func _push_edges_to_overlays() -> void:
+	# View-id → preset string for set_overlay_data.
+	var view_presets := {
+		"top": "Top",
+		"front": "Front",
+		"right": "Right",
+		"iso": "Perspective",
+		"single": _current_projection_preset(),
+	}
+	# View-id → Camera3D
+	var view_cameras := {
+		"top":   $ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/TopView/SubViewport/OrbitCamera,
+		"front": $ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/FrontView/SubViewport/OrbitCamera,
+		"right": $ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/RightView/SubViewport/OrbitCamera,
+		"iso":   $ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/IsoView/SubViewport/OrbitCamera,
+		"single": _single_view_camera,
+	}
+	var center := Vector3.ZERO
+	for ov_id in _edge_overlays.keys():
+		var ov: Control = _edge_overlays[ov_id] as Control
+		if ov == null:
+			continue
+		var cam: Camera3D = view_cameras.get(ov_id, null)
+		var preset: String = view_presets.get(ov_id, "Perspective")
+		if ov.has_method("set_overlay_data"):
+			ov.call("set_overlay_data", cam, _edge_registry, preset, center, _last_mesh_data)
+		ov.visible = true
+
+	# Active edge-pick pane: STOP; others: IGNORE. The active pane in wide mode
+	# is the iso quadrant; in narrow mode it's the single view.
+	_apply_active_overlay_filter()
+	# Mesh visibility for ortho panes (x-ray view) vs Iso/Perspective.
+	_apply_mesh_visibility()
+
+
+## Set mouse_filter on each EdgeOverlay so only the active pane intercepts
+## clicks. Wide mode → "iso". Narrow mode → "single".
+func _apply_active_overlay_filter() -> void:
+	var is_narrow := _narrow_layout != null and _narrow_layout.visible
+	var active_id := "single" if is_narrow else "iso"
+	for ov_id in _edge_overlays.keys():
+		var ov: Control = _edge_overlays[ov_id] as Control
+		if ov == null:
+			continue
+		ov.mouse_filter = (Control.MOUSE_FILTER_STOP
+				if String(ov_id) == active_id
+				else Control.MOUSE_FILTER_IGNORE)
+
+
+## Hide the shaded mesh in ortho-only panes (Top/Front/Right; narrow non-
+## perspective) so the edge overlay is the only visualisation. Iso /
+## Perspective keeps the mesh visible for shaded 3-D context.
+func _apply_mesh_visibility() -> void:
+	var grid := "ResponsiveContainer/WideLayout/VBoxContainer/GridContainer"
+	# Wide-layout panes: Top/Front/Right hide mesh; Iso shows it.
+	_set_pane_mesh_visible(grid + "/TopView/SubViewport/MeshRoot", false)
+	_set_pane_mesh_visible(grid + "/FrontView/SubViewport/MeshRoot", false)
+	_set_pane_mesh_visible(grid + "/RightView/SubViewport/MeshRoot", false)
+	_set_pane_mesh_visible(grid + "/IsoView/SubViewport/MeshRoot", true)
+	# Narrow single view: hide mesh unless the projection is Perspective.
+	var single_path := "ResponsiveContainer/NarrowLayout/SingleView/SubViewport/MeshRoot"
+	var preset := _current_projection_preset()
+	_set_pane_mesh_visible(single_path, preset == "Perspective")
+
+
+## Toggle the MeshInstance3D inside a MeshRoot. Found by the well-known child
+## name "MeshInstance" set in mesh_display.gd._ready().
+func _set_pane_mesh_visible(mesh_root_path: String, visible_flag: bool) -> void:
+	var mesh_root := get_node_or_null(mesh_root_path)
+	if mesh_root == null:
+		return
+	var mi := mesh_root.get_node_or_null("MeshInstance")
+	if mi != null and "visible" in mi:
+		mi.visible = visible_flag
+
+
+## Edge selection routing — called from EdgeOverlay clicks, from the Tree, and
+## from Prev/Next buttons. Highlights all panes, syncs the Tree, and pushes
+## the new id to Cad_AnnotationHost so MCP queries can read it.
+func _set_selected_edge_id(edge_id: int, sync_tree: bool = true) -> void:
+	if _selected_edge_id == edge_id:
+		if sync_tree:
+			_sync_tree_selection()
+		return
+	_selected_edge_id = edge_id
+	# Highlight in every pane.
+	for ov_id in _edge_overlays.keys():
+		var ov: Control = _edge_overlays[ov_id] as Control
+		if ov != null and ov.has_method("set_selected_edge"):
+			ov.call("set_selected_edge", edge_id)
+	# Mirror to host for MCP visibility.
+	if _annotation_host != null and _annotation_host.has_method("set_selected_edge_id"):
+		_annotation_host.set_selected_edge_id(edge_id)
+	if sync_tree:
+		_sync_tree_selection()
+
+
+func _on_edge_selected(edge_id: int) -> void:
+	_set_selected_edge_id(edge_id)
+
+
+func _on_edge_tree_item_selected() -> void:
+	if _suppress_tree_selection or _edge_tree == null:
+		return
+	var item: TreeItem = _edge_tree.get_selected()
+	if item == null:
+		return
+	var meta: Variant = item.get_metadata(0)
+	if meta == null:
+		return
+	_set_selected_edge_id(int(meta), false)
+
+
+func _sync_tree_selection() -> void:
+	if _edge_tree == null:
+		return
+	_suppress_tree_selection = true
+	if _selected_edge_id != -1 and _edge_tree_items.has(_selected_edge_id):
+		var item: TreeItem = _edge_tree_items[_selected_edge_id]
+		_edge_tree.set_selected(item, 0)
+		_edge_tree.scroll_to_item(item, true)
+	else:
+		_edge_tree.deselect_all()
+	_suppress_tree_selection = false
+
+
+func _on_prev_edge_pressed() -> void:
+	_step_selected_edge(-1)
+
+
+func _on_next_edge_pressed() -> void:
+	_step_selected_edge(1)
+
+
+func _on_clear_edge_pressed() -> void:
+	_set_selected_edge_id(-1)
+
+
+func _step_selected_edge(delta: int) -> void:
+	var ids: Array = []
+	for edge_info in _edge_registry:
+		if edge_info is Dictionary:
+			ids.append(int(edge_info.get("id", 0)))
+	ids.sort()
+	if ids.is_empty():
+		_set_selected_edge_id(-1)
+		return
+	if _selected_edge_id == -1:
+		_set_selected_edge_id(ids[0] if delta >= 0 else ids[ids.size() - 1])
+		return
+	var idx := ids.find(_selected_edge_id)
+	if idx == -1:
+		_set_selected_edge_id(ids[0])
+		return
+	var next_idx := posmod(idx + delta, ids.size())
+	_set_selected_edge_id(ids[next_idx])
+
+
+## Build a minimal edge registry for the unit-cube stub. 12 straight edges,
+## ids 1..12. Dict shape matches the worker's mcad_list_edges contract: id,
+## start, end, midpoint, center, radius, normal, kind, source_plane,
+## axis_name, length, visible_in_views.
+func _synthesize_cube_edge_registry(mesh_data: Dictionary) -> Array:
+	var verts: Variant = mesh_data.get("vertices", [])
+	if not (verts is Array) or (verts as Array).size() < 8:
+		return []
+	# Dedup edges from triangles (matches mesh_display._accumulate_edge logic
+	# but in registry form).
+	var faces: Variant = mesh_data.get("faces", [])
+	if not (faces is Array):
+		return []
+	var seen: Dictionary = {}
+	var registry: Array = []
+	var next_id: int = 1
+	for face in faces:
+		if not (face is Array) or face.size() < 3:
+			continue
+		var ia := int(face[0])
+		var ib := int(face[1])
+		var ic := int(face[2])
+		var edge_pairs := [
+			[ia, ib],
+			[ib, ic],
+			[ic, ia],
+		]
+		for pair in edge_pairs:
+			var a_idx: int = pair[0]
+			var b_idx: int = pair[1]
+			var key := "%d|%d" % [mini(a_idx, b_idx), maxi(a_idx, b_idx)]
+			if seen.has(key):
+				continue
+			seen[key] = true
+			var va: Array = verts[a_idx]
+			var vb: Array = verts[b_idx]
+			var sa := Vector3(float(va[0]), float(va[1]), float(va[2]))
+			var sb := Vector3(float(vb[0]), float(vb[1]), float(vb[2]))
+			# For a cube, the diagonals on each face also show up here; filter
+			# by axis-alignment (any two coords equal between sa and sb means
+			# it's an axis-aligned edge).
+			var axis_aligned := (
+				(is_equal_approx(sa.x, sb.x) and is_equal_approx(sa.y, sb.y)) or
+				(is_equal_approx(sa.y, sb.y) and is_equal_approx(sa.z, sb.z)) or
+				(is_equal_approx(sa.x, sb.x) and is_equal_approx(sa.z, sb.z))
+			)
+			if not axis_aligned:
+				continue
+			var mid := (sa + sb) * 0.5
+			var length_val := sa.distance_to(sb)
+			var axis_name: String = "x"
+			if not is_equal_approx(sa.x, sb.x):
+				axis_name = "x"
+			elif not is_equal_approx(sa.y, sb.y):
+				axis_name = "y"
+			else:
+				axis_name = "z"
+			registry.append({
+				"id": next_id,
+				"start": [sa.x, sa.y, sa.z],
+				"end": [sb.x, sb.y, sb.z],
+				"midpoint": [mid.x, mid.y, mid.z],
+				"center": [mid.x, mid.y, mid.z],
+				"radius": 0.0,
+				"normal": [0.0, 0.0, 1.0],
+				"kind": "straight",
+				"source_plane": "",
+				"axis_name": axis_name,
+				"length": length_val,
+				"visible_in_views": ["top", "front", "right", "iso"],
+			})
+			next_id += 1
+	return registry
 
 
 # ── Toolbar → canvas plumbing ──────────────────────────────────────────────
