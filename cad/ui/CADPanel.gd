@@ -46,8 +46,10 @@ var _iso_view_container: SubViewportContainer = null
 
 ## Single SubViewportContainer used in NARROW layout. Its OrbitCamera's preset
 ## is updated by the projection dropdown.
+## Camera typed as Camera3D (base) — OrbitCamera class_name is plugin-local and
+## not resolvable from off-tree. set_view_preset() called via duck typing.
 var _single_view_container: SubViewportContainer = null
-var _single_view_camera: OrbitCamera = null
+var _single_view_camera: Camera3D = null
 
 ## Projection dropdown used to switch the single-view camera preset.
 var _projection_dropdown: OptionButton = null
@@ -126,7 +128,7 @@ func _ready() -> void:
 
 	# ── Narrow-layout single viewport ──────────────────────────────────────
 	_single_view_container = $ResponsiveContainer/NarrowLayout/SingleView as SubViewportContainer
-	_single_view_camera = $ResponsiveContainer/NarrowLayout/SingleView/SubViewport/OrbitCamera as OrbitCamera
+	_single_view_camera = $ResponsiveContainer/NarrowLayout/SingleView/SubViewport/OrbitCamera as Camera3D
 
 	# ── Projection dropdown ────────────────────────────────────────────────
 	_projection_dropdown = $ResponsiveContainer/NarrowLayout/ProjectionRow/ProjectionDropdown as OptionButton
