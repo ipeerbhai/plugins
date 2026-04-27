@@ -14,6 +14,14 @@ extends MinervaPluginPanel
 ##
 ## class_name prefix "Cad" = canonical_prefix("cad")
 ## per design §6.1: plugin_id.replace("_","").lower() → first-upper.
+##
+## Off-tree note: this plugin lives at ~/github/plugins/cad/, OUTSIDE Minerva's
+## res:// tree, so Godot's class_name parser cache can't see Cad_AnnotationHost.
+## We use preload() with a script-relative path (works regardless of res://-or-not)
+## and type the field with the Minerva-side base class AnnotationHost (which IS
+## class_name-registered) instead of the plugin's own subclass.
+
+const _CadAnnotationHostScript: Script = preload("CadAnnotationHost.gd")
 
 # ── Node references (set in _ready) ────────────────────────────────────────
 
@@ -26,7 +34,7 @@ var _iso_view_container: SubViewportContainer = null
 # ── Annotation substrate ────────────────────────────────────────────────────
 
 var _annotation_registry: AnnotationRegistry = null
-var _annotation_host: Cad_AnnotationHost = null
+var _annotation_host: AnnotationHost = null  # actual class is Cad_AnnotationHost; see preload above
 
 ## Editor name under which we registered our host with AnnotationHostRegistry.
 ## Tracked so _on_panel_unload can deregister the same key even if the tab is
@@ -51,9 +59,9 @@ func _ready() -> void:
 	# "Perspective" in orbit_camera.gd's var declaration; we override here
 	# rather than storing private vars in the .tscn (which would cause
 	# unknown-property warnings since they are not @export).
-	var top_cam: OrbitCamera = $HSplitContainer/VBoxContainer/GridContainer/TopView/SubViewport/OrbitCamera
-	var front_cam: OrbitCamera = $HSplitContainer/VBoxContainer/GridContainer/FrontView/SubViewport/OrbitCamera
-	var right_cam: OrbitCamera = $HSplitContainer/VBoxContainer/GridContainer/RightView/SubViewport/OrbitCamera
+	var top_cam: Camera3D =$HSplitContainer/VBoxContainer/GridContainer/TopView/SubViewport/OrbitCamera
+	var front_cam: Camera3D =$HSplitContainer/VBoxContainer/GridContainer/FrontView/SubViewport/OrbitCamera
+	var right_cam: Camera3D =$HSplitContainer/VBoxContainer/GridContainer/RightView/SubViewport/OrbitCamera
 	# IsoView camera stays at "Perspective" default — no call needed.
 	if top_cam != null:
 		top_cam.set_view_preset("Top")
@@ -75,7 +83,7 @@ func _ready() -> void:
 	# It is a class_name'd script (no autoload), so it will be available
 	# after Unit D wires this plugin into the Minerva project.
 
-	_annotation_host = Cad_AnnotationHost.new()
+	_annotation_host = _CadAnnotationHostScript.new()
 	_annotation_host._registry = _annotation_registry
 
 	# TODO(scaffold-round-2): create one AnnotationCanvas per viewport,

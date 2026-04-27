@@ -130,6 +130,7 @@ func pluginRootDir() (string, error) {
 func initRegistry() {
 	registry = tools.NewRegistry()
 	registry.Register(tools.Validate, tools.HandleValidate)
+	registry.Register(tools.ListEdges, tools.HandleListEdges)
 }
 
 // ---------------------------------------------------------------------------

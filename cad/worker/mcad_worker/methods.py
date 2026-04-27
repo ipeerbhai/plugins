@@ -5,15 +5,23 @@ Callers pass a decoded request dict and receive a response dict.
 
 Per design §8, only `init` and `shutdown` are real in Round 1 (scaffold).
 Round 2 Unit A adds a real `validate` implementation.
-The four remaining geometry methods return stub errors; they will be filled
-in by per-tool grandchildren.
+Round 3 Unit A adds real `evaluate` and `list_edges` implementations.
+The two remaining geometry methods (export, deviation) return stub errors;
+they will be filled in by per-tool grandchildren.
 """
 
 from __future__ import annotations
 
 import traceback
+from typing import Optional, Tuple
 
 WORKER_VERSION = "0.1.0"
+
+# Module-level last-program cache (design §5).
+# Keyed by hash(source); holds the last evaluation result as a plain dict.
+# Size 1: replaced on each new source. Threadsafe is not required — the worker
+# is single-threaded by design (§2 process model).
+_last_program: Optional[Tuple[int, dict]] = None
 
 # Best-effort OCCT version string, resolved once at module import.
 _OCCT_VERSION: str = "unknown"
@@ -35,6 +43,154 @@ try:
     _BUILD123D_VERSION = getattr(build123d, "__version__", "unknown")
 except Exception:
     pass
+
+
+def _evaluate(params: dict) -> dict:
+    """Run the full mcad pipeline (lex → parse → translate → tessellate).
+
+    Returns {ok: True, result: {shape_name, mesh: {vertices, faces}, edges}}
+    or {ok: False, error: {kind, message, ...}}.
+
+    Maintains the module-level ``_last_program`` cache (design §5): if the
+    same source is evaluated twice, the second call returns the cached dict
+    without re-tessellating.
+    """
+    global _last_program
+
+    source = params.get("source")
+    if not isinstance(source, str):
+        return {
+            "ok": False,
+            "error": {
+                "kind": "internal",
+                "message": "evaluate requires params.source: str",
+            },
+        }
+
+    tolerance: float = float(params.get("tolerance", 0.1))
+    angular_tolerance: float = float(params.get("angular_tolerance", 0.1))
+
+    h = hash(source)
+    if _last_program is not None and _last_program[0] == h:
+        return {"ok": True, "result": _last_program[1]}
+
+    try:
+        from mcad.evaluator import EvaluationError, evaluate_source
+        from mcad.lexer import LexError
+        from mcad.parser import ParseError
+        from mcad.translator import TranslatorError
+    except ImportError as exc:
+        return {
+            "ok": False,
+            "error": {
+                "kind": "internal",
+                "message": f"mcad package unavailable: {exc}",
+            },
+        }
+
+    try:
+        result = evaluate_source(
+            source,
+            tolerance=tolerance,
+            angular_tolerance=angular_tolerance,
+        )
+    except LexError as exc:
+        # LexError is not wrapped by EvaluationError; lex is conceptually part
+        # of the parse phase per design §7. Surface as kind: "parse" with
+        # line/col from the exception attributes.
+        return {
+            "ok": False,
+            "error": {
+                "kind": "parse",
+                "message": str(exc),
+                "details": {
+                    "line": getattr(exc, "line", 0),
+                    "col": getattr(exc, "col", 0),
+                },
+            },
+        }
+    except EvaluationError as exc:
+        # EvaluationError wraps both ParseError and TranslatorError (and plain
+        # "no 3D part produced" / "tessellation produced no mesh data" messages).
+        # We inspect the __cause__ to pick the right kind.
+        cause = exc.__cause__
+        if isinstance(cause, ParseError):
+            kind = "parse"
+            tok = getattr(cause, "token", None)
+            detail: dict = {}
+            if tok is not None:
+                detail = {"line": tok.line, "col": tok.col}
+            return {
+                "ok": False,
+                "error": {
+                    "kind": kind,
+                    "message": str(exc),
+                    "details": detail,
+                },
+            }
+        if isinstance(cause, TranslatorError):
+            return {
+                "ok": False,
+                "error": {
+                    "kind": "translate",
+                    "message": str(exc),
+                },
+            }
+        # No typed cause or unrecognised cause → treat as OCCT/build123d error.
+        return {
+            "ok": False,
+            "error": {
+                "kind": "occt",
+                "message": str(exc),
+            },
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": {
+                "kind": "python",
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+            },
+        }
+
+    result_dict: dict = {
+        "shape_name": result.shape_name,
+        "mesh": result.mesh,
+        "edges": result.edges,
+    }
+    _last_program = (h, result_dict)
+    return {"ok": True, "result": result_dict}
+
+
+def _list_edges(params: dict) -> dict:
+    """Return just the edges list for a given source (design §8.4).
+
+    Reuses the ``_last_program`` cache when the source was evaluated recently,
+    avoiding a redundant tessellation pass.
+    """
+    global _last_program
+
+    source = params.get("source")
+    if not isinstance(source, str):
+        return {
+            "ok": False,
+            "error": {
+                "kind": "internal",
+                "message": "list_edges requires params.source: str",
+            },
+        }
+
+    h = hash(source)
+    if _last_program is not None and _last_program[0] == h:
+        return {"ok": True, "result": _last_program[1]["edges"]}
+
+    # Cache miss — run the full evaluate pipeline.
+    response = _evaluate({"source": source})
+    if not response.get("ok"):
+        return response  # propagate error unchanged
+
+    return {"ok": True, "result": response["result"]["edges"]}
 
 
 def _stub_not_implemented(req: dict) -> dict:
@@ -163,8 +319,18 @@ def handle_request(req: dict) -> dict | None:
         result["id"] = req_id
         return result
 
-    # Four remaining geometry stubs — filled in by per-tool grandchildren.
-    if method in ("evaluate", "export", "list_edges", "deviation"):
+    if method == "evaluate":
+        result = _evaluate(req.get("params") or {})
+        result["id"] = req_id
+        return result
+
+    if method == "list_edges":
+        result = _list_edges(req.get("params") or {})
+        result["id"] = req_id
+        return result
+
+    # Two remaining geometry stubs — filled in by per-tool grandchildren.
+    if method in ("export", "deviation"):
         return _stub_not_implemented(req)
 
     # Unknown method.
