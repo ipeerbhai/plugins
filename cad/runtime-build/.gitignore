@@ -1,0 +1,4 @@
+# Build outputs (per-platform Python runtime archives) go here.
+# Gitignored to keep the source repo small.
+# Each platform's tar.zst is ~100MB; see parent README for context.
+*.tar.zst

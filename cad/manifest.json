@@ -1,0 +1,72 @@
+{
+  "id": "cad",
+  "name": "CAD",
+  "version": "0.1.0",
+  "host_api_version": "1",
+  "backend": {
+    "transport": "stdio",
+    "entrypoint": "./cad-plugin",
+    "args": []
+  },
+  "tools": [],
+  "ui": {
+    "panels": [
+      {
+        "name": "cad_panel",
+        "kind": "godot_scene",
+        "entry_scene": "ui/CADPanel.tscn",
+        "scripts": [
+          "ui/CADPanel.gd",
+          "ui/CadAnnotationHost.gd",
+          "ui/scripts/mesh_display.gd",
+          "ui/scripts/edge_overlay.gd",
+          "ui/scripts/orbit_camera.gd"
+        ],
+        "file_extensions": [".mcad"],
+        "ipc_channels": [
+          "cad.serialize",
+          "cad.deserialize",
+          "cad.collect_export",
+          "cad.apply_export"
+        ],
+        "save_mode": "host_owned"
+      }
+    ],
+    "ipc_messages": [
+      "cad.serialize",
+      "cad.deserialize",
+      "cad.collect_export",
+      "cad.apply_export"
+    ]
+  },
+  "editor_items": [
+    {
+      "id": "new_mcad",
+      "name": "New CAD Document",
+      "panel": "cad_panel",
+      "default_filename": "untitled.mcad"
+    }
+  ],
+  "capabilities": ["project_state", "host_owned_save", "project_export"],
+  "project_file": {
+    "serialize_channel": "cad.serialize",
+    "deserialize_channel": "cad.deserialize"
+  },
+  "project_export": {
+    "collect_channel": "cad.collect_export",
+    "apply_channel": "cad.apply_export"
+  },
+  "permissions": {
+    "host_capabilities": [],
+    "network": {
+      "mode": "none"
+    },
+    "filesystem": {
+      "mode": "none",
+      "paths": []
+    }
+  },
+  "data_directory": "",
+  "autostart": false,
+  "auto_reload": true
+}
