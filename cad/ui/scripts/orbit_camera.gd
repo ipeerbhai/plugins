@@ -143,10 +143,12 @@ func _apply_orthographic_transform() -> void:
 
 	match _view_preset:
 		"Top":
-			direction = Vector3(0, -1, 0)
+			# Camera sits above the origin looking down (-Y). Up = +Z so the
+			# horizontal axis reads left/right as expected in a plan view.
+			direction = Vector3(0, 1, 0)
 			up = Vector3(0, 0, 1)
 		"Bottom":
-			direction = Vector3(0, 1, 0)
+			direction = Vector3(0, -1, 0)
 			up = Vector3(0, 0, 1)
 		"Front":
 			direction = Vector3(0, 0, 1)
@@ -303,11 +305,21 @@ func _ensure_helpers() -> void:
 
 
 func _apply_helper_visibility() -> void:
-	var visible := _show_helpers and _view_preset == "Perspective"
+	# Grid: show in all views. In ortho views the grid plane is a useful
+	# orientation reference (shows ground plane in Front/Right, depth lines in
+	# Top). Reduced opacity (0.25) in ortho so it doesn't drown out the mesh.
+	# Axis gizmo: Perspective only — in ortho the preset label text ("Top" etc.)
+	# is sufficient orientation context, and the gizmo clutters the view.
 	if _grid_floor != null:
-		_grid_floor.visible = visible
+		_grid_floor.visible = true
+		var mat := _grid_floor.material_override as StandardMaterial3D
+		if mat != null:
+			if _view_preset == "Perspective":
+				mat.albedo_color = Color(0.35, 0.35, 0.4, 0.6)
+			else:
+				mat.albedo_color = Color(0.35, 0.35, 0.4, 0.25)
 	if _axis_gizmo != null:
-		_axis_gizmo.visible = visible
+		_axis_gizmo.visible = _view_preset == "Perspective"
 
 
 func get_debug_state() -> Dictionary:

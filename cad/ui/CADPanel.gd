@@ -73,6 +73,20 @@ func _ready() -> void:
 		right_cam.set_view_preset("Right")
 		right_cam.set_show_helpers(false)
 
+	# Load a stub cube into every viewport so all four views have visible
+	# content on first open. The cube is a 50-unit box centred at the origin.
+	# TODO(round-2): replace with actual .mcad IPC data.
+	var stub_data := _make_unit_cube_mesh_data(50.0)
+	for vp_path in [
+		"HSplitContainer/VBoxContainer/GridContainer/TopView/SubViewport/MeshRoot",
+		"HSplitContainer/VBoxContainer/GridContainer/FrontView/SubViewport/MeshRoot",
+		"HSplitContainer/VBoxContainer/GridContainer/RightView/SubViewport/MeshRoot",
+		"HSplitContainer/VBoxContainer/GridContainer/IsoView/SubViewport/MeshRoot",
+	]:
+		var mesh_root: Node = get_node_or_null(vp_path)
+		if mesh_root != null and mesh_root.has_method("update_mesh"):
+			mesh_root.call("update_mesh", stub_data)
+
 	# Build annotation substrate.
 	_annotation_registry = AnnotationRegistry.new()
 
@@ -138,6 +152,45 @@ func _on_panel_save_request() -> Dictionary:
 ## TODO(scaffold-round-2): restore annotations and camera states from document.
 func _on_panel_load_request(_document: Dictionary) -> void:
 	pass
+
+
+# ── Stub mesh helpers ───────────────────────────────────────────────────────
+
+## Build mesh_data dict for an axis-aligned cube of side `size` centred at
+## the origin. Format matches MeshDisplay.update_mesh() expectations:
+##   vertices: [[x,y,z], ...]   (8 corners)
+##   faces:    [[i,j,k], ...]   (12 triangles, CCW outward winding)
+##   color:    [r, g, b]
+## Used as a scaffold stub until real .mcad IPC data arrives in Round 2.
+func _make_unit_cube_mesh_data(size: float) -> Dictionary:
+	var h := size * 0.5
+	var verts := [
+		# Bottom face (y = -h): 0..3
+		[-h, -h, -h], [ h, -h, -h], [ h, -h,  h], [-h, -h,  h],
+		# Top face    (y = +h): 4..7
+		[-h,  h, -h], [ h,  h, -h], [ h,  h,  h], [-h,  h,  h],
+	]
+	# 6 faces × 2 triangles each = 12 triangles.
+	# Winding: counter-clockwise when viewed from outside.
+	var faces := [
+		# Bottom  (-Y)
+		[0, 2, 1], [0, 3, 2],
+		# Top     (+Y)
+		[4, 5, 6], [4, 6, 7],
+		# Front   (+Z)
+		[3, 6, 2], [3, 7, 6],
+		# Back    (-Z)
+		[0, 1, 5], [0, 5, 4],
+		# Right   (+X)
+		[1, 2, 6], [1, 6, 5],
+		# Left    (-X)
+		[0, 4, 7], [0, 7, 3],
+	]
+	return {
+		"vertices": verts,
+		"faces":    faces,
+		"color":    [0.78, 0.62, 0.12],  # CAD gold
+	}
 
 
 # Note: the cad.collect_export / cad.apply_export channels declared in the
