@@ -51,6 +51,23 @@ var _selected_id: String = ""
 ## Set by set_active_viewport(); used by get_view_context() and future transforms.
 var _active_viewport_id: String = "iso"
 
+## Currently selected edge id (set by EdgeOverlay → CADPanel). -1 = none.
+## Exposed via get_selected_edge_id() so MCP queries can read it.
+var _selected_edge_id: int = -1
+
+## Map of view_id -> SubViewport node, populated by CADPanel._ready() via
+## set_viewport_for(). Untyped-value Dict because Dictionary value types are
+## not enforced and SubViewport has no off-tree resolution issue but we keep
+## it loose for symmetry with the rest of the off-tree contract.
+var _viewport_for: Dictionary = {}
+
+## Cache of last captured Image keyed by view_id. Invalidated when
+## set_active_viewport() changes the active id, or when the cached frame
+## number no longer matches the engine's current frame.
+var _capture_cache: Dictionary = {}     # view_id -> Image
+var _capture_cache_frame: Dictionary = {}  # view_id -> int (Engine.get_frames_drawn() at capture)
+var _capture_pending: Dictionary = {}   # view_id -> bool (one-shot in flight)
+
 # ── AnnotationHost overrides ───────────────────────────────────────────────
 
 func get_registry() -> AnnotationRegistry:
@@ -153,25 +170,122 @@ func describe_point(_doc_pos: Vector2) -> String:
 	return ""
 
 
-## Render content to image — Round 1 stub returning null.
+## Capture the active SubViewport's texture so MCP overlay-rendering composites
+## the 3-D scene + 2-D annotations together.
 ##
-## TODO(scaffold-round-2): capture the active SubViewport's texture and crop it
-## to viewport_rect (in document/screen coordinates). Use the same
-## RenderingServer.frame_post_draw one-shot pattern as Helloscene_AnnotationHost
-## to avoid blocking on GPU→CPU sync.
-func render_content_to_image(_viewport_rect: Rect2) -> Image:
-	return null
+## Pattern mirrors Helloscene_AnnotationHost: schedule a one-shot
+## RenderingServer.frame_post_draw lambda to do the GPU→CPU pull, return the
+## last cached image (may be null on the very first call before the frame has
+## been drawn). Cached per-view, keyed by Engine.get_frames_drawn(), so
+## repeated calls within the same frame don't re-capture.
+##
+## viewport_rect: if non-zero, crop the image to that region (matching the
+## hello pattern). If zero, return the full SubViewport image.
+func render_content_to_image(viewport_rect: Rect2) -> Image:
+	var view_id: String = _active_viewport_id
+	var current_frame: int = Engine.get_frames_drawn()
+	var cached_frame: int = int(_capture_cache_frame.get(view_id, -1))
+	var cached_image: Image = _capture_cache.get(view_id, null) as Image
+
+	if cached_image != null and cached_frame == current_frame:
+		return _maybe_crop(cached_image, viewport_rect)
+
+	# Cache miss or stale — schedule a refresh for next frame.
+	_schedule_capture(view_id)
+	# Return the previous capture if we have one (stale by ≥1 frame is fine);
+	# null only on cold start.
+	return _maybe_crop(cached_image, viewport_rect) if cached_image != null else null
+
+
+func _maybe_crop(img: Image, viewport_rect: Rect2) -> Image:
+	if img == null:
+		return null
+	if viewport_rect.size.x <= 0.0 or viewport_rect.size.y <= 0.0:
+		return img
+	var rect_i := Rect2i(viewport_rect.position, viewport_rect.size)
+	rect_i = rect_i.intersection(Rect2i(Vector2i.ZERO, img.get_size()))
+	if rect_i.size.x <= 0 or rect_i.size.y <= 0:
+		return img
+	return img.get_region(rect_i)
+
+
+## One-shot frame_post_draw scheduling. De-dup'd per-view via _capture_pending.
+func _schedule_capture(view_id: String) -> void:
+	if bool(_capture_pending.get(view_id, false)):
+		return
+	if not _viewport_for.has(view_id):
+		return
+	_capture_pending[view_id] = true
+	RenderingServer.frame_post_draw.connect(
+		func() -> void: _do_capture_now(view_id),
+		CONNECT_ONE_SHOT)
+
+
+func _do_capture_now(view_id: String) -> void:
+	_capture_pending[view_id] = false
+	var vp_variant: Variant = _viewport_for.get(view_id, null)
+	if vp_variant == null or not is_instance_valid(vp_variant):
+		return
+	# Duck-typed access — avoid typed `as SubViewport` for symmetry with the
+	# rest of the off-tree contract; SubViewport.get_texture() / get_image()
+	# are stable platform APIs.
+	if not vp_variant.has_method("get_texture"):
+		return
+	var tex: ViewportTexture = vp_variant.get_texture()
+	if tex == null:
+		return
+	var img: Image = tex.get_image()
+	if img == null:
+		return
+	_capture_cache[view_id] = img
+	_capture_cache_frame[view_id] = Engine.get_frames_drawn()
 
 
 # ── Per-viewport helpers (future grandchild stubs) ─────────────────────────
 
 ## Set the active viewport id used by get_view_context() and future transforms.
-## viewport_id must be one of: "top", "front", "right", "iso".
+## viewport_id must be one of: "top", "front", "right", "iso", "perspective",
+## "bottom", "back", "left".
+##
+## Switching the active view invalidates the per-view capture cache for the
+## OUTGOING view (so a later switch back gets a fresh capture rather than
+## a stale one from the prior session).
 ##
 ## TODO(scaffold-round-2): also store a reference to the matching Camera3D so
 ## transform_doc_to_viewport_screen can call camera.unproject_position().
 func set_active_viewport(viewport_id: String) -> void:
+	if _active_viewport_id != viewport_id:
+		# Drop the cached capture for the OLD active view so the next render
+		# cycle rebuilds. Pending one-shots remain queued; their callbacks just
+		# repopulate the cache for whichever view was last requested.
+		_capture_cache.erase(_active_viewport_id)
+		_capture_cache_frame.erase(_active_viewport_id)
 	_active_viewport_id = viewport_id
+
+
+## Register the SubViewport that backs a given view_id. CADPanel calls this
+## once per pane in _ready(): "iso", "top", "front", "right" (wide layout),
+## plus "perspective"/"bottom"/"back"/"left" (narrow projection options that
+## point at the SingleView SubViewport).
+##
+## We store the value untyped because Dictionary value-types aren't enforced
+## and SubViewport itself is a platform class (resolvable from off-tree, but
+## we keep the access path duck-typed for consistency).
+func set_viewport_for(view_id: String, vp: Node) -> void:
+	if vp == null:
+		_viewport_for.erase(view_id)
+		return
+	_viewport_for[view_id] = vp
+
+
+## Set/get the currently selected edge id for the active viewport.
+## EdgeOverlay → CADPanel pushes this; MCP queries can read it via get.
+func set_selected_edge_id(edge_id: int) -> void:
+	_selected_edge_id = edge_id
+
+
+func get_selected_edge_id() -> int:
+	return _selected_edge_id
 
 
 ## Map a document-space point to screen-space for a specific viewport.

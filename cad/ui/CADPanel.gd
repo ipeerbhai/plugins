@@ -162,6 +162,14 @@ func _ready() -> void:
 	_annotation_host = _CadAnnotationHostScript.new()
 	_annotation_host._registry = _annotation_registry
 
+	# ── Register SubViewports with the host so render_content_to_image can
+	# capture the correct pane for AI vision composites. The mapping is
+	# layout-dependent (wide vs narrow share the "top"/"front"/"right" ids,
+	# but they refer to different SubViewports). _register_host_viewports()
+	# is re-called on every width-class transition so the active map always
+	# matches the visible layout.
+	_register_host_viewports(false)  # wide by default; corrected below in _apply_width_class
+
 	# ── Build AnnotationToolbar (parented in the wide sidebar by default) ──
 	_toolbar = _AnnotationToolbarScript.new()
 	_toolbar.name = "AnnotationToolbar"
@@ -258,6 +266,36 @@ func _apply_width_class(cls: StringName) -> void:
 
 	# Reparent the canvas to the appropriate viewport container.
 	_reparent_canvas(is_narrow)
+
+	# Re-register SubViewports with the host so render_content_to_image
+	# captures the visible layout's panes (the "top"/"front"/"right" ids
+	# overlap between layouts but resolve to different SubViewports).
+	_register_host_viewports(is_narrow)
+
+
+## Populate Cad_AnnotationHost's viewport map for the active layout. Called
+## from _ready() (initial state) and _apply_width_class() (transitions).
+func _register_host_viewports(is_narrow: bool) -> void:
+	if _annotation_host == null:
+		return
+	if is_narrow:
+		var single_vp: SubViewport = _single_view_container.get_node("SubViewport") as SubViewport
+		# In narrow mode every projection id (incl. "iso") resolves to the
+		# single SubViewport whose camera preset the dropdown drives.
+		for proj in ["perspective", "top", "bottom", "front", "back", "left", "right", "iso"]:
+			_annotation_host.set_viewport_for(proj, single_vp)
+	else:
+		var iso_vp: SubViewport   = _iso_view_container.get_node("SubViewport") as SubViewport
+		var top_vp: SubViewport   = _top_view_container.get_node("SubViewport") as SubViewport
+		var front_vp: SubViewport = _front_view_container.get_node("SubViewport") as SubViewport
+		var right_vp: SubViewport = _right_view_container.get_node("SubViewport") as SubViewport
+		_annotation_host.set_viewport_for("iso", iso_vp)
+		_annotation_host.set_viewport_for("top", top_vp)
+		_annotation_host.set_viewport_for("front", front_vp)
+		_annotation_host.set_viewport_for("right", right_vp)
+		# Narrow-only ids unset in wide mode (they'd be unreachable anyway).
+		for proj in ["perspective", "bottom", "back", "left"]:
+			_annotation_host.set_viewport_for(proj, null)
 
 
 ## Move the toolbar between the wide sidebar and the narrow VBox.
