@@ -1,10 +1,26 @@
-[gd_scene load_steps=6 format=3]
+[gd_scene load_steps=9 format=3]
 
 [ext_resource type="Script" path="CADPanel.gd" id="1_cadpanel"]
 [ext_resource type="Script" path="scripts/orbit_camera.gd" id="2_orbitcam"]
 [ext_resource type="Script" path="scripts/mesh_display.gd" id="3_meshdisplay"]
 [ext_resource type="Script" path="scripts/edge_overlay.gd" id="4_edgeoverlay"]
 [ext_resource type="Script" path="res://Scripts/UI/Controls/responsive_container.gd" id="5_responsive"]
+
+[sub_resource type="ProceduralSkyMaterial" id="ProceduralSkyMaterial_cad"]
+sky_top_color = Color(0.42, 0.46, 0.54, 1)
+sky_horizon_color = Color(0.8, 0.82, 0.86, 1)
+ground_bottom_color = Color(0.2, 0.21, 0.24, 1)
+ground_horizon_color = Color(0.55, 0.57, 0.62, 1)
+
+[sub_resource type="Sky" id="Sky_cad"]
+sky_material = SubResource("ProceduralSkyMaterial_cad")
+
+[sub_resource type="Environment" id="Environment_cad"]
+background_mode = 2
+sky = SubResource("Sky_cad")
+ambient_light_source = 2
+ambient_light_color = Color(0.9, 0.92, 0.96, 1)
+ambient_light_energy = 1.2
 
 [node name="CADPanel" type="PanelContainer"]
 anchors_preset = 15
@@ -63,6 +79,9 @@ grow_horizontal = 2
 grow_vertical = 2
 script = ExtResource("4_edgeoverlay")
 
+[node name="WorldEnvironment" type="WorldEnvironment" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/TopView/SubViewport"]
+environment = SubResource("Environment_cad")
+
 [node name="FrontView" type="SubViewportContainer" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer"]
 layout_mode = 2
 size_flags_horizontal = 3
@@ -87,6 +106,9 @@ anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
 script = ExtResource("4_edgeoverlay")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/FrontView/SubViewport"]
+environment = SubResource("Environment_cad")
 
 [node name="RightView" type="SubViewportContainer" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer"]
 layout_mode = 2
@@ -113,6 +135,9 @@ grow_horizontal = 2
 grow_vertical = 2
 script = ExtResource("4_edgeoverlay")
 
+[node name="WorldEnvironment" type="WorldEnvironment" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/RightView/SubViewport"]
+environment = SubResource("Environment_cad")
+
 [node name="IsoView" type="SubViewportContainer" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer"]
 layout_mode = 2
 size_flags_horizontal = 3
@@ -137,6 +162,9 @@ anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
 script = ExtResource("4_edgeoverlay")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/IsoView/SubViewport"]
+environment = SubResource("Environment_cad")
 
 [node name="WideSidebar" type="VBoxContainer" parent="ResponsiveContainer/WideLayout"]
 layout_mode = 2
@@ -192,6 +220,9 @@ anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
 script = ExtResource("4_edgeoverlay")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="ResponsiveContainer/NarrowLayout/SingleView/SubViewport"]
+environment = SubResource("Environment_cad")
 
 [node name="NarrowAnnotationsHeader" type="Label" parent="ResponsiveContainer/NarrowLayout"]
 layout_mode = 2
