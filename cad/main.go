@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ipeerbhai/plugins/cad/internal/bridge"
@@ -81,7 +82,16 @@ func errResponse(id json.RawMessage, code int, msg string) rpcResponse {
 	}
 }
 
+// stdoutMu serialises every write to stdout. Both the main JSON-RPC response
+// path (send) and the stderr-pump-driven notify path (emitHostNotify) target
+// os.Stdout. Without this mutex two goroutines can interleave bytes — line
+// atomicity on os.Stdout is only POSIX-guaranteed for pipes ≤ PIPE_BUF, which
+// the host (Minerva) may capture as a regular file or socket.
+var stdoutMu sync.Mutex
+
 func send(enc *json.Encoder, v interface{}) {
+	stdoutMu.Lock()
+	defer stdoutMu.Unlock()
 	if err := enc.Encode(v); err != nil {
 		log.Printf("cad-plugin: write response: %v", err)
 	}
@@ -120,6 +130,8 @@ func emitHostNotify(level, message string, details interface{}) {
 	if message == "" {
 		return
 	}
+	stdoutMu.Lock()
+	defer stdoutMu.Unlock()
 	if notifyEnc == nil {
 		notifyEnc = json.NewEncoder(notifyOut)
 	}
