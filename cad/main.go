@@ -97,13 +97,6 @@ var (
 // initWorker resolves the Python interpreter path and constructs the Worker.
 // Called once at startup; the worker is NOT yet spawned (lazy per §2).
 func initWorker() {
-	pythonPath, err := runtime.PythonPath()
-	if err != nil {
-		log.Printf("cad-plugin: WARNING: %v — mcad_validate will fail until python3 is on PATH", err)
-		// Still create a Worker with an empty path so Call returns a clean error.
-		pythonPath = ""
-	}
-
 	// Determine the plugin root (directory containing this binary / manifest.json).
 	pluginRoot, err := pluginRootDir()
 	if err != nil {
@@ -111,6 +104,13 @@ func initWorker() {
 		pluginRoot = "."
 	}
 	workerDir := runtime.WorkerScriptDir(pluginRoot)
+
+	pythonPath, err := runtime.PythonPath(workerDir)
+	if err != nil {
+		log.Printf("cad-plugin: WARNING: %v — mcad_validate will fail until python3 is on PATH or .venv exists", err)
+		// Still create a Worker with an empty path so Call returns a clean error.
+		pythonPath = ""
+	}
 	log.Printf("cad-plugin: worker dir=%s, python=%s", workerDir, pythonPath)
 
 	worker = bridge.New(pythonPath, workerDir)
