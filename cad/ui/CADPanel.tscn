@@ -1,9 +1,10 @@
-[gd_scene load_steps=5 format=3]
+[gd_scene load_steps=6 format=3]
 
 [ext_resource type="Script" path="CADPanel.gd" id="1_cadpanel"]
 [ext_resource type="Script" path="scripts/orbit_camera.gd" id="2_orbitcam"]
 [ext_resource type="Script" path="scripts/mesh_display.gd" id="3_meshdisplay"]
 [ext_resource type="Script" path="scripts/edge_overlay.gd" id="4_edgeoverlay"]
+[ext_resource type="Script" path="res://Scripts/UI/Controls/responsive_container.gd" id="5_responsive"]
 
 [node name="CADPanel" type="PanelContainer"]
 anchors_preset = 15
@@ -15,42 +16,45 @@ size_flags_horizontal = 3
 size_flags_vertical = 3
 script = ExtResource("1_cadpanel")
 
-[node name="HSplitContainer" type="HSplitContainer" parent="."]
-layout_mode = 1
-anchors_preset = 15
-anchor_right = 1.0
-anchor_bottom = 1.0
-grow_horizontal = 2
-grow_vertical = 2
+[node name="ResponsiveContainer" type="Container" parent="."]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+script = ExtResource("5_responsive")
 
-[node name="VBoxContainer" type="VBoxContainer" parent="HSplitContainer"]
+[node name="WideLayout" type="HSplitContainer" parent="ResponsiveContainer"]
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
 
-[node name="GridContainer" type="GridContainer" parent="HSplitContainer/VBoxContainer"]
+[node name="VBoxContainer" type="VBoxContainer" parent="ResponsiveContainer/WideLayout"]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+
+[node name="GridContainer" type="GridContainer" parent="ResponsiveContainer/WideLayout/VBoxContainer"]
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
 columns = 2
 
-[node name="TopView" type="SubViewportContainer" parent="HSplitContainer/VBoxContainer/GridContainer"]
+[node name="TopView" type="SubViewportContainer" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer"]
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
 custom_minimum_size = Vector2(400, 300)
 stretch = true
 
-[node name="SubViewport" type="SubViewport" parent="HSplitContainer/VBoxContainer/GridContainer/TopView"]
+[node name="SubViewport" type="SubViewport" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/TopView"]
 size = Vector2i(400, 300)
 
-[node name="OrbitCamera" type="Camera3D" parent="HSplitContainer/VBoxContainer/GridContainer/TopView/SubViewport"]
+[node name="OrbitCamera" type="Camera3D" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/TopView/SubViewport"]
 script = ExtResource("2_orbitcam")
 
-[node name="MeshRoot" type="Node3D" parent="HSplitContainer/VBoxContainer/GridContainer/TopView/SubViewport"]
+[node name="MeshRoot" type="Node3D" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/TopView/SubViewport"]
 script = ExtResource("3_meshdisplay")
 
-[node name="EdgeOverlayRoot" type="Control" parent="HSplitContainer/VBoxContainer/GridContainer/TopView/SubViewport"]
+[node name="EdgeOverlayRoot" type="Control" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/TopView/SubViewport"]
 layout_mode = 1
 anchors_preset = 15
 anchor_right = 1.0
@@ -59,23 +63,23 @@ grow_horizontal = 2
 grow_vertical = 2
 script = ExtResource("4_edgeoverlay")
 
-[node name="FrontView" type="SubViewportContainer" parent="HSplitContainer/VBoxContainer/GridContainer"]
+[node name="FrontView" type="SubViewportContainer" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer"]
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
 custom_minimum_size = Vector2(400, 300)
 stretch = true
 
-[node name="SubViewport" type="SubViewport" parent="HSplitContainer/VBoxContainer/GridContainer/FrontView"]
+[node name="SubViewport" type="SubViewport" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/FrontView"]
 size = Vector2i(400, 300)
 
-[node name="OrbitCamera" type="Camera3D" parent="HSplitContainer/VBoxContainer/GridContainer/FrontView/SubViewport"]
+[node name="OrbitCamera" type="Camera3D" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/FrontView/SubViewport"]
 script = ExtResource("2_orbitcam")
 
-[node name="MeshRoot" type="Node3D" parent="HSplitContainer/VBoxContainer/GridContainer/FrontView/SubViewport"]
+[node name="MeshRoot" type="Node3D" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/FrontView/SubViewport"]
 script = ExtResource("3_meshdisplay")
 
-[node name="EdgeOverlayRoot" type="Control" parent="HSplitContainer/VBoxContainer/GridContainer/FrontView/SubViewport"]
+[node name="EdgeOverlayRoot" type="Control" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/FrontView/SubViewport"]
 layout_mode = 1
 anchors_preset = 15
 anchor_right = 1.0
@@ -84,23 +88,23 @@ grow_horizontal = 2
 grow_vertical = 2
 script = ExtResource("4_edgeoverlay")
 
-[node name="RightView" type="SubViewportContainer" parent="HSplitContainer/VBoxContainer/GridContainer"]
+[node name="RightView" type="SubViewportContainer" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer"]
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
 custom_minimum_size = Vector2(400, 300)
 stretch = true
 
-[node name="SubViewport" type="SubViewport" parent="HSplitContainer/VBoxContainer/GridContainer/RightView"]
+[node name="SubViewport" type="SubViewport" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/RightView"]
 size = Vector2i(400, 300)
 
-[node name="OrbitCamera" type="Camera3D" parent="HSplitContainer/VBoxContainer/GridContainer/RightView/SubViewport"]
+[node name="OrbitCamera" type="Camera3D" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/RightView/SubViewport"]
 script = ExtResource("2_orbitcam")
 
-[node name="MeshRoot" type="Node3D" parent="HSplitContainer/VBoxContainer/GridContainer/RightView/SubViewport"]
+[node name="MeshRoot" type="Node3D" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/RightView/SubViewport"]
 script = ExtResource("3_meshdisplay")
 
-[node name="EdgeOverlayRoot" type="Control" parent="HSplitContainer/VBoxContainer/GridContainer/RightView/SubViewport"]
+[node name="EdgeOverlayRoot" type="Control" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/RightView/SubViewport"]
 layout_mode = 1
 anchors_preset = 15
 anchor_right = 1.0
@@ -109,23 +113,23 @@ grow_horizontal = 2
 grow_vertical = 2
 script = ExtResource("4_edgeoverlay")
 
-[node name="IsoView" type="SubViewportContainer" parent="HSplitContainer/VBoxContainer/GridContainer"]
+[node name="IsoView" type="SubViewportContainer" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer"]
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
 custom_minimum_size = Vector2(400, 300)
 stretch = true
 
-[node name="SubViewport" type="SubViewport" parent="HSplitContainer/VBoxContainer/GridContainer/IsoView"]
+[node name="SubViewport" type="SubViewport" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/IsoView"]
 size = Vector2i(400, 300)
 
-[node name="OrbitCamera" type="Camera3D" parent="HSplitContainer/VBoxContainer/GridContainer/IsoView/SubViewport"]
+[node name="OrbitCamera" type="Camera3D" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/IsoView/SubViewport"]
 script = ExtResource("2_orbitcam")
 
-[node name="MeshRoot" type="Node3D" parent="HSplitContainer/VBoxContainer/GridContainer/IsoView/SubViewport"]
+[node name="MeshRoot" type="Node3D" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/IsoView/SubViewport"]
 script = ExtResource("3_meshdisplay")
 
-[node name="EdgeOverlayRoot" type="Control" parent="HSplitContainer/VBoxContainer/GridContainer/IsoView/SubViewport"]
+[node name="EdgeOverlayRoot" type="Control" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/IsoView/SubViewport"]
 layout_mode = 1
 anchors_preset = 15
 anchor_right = 1.0
@@ -134,47 +138,63 @@ grow_horizontal = 2
 grow_vertical = 2
 script = ExtResource("4_edgeoverlay")
 
-[node name="SidebarVBox" type="VBoxContainer" parent="HSplitContainer"]
+[node name="WideSidebar" type="VBoxContainer" parent="ResponsiveContainer/WideLayout"]
 layout_mode = 2
-custom_minimum_size = Vector2(200, 0)
+custom_minimum_size = Vector2(220, 0)
 size_flags_horizontal = 0
 size_flags_vertical = 3
 
-[node name="AnnotationsHeader" type="Label" parent="HSplitContainer/SidebarVBox"]
+[node name="AnnotationsHeader" type="Label" parent="ResponsiveContainer/WideLayout/WideSidebar"]
 layout_mode = 2
 size_flags_horizontal = 3
 text = "Annotations"
 horizontal_alignment = 1
 
-[node name="AnnotationToolbarStub" type="Control" parent="HSplitContainer/SidebarVBox"]
+[node name="NarrowLayout" type="VBoxContainer" parent="ResponsiveContainer"]
+visible = false
 layout_mode = 2
-custom_minimum_size = Vector2(200, 400)
+size_flags_horizontal = 3
+size_flags_vertical = 3
+
+[node name="ProjectionRow" type="HBoxContainer" parent="ResponsiveContainer/NarrowLayout"]
+layout_mode = 2
 size_flags_horizontal = 3
 
-[node name="ToolbarLabel" type="Label" parent="HSplitContainer/SidebarVBox/AnnotationToolbarStub"]
+[node name="ProjectionLabel" type="Label" parent="ResponsiveContainer/NarrowLayout/ProjectionRow"]
+layout_mode = 2
+text = "View:"
+
+[node name="ProjectionDropdown" type="OptionButton" parent="ResponsiveContainer/NarrowLayout/ProjectionRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="SingleView" type="SubViewportContainer" parent="ResponsiveContainer/NarrowLayout"]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+custom_minimum_size = Vector2(300, 300)
+stretch = true
+
+[node name="SubViewport" type="SubViewport" parent="ResponsiveContainer/NarrowLayout/SingleView"]
+size = Vector2i(400, 300)
+
+[node name="OrbitCamera" type="Camera3D" parent="ResponsiveContainer/NarrowLayout/SingleView/SubViewport"]
+script = ExtResource("2_orbitcam")
+
+[node name="MeshRoot" type="Node3D" parent="ResponsiveContainer/NarrowLayout/SingleView/SubViewport"]
+script = ExtResource("3_meshdisplay")
+
+[node name="EdgeOverlayRoot" type="Control" parent="ResponsiveContainer/NarrowLayout/SingleView/SubViewport"]
 layout_mode = 1
 anchors_preset = 15
 anchor_right = 1.0
 anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
-text = "Toolbar Stub"
-horizontal_alignment = 1
-vertical_alignment = 1
+script = ExtResource("4_edgeoverlay")
 
-[node name="AnnotationCanvasTopView" type="Control" parent="HSplitContainer/SidebarVBox"]
+[node name="NarrowAnnotationsHeader" type="Label" parent="ResponsiveContainer/NarrowLayout"]
 layout_mode = 2
-custom_minimum_size = Vector2(200, 80)
 size_flags_horizontal = 3
-
-[node name="CanvasLabel" type="Label" parent="HSplitContainer/SidebarVBox/AnnotationCanvasTopView"]
-layout_mode = 1
-anchors_preset = 15
-anchor_right = 1.0
-anchor_bottom = 1.0
-grow_horizontal = 2
-grow_vertical = 2
-text = "AnnotationCanvas (top view)"
+text = "Annotations"
 horizontal_alignment = 1
-vertical_alignment = 1
-autowrap_mode = 3

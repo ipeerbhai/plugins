@@ -1,67 +1,118 @@
 class_name Cad_CADPanel
 extends MinervaPluginPanel
-## CAD editor panel — Round 1 scaffold.
+## CAD editor panel — Round 2 layout integration.
 ##
-## Mirrors the lifecycle pattern of Helloscene_HelloPanel (hello_scene plugin):
-##   _ready()                    → build annotation substrate
-##   _on_panel_loaded(ctx)       → receive context, register host
-##   _on_panel_unload()          → deregister host, disconnect signals
-##   _on_panel_save_request()    → serialize state (stub for Round 1)
-##   _on_panel_load_request(doc) → restore state (stub for Round 1)
+## Cycle 2 R2 adopts platform widgets:
+##   * ResponsiveContainer wraps the panel content. width_class drives a
+##     stack-style swap between WideLayout (4-view + sidebar HSplit) and
+##     NarrowLayout (single-view + projection dropdown + tools).
+##   * AnnotationToolbar (real platform widget, not the R1 stub) is built at
+##     runtime, bound to the registry/host, and rebuilt with the matching
+##     presentation_mode whenever width_class changes.
+##   * Cad_AnnotationCanvas is overlaid on whichever SubViewportContainer is
+##     currently the "active" viewport (Iso in wide mode, the dropdown
+##     selection in narrow mode). One canvas, repointed across mode changes.
 ##
-## Four-viewport 3-D CAD layout (Top / Front / Right / Iso) with a right-side
-## annotation sidebar. Real mesh data and IPC wiring are Round 2+.
-##
-## class_name prefix "Cad" = canonical_prefix("cad")
-## per design §6.1: plugin_id.replace("_","").lower() → first-upper.
-##
-## Off-tree note: this plugin lives at ~/github/plugins/cad/, OUTSIDE Minerva's
-## res:// tree, so Godot's class_name parser cache can't see Cad_AnnotationHost.
-## We use preload() with a script-relative path (works regardless of res://-or-not)
-## and type the field with the Minerva-side base class AnnotationHost (which IS
-## class_name-registered) instead of the plugin's own subclass.
+## Off-tree class_name gotcha:
+##   This plugin lives at ~/github/plugins/cad/, OUTSIDE Minerva's res:// tree,
+##   so Godot's parser cache cannot statically resolve plugin or platform
+##   class_names from typed field declarations in this file. Fields whose
+##   types are platform classes (ResponsiveContainer, AnnotationToolbar) are
+##   typed with the platform BASE class (Container, VBoxContainer) or kept
+##   untyped, and assigned via preload(...).new(). Property access and signal
+##   subscription works via duck typing.
 
 const _CadAnnotationHostScript: Script = preload("CadAnnotationHost.gd")
+const _CadAnnotationCanvasScript: Script = preload("CadAnnotationCanvas.gd")
+const _ResponsiveContainerScript: Script = preload("res://Scripts/UI/Controls/responsive_container.gd")
+const _AnnotationToolbarScript: Script = preload("res://Scripts/Services/Annotations/AnnotationToolbar.gd")
+const _BuiltinKindsScript: Script = preload("res://Scripts/Services/Annotations/BuiltinKinds.gd")
 
 # ── Node references (set in _ready) ────────────────────────────────────────
 
-## SubViewportContainers for the four CAD views.
+## ResponsiveContainer wrapping both layouts. Typed Container (base class) so
+## the parser doesn't try to resolve ResponsiveContainer from off-tree.
+var _responsive: Container = null
+
+## Wide-layout (4-view + sidebar) and narrow-layout (single-view) roots.
+var _wide_layout: Control = null
+var _narrow_layout: Control = null
+
+## SubViewportContainers for the four CAD views in WIDE layout.
 var _top_view_container: SubViewportContainer = null
 var _front_view_container: SubViewportContainer = null
 var _right_view_container: SubViewportContainer = null
 var _iso_view_container: SubViewportContainer = null
 
+## Single SubViewportContainer used in NARROW layout. Its OrbitCamera's preset
+## is updated by the projection dropdown.
+var _single_view_container: SubViewportContainer = null
+var _single_view_camera: OrbitCamera = null
+
+## Projection dropdown used to switch the single-view camera preset.
+var _projection_dropdown: OptionButton = null
+
+## Wide-layout sidebar (where the toolbar is parented in wide mode).
+var _wide_sidebar: VBoxContainer = null
+
+## AnnotationToolbar instance — built at runtime; reparented across mode
+## changes. Untyped because off-tree scripts can't type fields as
+## AnnotationToolbar.
+var _toolbar = null
+
+## Cad_AnnotationCanvas instance — single canvas, overlaid on the active
+## viewport's SubViewportContainer. Untyped for the same reason.
+var _canvas = null
+
+## Currently active viewport id, one of: "top","front","right","iso" (wide mode)
+## or "perspective","top","bottom","front","back","left","right" (narrow mode).
+## In wide mode the canvas is overlaid on the Iso quadrant by default.
+var _active_viewport_id: String = "iso"
+
 # ── Annotation substrate ────────────────────────────────────────────────────
 
 var _annotation_registry: AnnotationRegistry = null
-var _annotation_host: AnnotationHost = null  # actual class is Cad_AnnotationHost; see preload above
+var _annotation_host: AnnotationHost = null  # actual class is Cad_AnnotationHost
 
 ## Editor name under which we registered our host with AnnotationHostRegistry.
-## Tracked so _on_panel_unload can deregister the same key even if the tab is
-## later renamed. Empty string when not registered.
 var _registered_editor_name: String = ""
 
 # ── Plugin context ──────────────────────────────────────────────────────────
 
 var _ctx: Dictionary = {}
 
+## Projection dropdown options (id → preset string accepted by orbit_camera).
+const _PROJECTION_OPTIONS: Array = [
+	{"id": 0, "label": "Perspective", "preset": "Perspective"},
+	{"id": 1, "label": "Top",         "preset": "Top"},
+	{"id": 2, "label": "Bottom",      "preset": "Bottom"},
+	{"id": 3, "label": "Front",       "preset": "Front"},
+	{"id": 4, "label": "Back",        "preset": "Back"},
+	{"id": 5, "label": "Left",        "preset": "Left"},
+	{"id": 6, "label": "Right",       "preset": "Right"},
+]
+
 
 # ── Godot lifecycle ─────────────────────────────────────────────────────────
 
 func _ready() -> void:
-	# Wire node references from the scene tree.
-	_top_view_container   = $HSplitContainer/VBoxContainer/GridContainer/TopView
-	_front_view_container = $HSplitContainer/VBoxContainer/GridContainer/FrontView
-	_right_view_container = $HSplitContainer/VBoxContainer/GridContainer/RightView
-	_iso_view_container   = $HSplitContainer/VBoxContainer/GridContainer/IsoView
+	# ── Wire layout container references ───────────────────────────────────
+	_responsive = $ResponsiveContainer as Container
+	_wide_layout = $ResponsiveContainer/WideLayout as Control
+	_narrow_layout = $ResponsiveContainer/NarrowLayout as Control
+	_wide_sidebar = $ResponsiveContainer/WideLayout/WideSidebar as VBoxContainer
 
-	# Configure each OrbitCamera to its view preset. Cameras default to
-	# "Perspective" in orbit_camera.gd's var declaration; we override here
-	# rather than storing private vars in the .tscn (which would cause
-	# unknown-property warnings since they are not @export).
-	var top_cam: Camera3D =$HSplitContainer/VBoxContainer/GridContainer/TopView/SubViewport/OrbitCamera
-	var front_cam: Camera3D =$HSplitContainer/VBoxContainer/GridContainer/FrontView/SubViewport/OrbitCamera
-	var right_cam: Camera3D =$HSplitContainer/VBoxContainer/GridContainer/RightView/SubViewport/OrbitCamera
+	# ── Wide-layout viewport containers ────────────────────────────────────
+	var grid := "ResponsiveContainer/WideLayout/VBoxContainer/GridContainer"
+	_top_view_container   = get_node(grid + "/TopView")   as SubViewportContainer
+	_front_view_container = get_node(grid + "/FrontView") as SubViewportContainer
+	_right_view_container = get_node(grid + "/RightView") as SubViewportContainer
+	_iso_view_container   = get_node(grid + "/IsoView")   as SubViewportContainer
+
+	# Configure each OrbitCamera to its view preset (wide mode).
+	var top_cam: Camera3D   = get_node(grid + "/TopView/SubViewport/OrbitCamera")
+	var front_cam: Camera3D = get_node(grid + "/FrontView/SubViewport/OrbitCamera")
+	var right_cam: Camera3D = get_node(grid + "/RightView/SubViewport/OrbitCamera")
 	# IsoView camera stays at "Perspective" default — no call needed.
 	if top_cam != null:
 		top_cam.set_view_preset("Top")
@@ -73,36 +124,66 @@ func _ready() -> void:
 		right_cam.set_view_preset("Right")
 		right_cam.set_show_helpers(false)
 
-	# Load a stub cube into every viewport so all four views have visible
-	# content on first open. The cube is a 50-unit box centred at the origin.
-	# TODO(round-2): replace with actual .mcad IPC data.
+	# ── Narrow-layout single viewport ──────────────────────────────────────
+	_single_view_container = $ResponsiveContainer/NarrowLayout/SingleView as SubViewportContainer
+	_single_view_camera = $ResponsiveContainer/NarrowLayout/SingleView/SubViewport/OrbitCamera as OrbitCamera
+
+	# ── Projection dropdown ────────────────────────────────────────────────
+	_projection_dropdown = $ResponsiveContainer/NarrowLayout/ProjectionRow/ProjectionDropdown as OptionButton
+	_projection_dropdown.clear()
+	for opt in _PROJECTION_OPTIONS:
+		_projection_dropdown.add_item(opt["label"], opt["id"])
+	_projection_dropdown.select(0)  # Perspective by default
+	_projection_dropdown.item_selected.connect(_on_projection_selected)
+
+	# ── Stub mesh: load into every MeshRoot (4 wide + 1 narrow) ────────────
 	var stub_data := _make_unit_cube_mesh_data(50.0)
-	for vp_path in [
-		"HSplitContainer/VBoxContainer/GridContainer/TopView/SubViewport/MeshRoot",
-		"HSplitContainer/VBoxContainer/GridContainer/FrontView/SubViewport/MeshRoot",
-		"HSplitContainer/VBoxContainer/GridContainer/RightView/SubViewport/MeshRoot",
-		"HSplitContainer/VBoxContainer/GridContainer/IsoView/SubViewport/MeshRoot",
-	]:
+	var mesh_paths: Array = [
+		grid + "/TopView/SubViewport/MeshRoot",
+		grid + "/FrontView/SubViewport/MeshRoot",
+		grid + "/RightView/SubViewport/MeshRoot",
+		grid + "/IsoView/SubViewport/MeshRoot",
+		"ResponsiveContainer/NarrowLayout/SingleView/SubViewport/MeshRoot",
+	]
+	for vp_path in mesh_paths:
 		var mesh_root: Node = get_node_or_null(vp_path)
 		if mesh_root != null and mesh_root.has_method("update_mesh"):
 			mesh_root.call("update_mesh", stub_data)
 
-	# Build annotation substrate.
+	# ── Annotation substrate ───────────────────────────────────────────────
 	_annotation_registry = AnnotationRegistry.new()
-
-	# TODO(scaffold-round-2): call BuiltinKinds.register_all(_annotation_registry)
-	# once the annotation substrate autoloads are reachable from this plugin's
-	# project context. BuiltinKinds is defined at:
-	#   ~/github/Minerva/src/Scripts/Services/Annotations/BuiltinKinds.gd
-	# It is a class_name'd script (no autoload), so it will be available
-	# after Unit D wires this plugin into the Minerva project.
+	# Register built-in 2D kinds (arrow, text, region, polyline, highlight,
+	# measure_distance, measure_angle, measure_radius). CAD-specific 3-D kinds
+	# are a later grandchild (`019dd017d9df`).
+	_BuiltinKindsScript.register_all(_annotation_registry)
 
 	_annotation_host = _CadAnnotationHostScript.new()
 	_annotation_host._registry = _annotation_registry
 
-	# TODO(scaffold-round-2): create one AnnotationCanvas per viewport,
-	# call canvas.set_host(_annotation_host) for each, and store references
-	# so _on_panel_unload can call canvas.set_host(null).
+	# ── Build AnnotationToolbar (parented in the wide sidebar by default) ──
+	_toolbar = _AnnotationToolbarScript.new()
+	_toolbar.name = "AnnotationToolbar"
+	_wide_sidebar.add_child(_toolbar)
+	_toolbar.set_registry(_annotation_registry)
+	_toolbar.set_host(_annotation_host)
+	_toolbar.active_tool_changed.connect(_on_toolbar_active_tool_changed)
+
+	# ── Build single AnnotationCanvas, overlay on Iso (wide default) ───────
+	_canvas = _CadAnnotationCanvasScript.new()
+	_canvas.name = "AnnotationCanvas"
+	_canvas.mouse_filter = Control.MOUSE_FILTER_PASS
+	_canvas.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_canvas.set_host(_annotation_host)
+	# Initial parent = Iso quadrant in wide mode. _on_width_class_changed will
+	# move it to the single-view in narrow mode.
+	_iso_view_container.add_child(_canvas)
+	_annotation_host.set_active_viewport(_active_viewport_id)
+
+	# ── Connect ResponsiveContainer width-class signal & apply initial mode
+	_responsive.width_class_changed.connect(_on_width_class_changed)
+	# Apply the initial layout state so toolbar/canvas are correctly placed
+	# even before the first resize transition fires.
+	_apply_width_class(_responsive.width_class)
 
 
 # ── Plugin platform lifecycle hooks (override MinervaPluginPanel virtuals) ──
@@ -110,8 +191,6 @@ func _ready() -> void:
 func _on_panel_loaded(ctx: Dictionary) -> void:
 	_ctx = ctx
 
-	# Register our live host so MCP annotation queries can answer
-	# "what did the user draw?" without requiring a save first.
 	var ed: Variant = ctx.get("editor", null)
 	if ed != null and "tab_title" in ed and _annotation_host != null:
 		var ed_name: String = str(ed.tab_title)
@@ -126,74 +205,157 @@ func _on_panel_unload() -> void:
 		AnnotationHostRegistry.deregister(_registered_editor_name)
 		_registered_editor_name = ""
 
-	# TODO(scaffold-round-2): disconnect toolbar active_tool_changed signal
-	# and call canvas.set_host(null) for each of the four canvases.
+	# Disconnect toolbar signal and detach canvas from host.
+	if _toolbar != null and _toolbar.active_tool_changed.is_connected(_on_toolbar_active_tool_changed):
+		_toolbar.active_tool_changed.disconnect(_on_toolbar_active_tool_changed)
+	if _canvas != null:
+		_canvas.set_host(null)
+		_canvas.set_active_tool(null)
 
 
 # ── Save/load contract (overrides MinervaPluginPanel virtuals) ──────────────
-# Used for both host_owned file save (Ctrl+S → .mcad sidecar) and
-# project-state capture (.minproj entry).
 
-## Capture panel state. Round 1 stub returns an empty versioned dict.
-## TODO(scaffold-round-2): include annotation list, four-camera states,
-## and any plugin-server-side state needed for round-trip.
 func _on_panel_save_request() -> Dictionary:
-	# Intended Round-2 payload:
-	#   {
-	#     "version": 1,
-	#     "annotations": _annotation_host.get_annotations(),
-	#     "cameras": { "top": {...}, "front": {...}, "right": {...}, "iso": {...} },
-	#   }
+	# TODO(later): include annotations + camera states.
 	return {"version": 1}
 
 
-## Restore panel state captured by _on_panel_save_request.
-## Round 1 stub — no-op.
-## TODO(scaffold-round-2): restore annotations and camera states from document.
 func _on_panel_load_request(_document: Dictionary) -> void:
 	pass
 
 
+# ── Width-class handling ────────────────────────────────────────────────────
+
+## Called whenever the ResponsiveContainer crosses a breakpoint.
+func _on_width_class_changed(new_class: StringName) -> void:
+	_apply_width_class(new_class)
+
+
+## Apply the layout for the given width class. Idempotent.
+##   xs / sm  → narrow (single view + projection dropdown), toolbar = COMPACT
+##   md / lg / xl → wide (4-view + sidebar), toolbar = LABELED
+func _apply_width_class(cls: StringName) -> void:
+	var is_narrow := (cls == _ResponsiveContainerScript.CLASS_XS or cls == _ResponsiveContainerScript.CLASS_SM)
+
+	if _wide_layout != null:
+		_wide_layout.visible = not is_narrow
+	if _narrow_layout != null:
+		_narrow_layout.visible = is_narrow
+
+	# Reparent toolbar into the appropriate layout's tools area.
+	if _toolbar != null:
+		_reparent_toolbar(is_narrow)
+		# Set presentation_mode AFTER reparent so the rebuild lays out under
+		# the new parent. Use the platform enum constants by name on the
+		# toolbar instance (off-tree consumers can't reference the enum from
+		# the type itself, but enum values on the instance are fine).
+		# COMPACT = 1, LABELED = 0 per AnnotationToolbar.PresentationMode.
+		var compact: int = 1
+		var labeled: int = 0
+		_toolbar.set_presentation_mode(compact if is_narrow else labeled)
+
+	# Reparent the canvas to the appropriate viewport container.
+	_reparent_canvas(is_narrow)
+
+
+## Move the toolbar between the wide sidebar and the narrow VBox.
+func _reparent_toolbar(narrow: bool) -> void:
+	if _toolbar == null:
+		return
+	var current_parent: Node = _toolbar.get_parent()
+	var target_parent: Node = _narrow_layout if narrow else _wide_sidebar
+	if current_parent == target_parent:
+		return
+	if current_parent != null:
+		current_parent.remove_child(_toolbar)
+	target_parent.add_child(_toolbar)
+
+
+## Move the AnnotationCanvas overlay between the active wide quadrant (Iso) and
+## the narrow single-view container.
+func _reparent_canvas(narrow: bool) -> void:
+	if _canvas == null:
+		return
+	var current_parent: Node = _canvas.get_parent()
+	var target_parent: Node
+	if narrow:
+		target_parent = _single_view_container
+		_active_viewport_id = _projection_preset_to_viewport_id(_current_projection_preset())
+	else:
+		target_parent = _iso_view_container
+		_active_viewport_id = "iso"
+	if current_parent != target_parent:
+		if current_parent != null:
+			current_parent.remove_child(_canvas)
+		target_parent.add_child(_canvas)
+		_canvas.set_anchors_preset(Control.PRESET_FULL_RECT)
+	if _annotation_host != null and _annotation_host.has_method("set_active_viewport"):
+		_annotation_host.set_active_viewport(_active_viewport_id)
+
+
+# ── Projection dropdown handling (narrow mode) ──────────────────────────────
+
+## Called when the user picks an item from the narrow-layout projection
+## dropdown. Updates the single-view camera preset.
+func _on_projection_selected(index: int) -> void:
+	if _single_view_camera == null:
+		return
+	var preset: String = "Perspective"
+	if index >= 0 and index < _PROJECTION_OPTIONS.size():
+		preset = String(_PROJECTION_OPTIONS[index]["preset"])
+	_single_view_camera.set_view_preset(preset)
+	# Update the host's active viewport id so MCP queries get the right context.
+	_active_viewport_id = _projection_preset_to_viewport_id(preset)
+	if _annotation_host != null and _annotation_host.has_method("set_active_viewport"):
+		_annotation_host.set_active_viewport(_active_viewport_id)
+
+
+## Return the preset string ("Perspective", "Top", ...) currently selected in
+## the dropdown. Defaults to "Perspective" if the dropdown is missing/unset.
+func _current_projection_preset() -> String:
+	if _projection_dropdown == null:
+		return "Perspective"
+	var idx: int = _projection_dropdown.selected
+	if idx < 0 or idx >= _PROJECTION_OPTIONS.size():
+		return "Perspective"
+	return String(_PROJECTION_OPTIONS[idx]["preset"])
+
+
+## Map an orbit-camera preset string to the lower-case viewport-id used by
+## Cad_AnnotationHost.get_view_context().
+func _projection_preset_to_viewport_id(preset: String) -> String:
+	return preset.to_lower()
+
+
+# ── Toolbar → canvas plumbing ──────────────────────────────────────────────
+
+## Called when the AnnotationToolbar emits active_tool_changed. Forwards the
+## new tool to the canvas so it can route pointer events / draw previews.
+func _on_toolbar_active_tool_changed(tool: AnnotationAuthorTool) -> void:
+	if _canvas != null:
+		_canvas.set_active_tool(tool)
+
+
 # ── Stub mesh helpers ───────────────────────────────────────────────────────
 
-## Build mesh_data dict for an axis-aligned cube of side `size` centred at
-## the origin. Format matches MeshDisplay.update_mesh() expectations:
-##   vertices: [[x,y,z], ...]   (8 corners)
-##   faces:    [[i,j,k], ...]   (12 triangles, CCW outward winding)
-##   color:    [r, g, b]
-## Used as a scaffold stub until real .mcad IPC data arrives in Round 2.
+## Build mesh_data dict for an axis-aligned cube of side `size` centred at the
+## origin. Format matches MeshDisplay.update_mesh() expectations.
 func _make_unit_cube_mesh_data(size: float) -> Dictionary:
 	var h := size * 0.5
 	var verts := [
-		# Bottom face (y = -h): 0..3
 		[-h, -h, -h], [ h, -h, -h], [ h, -h,  h], [-h, -h,  h],
-		# Top face    (y = +h): 4..7
 		[-h,  h, -h], [ h,  h, -h], [ h,  h,  h], [-h,  h,  h],
 	]
-	# 6 faces × 2 triangles each = 12 triangles.
-	# Winding: counter-clockwise when viewed from outside.
 	var faces := [
-		# Bottom  (-Y)
 		[0, 2, 1], [0, 3, 2],
-		# Top     (+Y)
 		[4, 5, 6], [4, 6, 7],
-		# Front   (+Z)
 		[3, 6, 2], [3, 7, 6],
-		# Back    (-Z)
 		[0, 1, 5], [0, 5, 4],
-		# Right   (+X)
 		[1, 2, 6], [1, 6, 5],
-		# Left    (-X)
 		[0, 4, 7], [0, 7, 3],
 	]
 	return {
 		"vertices": verts,
 		"faces":    faces,
-		"color":    [0.78, 0.62, 0.12],  # CAD gold
+		"color":    [0.78, 0.62, 0.12],
 	}
-
-
-# Note: the cad.collect_export / cad.apply_export channels declared in the
-# manifest are server-side concerns handled by the Go MCP shim's tools/call
-# dispatch. They do not require panel-side hooks; hello_scene follows the
-# same pattern. See the Go shim's internal/tools/ for the export handlers.

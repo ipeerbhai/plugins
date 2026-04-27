@@ -18,6 +18,7 @@
         "scripts": [
           "ui/CADPanel.gd",
           "ui/CadAnnotationHost.gd",
+          "ui/CadAnnotationCanvas.gd",
           "ui/scripts/mesh_display.gd",
           "ui/scripts/edge_overlay.gd",
           "ui/scripts/orbit_camera.gd"
