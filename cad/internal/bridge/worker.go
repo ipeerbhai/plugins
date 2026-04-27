@@ -49,6 +49,12 @@ type Worker struct {
 	pythonPath string
 	workerDir  string
 
+	// StderrCallback, if non-nil, is called for each line emitted by the worker
+	// on stderr (after the line has already been forwarded to Go's stderr via
+	// log.Printf). This allows the caller to apply additional filtering (e.g.,
+	// emitting Minerva toast notifications for critical lines).
+	StderrCallback func(line string)
+
 	// Subprocess state (guarded by mu).
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
@@ -167,7 +173,7 @@ func (w *Worker) startLocked(ctx context.Context) error {
 	w.doneC = make(chan struct{})
 
 	// Pump stderr to parent stderr with [worker] prefix (§5).
-	go pumpStderr(stderrPipe)
+	go pumpStderr(stderrPipe, w.StderrCallback)
 
 	// Reader goroutine: consumes frames from stdout and dispatches (§4).
 	go w.reader()
@@ -505,11 +511,17 @@ func buildEnv() []string {
 	return env
 }
 
-// pumpStderr consumes a reader and forwards each line to stderr with [worker] prefix.
-func pumpStderr(r io.Reader) {
+// pumpStderr consumes a reader and forwards each line to stderr with [worker]
+// prefix. If cb is non-nil it is called for each line after logging, allowing
+// the caller to apply additional filtering (e.g., Minerva toast notifications).
+func pumpStderr(r io.Reader, cb func(string)) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
-		log.Printf("[worker] %s", scanner.Text())
+		line := scanner.Text()
+		log.Printf("[worker] %s", line)
+		if cb != nil {
+			cb(line)
+		}
 	}
 }
 

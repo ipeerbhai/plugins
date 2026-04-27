@@ -20,9 +20,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/ipeerbhai/plugins/cad/internal/bridge"
@@ -86,6 +88,56 @@ func send(enc *json.Encoder, v interface{}) {
 }
 
 // ---------------------------------------------------------------------------
+// host.notify — Minerva toast pipe
+// ---------------------------------------------------------------------------
+
+// notifyParams is the params payload for the host.notify notification.
+type notifyParams struct {
+	Level   string      `json:"level"`
+	Message string      `json:"message"`
+	Details interface{} `json:"details,omitempty"`
+}
+
+// hostNotify is the JSON-RPC 2.0 notification envelope (no id field).
+type hostNotify struct {
+	JSONRPC string       `json:"jsonrpc"`
+	Method  string       `json:"method"`
+	Params  notifyParams `json:"params"`
+}
+
+// notifyOut is the writer used to emit host.notify messages. It is set to
+// os.Stdout in main() so tests can redirect it to a buffer.
+var notifyOut = io.Writer(os.Stdout)
+
+// notifyEnc is a lazily-initialised encoder that targets notifyOut. Tests
+// replace this after overriding notifyOut.
+var notifyEnc *json.Encoder
+
+// emitHostNotify writes a host.notify JSON-RPC 2.0 notification to stdout so
+// Minerva can display it as a toast. level must be "info", "warning", or "error".
+// details may be nil. The call is a no-op if message is empty.
+func emitHostNotify(level, message string, details interface{}) {
+	if message == "" {
+		return
+	}
+	if notifyEnc == nil {
+		notifyEnc = json.NewEncoder(notifyOut)
+	}
+	n := hostNotify{
+		JSONRPC: "2.0",
+		Method:  "host.notify",
+		Params: notifyParams{
+			Level:   level,
+			Message: message,
+			Details: details,
+		},
+	}
+	if err := notifyEnc.Encode(n); err != nil {
+		log.Printf("cad-plugin: emitHostNotify: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Global worker + tool registry
 // ---------------------------------------------------------------------------
 
@@ -108,12 +160,22 @@ func initWorker() {
 	pythonPath, err := runtime.PythonPath(workerDir)
 	if err != nil {
 		log.Printf("cad-plugin: WARNING: %v — mcad_validate will fail until python3 is on PATH or .venv exists", err)
+		emitHostNotify("error",
+			"CAD plugin: Python interpreter not found — mcad_validate and mcad_list_edges will fail",
+			map[string]string{"detail": err.Error(), "fix": "Install python3 or create a .venv in the plugin worker directory"})
 		// Still create a Worker with an empty path so Call returns a clean error.
 		pythonPath = ""
 	}
 	log.Printf("cad-plugin: worker dir=%s, python=%s", workerDir, pythonPath)
 
-	worker = bridge.New(pythonPath, workerDir)
+	w := bridge.New(pythonPath, workerDir)
+	// Attach the stderr callback so critical worker stderr lines surface as toasts.
+	w.StderrCallback = func(line string) {
+		if isCriticalStderrLine(line) {
+			emitHostNotify("error", "CAD worker: "+line, nil)
+		}
+	}
+	worker = w
 }
 
 // pluginRootDir returns the directory of the running executable, which by
@@ -194,6 +256,10 @@ func handleToolsCall(id json.RawMessage, params json.RawMessage) rpcResponse {
 		// so the LLM can inspect them. Only internal/protocol errors become MCP errors.
 		var we *bridge.WorkerError
 		if asWorkerErr(err, &we) {
+			// Surface spawn/crash errors (kind: crashed, python, internal) as error
+			// toasts; validation failures (kind: parse, translate, occt) as warnings.
+			toastLevel, toastMsg := workerErrorToast(p.Name, we)
+			emitHostNotify(toastLevel, toastMsg, we)
 			// Return structured error as tool content.
 			errJSON, _ := json.Marshal(we)
 			return okResponse(id, map[string]interface{}{
@@ -219,6 +285,55 @@ func asWorkerErr(err error, target **bridge.WorkerError) bool {
 	if we, ok := err.(*bridge.WorkerError); ok {
 		*target = we
 		return true
+	}
+	return false
+}
+
+// workerErrorToast maps a WorkerError to a (level, message) pair for toast
+// display. Spawn/crash errors surface at "error"; validation failures at
+// "warning" so the user can act without alarm.
+func workerErrorToast(toolName string, we *bridge.WorkerError) (level, message string) {
+	switch we.Kind {
+	case "crashed", "python", "internal":
+		return "error", fmt.Sprintf("CAD plugin [%s]: worker error (%s) — %s", toolName, we.Kind, we.Message)
+	case "parse", "translate", "occt":
+		return "warning", fmt.Sprintf("CAD plugin [%s]: validation failed (%s) — %s", toolName, we.Kind, we.Message)
+	case "timeout":
+		return "warning", fmt.Sprintf("CAD plugin [%s]: request timed out — %s", toolName, we.Message)
+	case "cancelled":
+		// Cancellation is expected; no toast needed. Return empty to suppress.
+		return "info", ""
+	default:
+		return "error", fmt.Sprintf("CAD plugin [%s]: worker error (%s) — %s", toolName, we.Kind, we.Message)
+	}
+}
+
+// criticalStderrPrefixes are line prefixes that indicate a critical problem in
+// the Python worker's stderr stream and should be surfaced as toast errors.
+// Lines that do NOT match any prefix are forwarded to the Go process's stderr
+// as-is (for the Activity log) but are NOT toasted.
+//
+// Design call on cold-start progress (build123d import, OCCT init):
+//   - Cold-start INFO/progress lines are intentionally NOT toasted — they are
+//     expected during first-use and would be noisy.
+//   - Only lines matching these prefixes become toasts; everything else is
+//     stderr-only (visible in the Activity log, not in toasts).
+var criticalStderrPrefixes = []string{
+	"FATAL:",
+	"ERROR:",
+	"ModuleNotFoundError:",
+	"ImportError:",
+	"RuntimeError:",
+	"Traceback (most recent call last):",
+}
+
+// isCriticalStderrLine returns true if line matches the critical filter.
+func isCriticalStderrLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	for _, prefix := range criticalStderrPrefixes {
+		if strings.HasPrefix(trimmed, prefix) {
+			return true
+		}
 	}
 	return false
 }
