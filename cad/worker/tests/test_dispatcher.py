@@ -46,7 +46,6 @@ class TestGeometryStubs:
     @pytest.mark.parametrize("method", [
         "evaluate",
         "export",
-        "validate",
         "list_edges",
         "deviation",
     ])
@@ -60,13 +59,134 @@ class TestGeometryStubs:
     @pytest.mark.parametrize("method", [
         "evaluate",
         "export",
-        "validate",
         "list_edges",
         "deviation",
     ])
     def test_echoes_id(self, method):
         resp = handle_request({"id": "xyz", "method": method, "params": {}})
         assert resp["id"] == "xyz"
+
+
+# ---------------------------------------------------------------------------
+# validate — real implementation (Round 2 Unit A)
+# ---------------------------------------------------------------------------
+
+# Minimal valid .mcad source: a single variable assignment.
+_VALID_SOURCE = "height = 100\n"
+
+# A slightly richer but still valid source with sketch + extrude syntax.
+_VALID_SOURCE_SKETCH = (
+    "sketch:\n"
+    "    s = rect(50, 30)\n"
+    "b = extrude(s, 20)\n"
+)
+
+# Source with a known lex error: bare '&' (should be '&&').
+_LEX_ERROR_SOURCE = "x = 1 & 2\n"
+
+# Source with a known parse error: 'else:' without a matching 'if:'.
+_PARSE_ERROR_SOURCE = "else:\n    x = 1\n"
+
+# Source with an unmatched paren (parse error).
+_UNMATCHED_PAREN_SOURCE = "x = (1 + 2\n"
+
+
+class TestValidate:
+    """Tests for the real validate implementation."""
+
+    # -- Response shape -------------------------------------------------------
+
+    def test_valid_source_ok_true(self):
+        resp = handle_request({"id": "r1", "method": "validate",
+                               "params": {"source": _VALID_SOURCE}})
+        assert resp is not None
+        assert resp["ok"] is True
+        assert resp["result"]["ok"] is True
+        assert resp["result"]["errors"] == []
+        assert resp["result"]["warnings"] == []
+
+    def test_valid_source_sketch_ok_true(self):
+        resp = handle_request({"id": "r2", "method": "validate",
+                               "params": {"source": _VALID_SOURCE_SKETCH}})
+        assert resp is not None
+        assert resp["ok"] is True
+        assert resp["result"]["ok"] is True
+        assert resp["result"]["errors"] == []
+
+    def test_id_echoed(self):
+        resp = handle_request({"id": "validate-42", "method": "validate",
+                               "params": {"source": _VALID_SOURCE}})
+        assert resp["id"] == "validate-42"
+
+    # -- Parse / lex errors are data, not bridge errors -----------------------
+
+    def test_lex_error_is_data_not_bridge_error(self):
+        resp = handle_request({"id": "r3", "method": "validate",
+                               "params": {"source": _LEX_ERROR_SOURCE}})
+        # Bridge-level ok must be True (request succeeded)
+        assert resp["ok"] is True
+        # Inner result ok is False because of the error
+        assert resp["result"]["ok"] is False
+        assert len(resp["result"]["errors"]) >= 1
+
+    def test_lex_error_has_line_col_message(self):
+        resp = handle_request({"id": "r4", "method": "validate",
+                               "params": {"source": _LEX_ERROR_SOURCE}})
+        err = resp["result"]["errors"][0]
+        assert "line" in err
+        assert "col" in err
+        assert "message" in err
+        assert isinstance(err["line"], int)
+        assert isinstance(err["col"], int)
+        assert isinstance(err["message"], str)
+        assert err["line"] >= 1  # lex error is on line 1
+
+    def test_parse_error_is_data_not_bridge_error(self):
+        resp = handle_request({"id": "r5", "method": "validate",
+                               "params": {"source": _PARSE_ERROR_SOURCE}})
+        assert resp["ok"] is True
+        assert resp["result"]["ok"] is False
+        assert len(resp["result"]["errors"]) >= 1
+
+    def test_parse_error_has_line_col_message(self):
+        resp = handle_request({"id": "r6", "method": "validate",
+                               "params": {"source": _PARSE_ERROR_SOURCE}})
+        err = resp["result"]["errors"][0]
+        assert "line" in err
+        assert "col" in err
+        assert "message" in err
+
+    def test_unmatched_paren_parse_error(self):
+        resp = handle_request({"id": "r7", "method": "validate",
+                               "params": {"source": _UNMATCHED_PAREN_SOURCE}})
+        assert resp["ok"] is True
+        assert resp["result"]["ok"] is False
+        assert len(resp["result"]["errors"]) >= 1
+
+    # -- Non-string source is an internal (bridge-level) error ----------------
+
+    def test_non_string_source_is_internal_error(self):
+        resp = handle_request({"id": "r8", "method": "validate",
+                               "params": {"source": 42}})
+        assert resp["ok"] is False
+        assert resp["error"]["kind"] == "internal"
+
+    def test_missing_source_key_treats_as_empty_string(self):
+        # Missing key → params.get("source", "") → "" → valid empty program
+        resp = handle_request({"id": "r9", "method": "validate",
+                               "params": {}})
+        assert resp is not None
+        assert resp["ok"] is True
+        assert resp["result"]["ok"] is True
+
+    # -- Empty source ---------------------------------------------------------
+
+    def test_empty_string_source_is_valid(self):
+        resp = handle_request({"id": "r10", "method": "validate",
+                               "params": {"source": ""}})
+        assert resp["ok"] is True
+        assert resp["result"]["ok"] is True
+        assert resp["result"]["errors"] == []
 
 
 class TestShutdownRequest:

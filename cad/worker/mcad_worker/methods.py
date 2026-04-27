@@ -4,11 +4,14 @@ This module is pure (no I/O) so it can be tested directly without stdio.
 Callers pass a decoded request dict and receive a response dict.
 
 Per design §8, only `init` and `shutdown` are real in Round 1 (scaffold).
-The five geometry methods return stub errors; they will be filled in by
-per-tool grandchildren.
+Round 2 Unit A adds a real `validate` implementation.
+The four remaining geometry methods return stub errors; they will be filled
+in by per-tool grandchildren.
 """
 
 from __future__ import annotations
+
+import traceback
 
 WORKER_VERSION = "0.1.0"
 
@@ -42,6 +45,81 @@ def _stub_not_implemented(req: dict) -> dict:
         "error": {
             "kind": "internal",
             "message": "not implemented in scaffold",
+        },
+    }
+
+
+def _validate(params: dict) -> dict:
+    """Validate .mcad source: lex + parse, but skip tessellation.
+
+    Returns {ok: bool, errors: [...], warnings: [...]}. Lex and parse
+    errors populate the errors list as data; they do NOT raise to the
+    bridge layer. Only catastrophic Python failures (unhandled exceptions)
+    propagate to the bridge as {ok: false, error: {kind: ...}}.
+
+    Per design §8.3 and the constraint that translator.py imports build123d
+    at module level (which requires OCCT), validate deliberately stops after
+    the parse phase.  Lex + parse catches all syntax errors and is OCCT-free,
+    which is exactly what makes validate cheap for the LLM inner loop.
+    """
+    source = params.get("source", "")
+    if not isinstance(source, str):
+        return {
+            "ok": False,
+            "error": {
+                "kind": "internal",
+                "message": "validate requires params.source: str",
+            },
+        }
+
+    errors: list[dict] = []
+    warnings: list[dict] = []
+
+    try:
+        from mcad.lexer import LexError, tokenize
+        from mcad.parser import ParseError, Parser
+
+        # Phase 1: lex
+        try:
+            tokens = tokenize(source)
+        except LexError as exc:
+            errors.append({"line": exc.line, "col": exc.col, "message": str(exc)})
+            return {
+                "ok": True,
+                "result": {"ok": False, "errors": errors, "warnings": warnings},
+            }
+
+        # Phase 2: parse
+        try:
+            parser = Parser(tokens)
+            parser.parse()
+        except ParseError as exc:
+            tok = exc.token
+            if tok is not None:
+                errors.append({"line": tok.line, "col": tok.col, "message": str(exc)})
+            else:
+                errors.append({"line": 0, "col": 0, "message": str(exc)})
+            return {
+                "ok": True,
+                "result": {"ok": False, "errors": errors, "warnings": warnings},
+            }
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": {
+                "kind": "python",
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+            },
+        }
+
+    return {
+        "ok": True,
+        "result": {
+            "ok": len(errors) == 0,
+            "errors": errors,
+            "warnings": warnings,
         },
     }
 
@@ -80,8 +158,13 @@ def handle_request(req: dict) -> dict | None:
         # Caller (dispatcher) uses the None sentinel to exit cleanly.
         return None  # dispatcher handles exit
 
-    # Five geometry stubs — filled in by per-tool grandchildren.
-    if method in ("evaluate", "export", "validate", "list_edges", "deviation"):
+    if method == "validate":
+        result = _validate(req.get("params") or {})
+        result["id"] = req_id
+        return result
+
+    # Four remaining geometry stubs — filled in by per-tool grandchildren.
+    if method in ("evaluate", "export", "list_edges", "deviation"):
         return _stub_not_implemented(req)
 
     # Unknown method.

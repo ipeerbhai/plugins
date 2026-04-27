@@ -1,26 +1,36 @@
-// Package runtime resolves the path of the bundled Python runtime that the
-// CAD worker subprocess is launched from.
-//
-// TODO(round-2): implement PBS tarball extraction, SHA-256 manifest check,
-// fallback lookup chain, and GC of old runtime versions per design §6.
-// The full shape is documented in Go-python-bridge-design.md §6
-// ("Python Packaging → Runtime directory").
+// Package runtime resolves the path of the Python interpreter and worker
+// entrypoint for the CAD worker subprocess.
 package runtime
 
 import (
-	"path/filepath"
+	"fmt"
+	"os/exec"
 )
 
-// RuntimeRoot returns the path to the extracted runtime directory for the
-// given plugin data directory and plugin version.
+// PythonPath returns the path to the Python interpreter to spawn the worker with.
 //
-// Canonical form (design §6):
+// Plan A (Round 2): look up `python3` from $PATH (dev-mode resolution).
+// Plan B (future grandchild): extract embedded PBS Python tarball to
+// <data_directory>/runtime/<plugin_version>/ and return that path.
+// See Docs/design/Go-python-bridge-design.md §6 for the full design.
+func PythonPath() (string, error) {
+	p, err := exec.LookPath("python3")
+	if err != nil {
+		return "", fmt.Errorf("python3 not on PATH: %w (TODO: replace with embedded PBS extract per design §6)", err)
+	}
+	return p, nil
+}
+
+// WorkerScriptDir returns the absolute filesystem path to the directory
+// containing the Python worker entrypoint module (`mcad_worker`).
 //
-//	<dataDir>/runtime/<pluginVersion>/
+// Plan A: assumes the plugin runs from a checkout, with worker/ next to the
+// Go binary. The caller invokes `python -m mcad_worker` with cwd set to the
+// returned directory.
 //
-// Round 1 stub: returns the path without verifying existence or extracting
-// anything.  A later grandchild task will add the three-step lookup (user
-// cache → pre-bundled → embedded tarball) and the GC policy.
-func RuntimeRoot(dataDir, pluginVersion string) string {
-	return filepath.Join(dataDir, "runtime", pluginVersion)
+// pluginRoot is typically the directory containing manifest.json, which the
+// plugin was launched from. We rely on the layout established in Round 1:
+// pluginRoot/worker/mcad_worker/.
+func WorkerScriptDir(pluginRoot string) string {
+	return pluginRoot + "/worker"
 }

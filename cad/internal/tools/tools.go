@@ -1,19 +1,32 @@
 // Package tools maintains the registry of MCP tools exposed by the CAD plugin.
 //
-// TODO(round-2+): register the five concrete CAD tools (mcad_render,
-// mcad_export, mcad_validate, mcad_list_edges, mcad_deviation) as grandchild
-// tasks are implemented.  Each tool will call bridge methods on the Go ↔
-// Python worker bridge (design §8).
+// Register tools at server startup (not in init()) so the registry is empty
+// at import time. Each tool's handler is a ToolHandlerFunc that receives raw
+// JSON params and returns raw JSON result or an error.
 package tools
 
-// HandlerFunc is the signature for an MCP tool handler.
-// params is the raw JSON params from the MCP tools/call message.
-// It returns a result JSON payload or an error.
-type HandlerFunc func(params []byte) ([]byte, error)
+import (
+	"context"
+	"encoding/json"
+
+	"github.com/ipeerbhai/plugins/cad/internal/bridge"
+)
+
+// ToolSpec describes an MCP tool for the tools/list response.
+type ToolSpec struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema json.RawMessage `json:"inputSchema"`
+}
+
+// ToolHandlerFunc is the signature for an MCP tool handler.
+// params is the raw JSON params from the tools/call "arguments" field.
+// Returns a JSON result payload or an error.
+type ToolHandlerFunc func(ctx context.Context, w *bridge.Worker, params json.RawMessage) (json.RawMessage, error)
 
 type entry struct {
-	name    string
-	handler HandlerFunc
+	spec    ToolSpec
+	handler ToolHandlerFunc
 }
 
 // Registry holds MCP tool registrations.
@@ -26,19 +39,29 @@ func NewRegistry() *Registry {
 	return &Registry{}
 }
 
-// Register adds a named tool with its handler to the registry.
-// Registering the same name twice appends a second entry (last one wins in
-// dispatch — a later grandchild task will deduplicate).
-func (r *Registry) Register(name string, handler HandlerFunc) {
-	r.entries = append(r.entries, entry{name: name, handler: handler})
+// Register adds a tool with its spec and handler to the registry.
+func (r *Registry) Register(spec ToolSpec, handler ToolHandlerFunc) {
+	r.entries = append(r.entries, entry{spec: spec, handler: handler})
 }
 
-// List returns the names of all registered tools.
-// Round 1: always returns an empty slice because no tools are registered yet.
-func (r *Registry) List() []string {
-	names := make([]string, 0, len(r.entries))
-	for _, e := range r.entries {
-		names = append(names, e.name)
+// Specs returns the ToolSpec for every registered tool, in registration order.
+// Used to build the tools/list response.
+func (r *Registry) Specs() []ToolSpec {
+	specs := make([]ToolSpec, len(r.entries))
+	for i, e := range r.entries {
+		specs[i] = e.spec
 	}
-	return names
+	return specs
+}
+
+// Dispatch looks up and calls the handler for the named tool.
+// Returns (nil, nil) if the name is not found (caller should return method-not-found).
+func (r *Registry) Dispatch(ctx context.Context, w *bridge.Worker, name string, params json.RawMessage) (json.RawMessage, error, bool) {
+	for _, e := range r.entries {
+		if e.spec.Name == name {
+			result, err := e.handler(ctx, w, params)
+			return result, err, true
+		}
+	}
+	return nil, nil, false
 }
