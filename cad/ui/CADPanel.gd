@@ -165,19 +165,10 @@ func _ready() -> void:
 	_projection_dropdown.select(0)  # Perspective by default
 	_projection_dropdown.item_selected.connect(_on_projection_selected)
 
-	# ── Stub mesh: load into every MeshRoot (4 wide + 1 narrow) ────────────
-	var stub_data := _make_unit_cube_mesh_data(50.0)
-	var mesh_paths: Array = [
-		grid + "/TopView/SubViewport/MeshRoot",
-		grid + "/FrontView/SubViewport/MeshRoot",
-		grid + "/RightView/SubViewport/MeshRoot",
-		grid + "/IsoView/SubViewport/MeshRoot",
-		"ResponsiveContainer/NarrowLayout/SingleView/SubViewport/MeshRoot",
-	]
-	for vp_path in mesh_paths:
-		var mesh_root: Node = get_node_or_null(vp_path)
-		if mesh_root != null and mesh_root.has_method("update_mesh"):
-			mesh_root.call("update_mesh", stub_data)
+	# Mesh is intentionally empty until a .mcad source is evaluated by the
+	# worker and pushed in via the future DSL→mesh bridge. Showing a stub
+	# cube here was misleading because it implied the panel had geometry
+	# without DSL backing it; the empty state is the honest state.
 
 	# ── Annotation substrate ───────────────────────────────────────────────
 	_annotation_registry = AnnotationRegistry.new()
@@ -230,13 +221,9 @@ func _ready() -> void:
 		if ov != null and ov.has_signal("edge_selected"):
 			ov.connect("edge_selected", Callable(self, "_on_edge_selected"))
 
-	# ── Synthesize an edge registry for the stub cube ──────────────────────
-	# When a real .mcad source is evaluated by the worker, a future grandchild
-	# will replace this with the worker's mcad_list_edges reply. For Round-3
-	# the cube is a deterministic 12-edge box and we can compute the registry
-	# locally — no IPC round-trip required.
-	_edge_registry = _synthesize_cube_edge_registry(stub_data)
-	_last_mesh_data = stub_data
+	# Edge registry stays empty until the DSL→mesh bridge wires the worker's
+	# mcad_list_edges reply into _edge_registry and calls _push_edges_to_overlays.
+	# Push the empty registry now so any pre-existing overlay state is cleared.
 	_push_edges_to_overlays()
 
 	# ── Wide-mode sidebar: edge Tree + Prev/Next/Clear buttons ─────────────
@@ -691,81 +678,6 @@ func _step_selected_edge(delta: int) -> void:
 	_set_selected_edge_id(ids[next_idx])
 
 
-## Build a minimal edge registry for the unit-cube stub. 12 straight edges,
-## ids 1..12. Dict shape matches the worker's mcad_list_edges contract: id,
-## start, end, midpoint, center, radius, normal, kind, source_plane,
-## axis_name, length, visible_in_views.
-func _synthesize_cube_edge_registry(mesh_data: Dictionary) -> Array:
-	var verts: Variant = mesh_data.get("vertices", [])
-	if not (verts is Array) or (verts as Array).size() < 8:
-		return []
-	# Dedup edges from triangles (matches mesh_display._accumulate_edge logic
-	# but in registry form).
-	var faces: Variant = mesh_data.get("faces", [])
-	if not (faces is Array):
-		return []
-	var seen: Dictionary = {}
-	var registry: Array = []
-	var next_id: int = 1
-	for face in faces:
-		if not (face is Array) or face.size() < 3:
-			continue
-		var ia := int(face[0])
-		var ib := int(face[1])
-		var ic := int(face[2])
-		var edge_pairs := [
-			[ia, ib],
-			[ib, ic],
-			[ic, ia],
-		]
-		for pair in edge_pairs:
-			var a_idx: int = pair[0]
-			var b_idx: int = pair[1]
-			var key := "%d|%d" % [mini(a_idx, b_idx), maxi(a_idx, b_idx)]
-			if seen.has(key):
-				continue
-			seen[key] = true
-			var va: Array = verts[a_idx]
-			var vb: Array = verts[b_idx]
-			var sa := Vector3(float(va[0]), float(va[1]), float(va[2]))
-			var sb := Vector3(float(vb[0]), float(vb[1]), float(vb[2]))
-			# For a cube, the diagonals on each face also show up here; filter
-			# by axis-alignment (any two coords equal between sa and sb means
-			# it's an axis-aligned edge).
-			var axis_aligned := (
-				(is_equal_approx(sa.x, sb.x) and is_equal_approx(sa.y, sb.y)) or
-				(is_equal_approx(sa.y, sb.y) and is_equal_approx(sa.z, sb.z)) or
-				(is_equal_approx(sa.x, sb.x) and is_equal_approx(sa.z, sb.z))
-			)
-			if not axis_aligned:
-				continue
-			var mid := (sa + sb) * 0.5
-			var length_val := sa.distance_to(sb)
-			var axis_name: String = "x"
-			if not is_equal_approx(sa.x, sb.x):
-				axis_name = "x"
-			elif not is_equal_approx(sa.y, sb.y):
-				axis_name = "y"
-			else:
-				axis_name = "z"
-			registry.append({
-				"id": next_id,
-				"start": [sa.x, sa.y, sa.z],
-				"end": [sb.x, sb.y, sb.z],
-				"midpoint": [mid.x, mid.y, mid.z],
-				"center": [mid.x, mid.y, mid.z],
-				"radius": 0.0,
-				"normal": [0.0, 0.0, 1.0],
-				"kind": "straight",
-				"source_plane": "",
-				"axis_name": axis_name,
-				"length": length_val,
-				"visible_in_views": ["top", "front", "right", "iso"],
-			})
-			next_id += 1
-	return registry
-
-
 # ── Toolbar → canvas plumbing ──────────────────────────────────────────────
 
 ## Called when the AnnotationToolbar emits active_tool_changed. Forwards the
@@ -775,26 +687,3 @@ func _on_toolbar_active_tool_changed(tool: AnnotationAuthorTool) -> void:
 		_canvas.set_active_tool(tool)
 
 
-# ── Stub mesh helpers ───────────────────────────────────────────────────────
-
-## Build mesh_data dict for an axis-aligned cube of side `size` centred at the
-## origin. Format matches MeshDisplay.update_mesh() expectations.
-func _make_unit_cube_mesh_data(size: float) -> Dictionary:
-	var h := size * 0.5
-	var verts := [
-		[-h, -h, -h], [ h, -h, -h], [ h, -h,  h], [-h, -h,  h],
-		[-h,  h, -h], [ h,  h, -h], [ h,  h,  h], [-h,  h,  h],
-	]
-	var faces := [
-		[0, 2, 1], [0, 3, 2],
-		[4, 5, 6], [4, 6, 7],
-		[3, 6, 2], [3, 7, 6],
-		[0, 1, 5], [0, 5, 4],
-		[1, 2, 6], [1, 6, 5],
-		[0, 4, 7], [0, 7, 3],
-	]
-	return {
-		"vertices": verts,
-		"faces":    faces,
-		"color":    [0.78, 0.62, 0.12],
-	}
