@@ -273,8 +273,10 @@ func handleToolsCall(id json.RawMessage, params json.RawMessage) rpcResponse {
 			// toasts; validation failures (kind: parse, translate, occt) as warnings.
 			toastLevel, toastMsg := workerErrorToast(p.Name, we)
 			emitHostNotify(toastLevel, toastMsg, we)
-			// Return structured error as tool content.
-			errJSON, _ := json.Marshal(we)
+			// Preserve the {ok, error} envelope shape the worker uses on success
+			// so panel-side decoders can read worker_payload.ok / .error uniformly.
+			errEnvelope := map[string]interface{}{"ok": false, "error": we}
+			errJSON, _ := json.Marshal(errEnvelope)
 			return okResponse(id, map[string]interface{}{
 				"content": []map[string]interface{}{
 					{"type": "text", "text": string(errJSON)},
@@ -285,10 +287,15 @@ func handleToolsCall(id json.RawMessage, params json.RawMessage) rpcResponse {
 		return errResponse(id, -32603, fmt.Sprintf("tool error: %v", err))
 	}
 
-	// Wrap the raw result in MCP tool result shape.
+	// Wrap the raw result in {ok: true, result: <result>} so the panel-side
+	// decoder is symmetric with the error path (which uses {ok: false, error}).
+	// bridge.Worker.Call strips the worker's {ok, result} wrapper on success,
+	// so we re-wrap here before forwarding to MCP.
+	successEnvelope := map[string]interface{}{"ok": true, "result": json.RawMessage(result)}
+	envelopeJSON, _ := json.Marshal(successEnvelope)
 	return okResponse(id, map[string]interface{}{
 		"content": []map[string]interface{}{
-			{"type": "text", "text": string(result)},
+			{"type": "text", "text": string(envelopeJSON)},
 		},
 	})
 }
