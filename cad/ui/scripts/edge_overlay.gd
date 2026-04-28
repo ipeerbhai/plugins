@@ -411,8 +411,9 @@ func _project_circle_edge(edge_info: Dictionary) -> Dictionary:
 		normal = Vector3.UP
 	normal = normal.normalized()
 	# Build an orthonormal basis in the circle's plane.
-	var seed := Vector3.UP if abs(normal.dot(Vector3.UP)) < 0.9 else Vector3.RIGHT
-	var u := seed.cross(normal).normalized() * radius
+	# Renamed from `seed` to avoid shadowing Godot's seed() global.
+	var seed_vec := Vector3.UP if abs(normal.dot(Vector3.UP)) < 0.9 else Vector3.RIGHT
+	var u := seed_vec.cross(normal).normalized() * radius
 	var v := normal.cross(u).normalized() * radius
 
 	var polyline: PackedVector2Array = PackedVector2Array()
@@ -579,19 +580,20 @@ func hover_clear_if_selected() -> void:
 	_hovered_edge_ids = filtered
 
 
-func _chooser_edge_at_position(position: Vector2) -> int:
+## `pos` not `position` — `position` shadows Control.position.
+func _chooser_edge_at_position(pos: Vector2) -> int:
 	for edge_id in _chooser_rects.keys():
 		var rect: Rect2 = _chooser_rects[edge_id]
-		if rect.has_point(position):
+		if rect.has_point(pos):
 			return int(edge_id)
 	return -1
 
 
-func _edge_ids_at_position(position: Vector2) -> Array:
+func _edge_ids_at_position(pos: Vector2) -> Array:
 	var hits: Array = []
 	for edge_id in _projected_edges.keys():
 		var projected: Dictionary = _projected_edges[edge_id]
-		var distance := _distance_to_projected_edge(position, projected)
+		var distance := _distance_to_projected_edge(pos, projected)
 		if distance <= PICK_RADIUS:
 			hits.append({"id": int(edge_id), "distance": distance})
 	hits.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
@@ -605,21 +607,21 @@ func _edge_ids_at_position(position: Vector2) -> Array:
 	return result
 
 
-func _distance_to_projected_edge(position: Vector2, projected: Dictionary) -> float:
+func _distance_to_projected_edge(pos: Vector2, projected: Dictionary) -> float:
 	if str(projected.get("kind", "")) == "circle" and projected.has("polyline"):
 		var polyline: PackedVector2Array = projected["polyline"]
 		if polyline.size() >= 2:
 			var best: float = INF
 			for i in range(polyline.size() - 1):
-				var d := _distance_point_to_segment(position, polyline[i], polyline[i + 1])
+				var d := _distance_point_to_segment(pos, polyline[i], polyline[i + 1])
 				if d < best:
 					best = d
 			return best
 	var start: Vector2 = projected["start"]
 	var end: Vector2 = projected["end"]
 	if bool(projected["pointlike"]):
-		return position.distance_to(start)
-	return _distance_point_to_segment(position, start, end)
+		return pos.distance_to(start)
+	return _distance_point_to_segment(pos, start, end)
 
 
 func _distance_point_to_segment(point: Vector2, a: Vector2, b: Vector2) -> float:
