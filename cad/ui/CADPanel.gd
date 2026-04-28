@@ -27,6 +27,7 @@ const _CadAnnotationCanvasScript: Script = preload("CadAnnotationCanvas.gd")
 const _ResponsiveContainerScript: Script = preload("res://Scripts/UI/Controls/responsive_container.gd")
 const _AnnotationToolbarScript: Script = preload("res://Scripts/Services/Annotations/AnnotationToolbar.gd")
 const _BuiltinKindsScript: Script = preload("res://Scripts/Services/Annotations/BuiltinKinds.gd")
+const _CadEdgeNumberKindScript: Script = preload("kinds/cad_edge_number_kind.gd")
 
 # ── Node references (set in _ready) ────────────────────────────────────────
 
@@ -176,6 +177,8 @@ func _ready() -> void:
 	# measure_distance, measure_angle, measure_radius). CAD-specific 3-D kinds
 	# are a later grandchild (`019dd017d9df`).
 	_BuiltinKindsScript.register_all(_annotation_registry)
+	# Register cad_edge_number: numbered callout bubbles for LLM/user edge disambiguation.
+	_annotation_registry.register_annotation_kind(_CadEdgeNumberKindScript.new())
 
 	_annotation_host = _CadAnnotationHostScript.new()
 	_annotation_host._registry = _annotation_registry
@@ -536,7 +539,7 @@ func _build_edge_sidebar() -> void:
 
 	var label := Label.new()
 	label.name = "EdgeSidebarHeader"
-	label.text = "Logical Edges"
+	label.text = "Edge Markers"
 	label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_wide_sidebar.add_child(label)
 

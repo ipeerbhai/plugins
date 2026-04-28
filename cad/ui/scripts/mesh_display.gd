@@ -20,11 +20,6 @@ const EDGE_LABEL_VERTICAL_OFFSET := 10.0
 const EDGE_LABEL_DEPTH_STAGGER := 10.0
 const EDGE_LABEL_PIXEL_SIZE := 0.0026
 const EDGE_LABEL_FONT_SIZE := 24
-# Above this edge count, skip auto-rendering all labels + leader lines.
-# Keeps the T-beam (24 edges) usable while preventing stutter on dense
-# post-boolean models like the bolt-flange plate (~68 edges), where the
-# label cloud is both visually noisy and slow to render.
-const MAX_AUTO_LABEL_EDGES := 32
 
 var _mesh_instance: MeshInstance3D
 var _edge_instance: MeshInstance3D
@@ -90,20 +85,12 @@ func update_mesh(mesh_data: Dictionary, edge_registry: Variant = []) -> void:
 				_mesh_instance.mesh = arr_mesh
 				_mesh_instance.visible = true
 		_edge_instance.mesh = _build_feature_edge_mesh(raw_verts, raw_faces)
-		var label_registry: Variant = edge_registry
-		if edge_registry is Array and edge_registry.size() > MAX_AUTO_LABEL_EDGES:
-			# Too many edges for an ID-label cloud to be useful — hide the
-			# labels + leader lines. Picking/hover/selection still work via
-			# EdgeOverlay; the feature-edge mesh still shows outlines.
-			label_registry = []
-		if _wireframe_only:
-			_edge_leader_instance.mesh = null
-		else:
-			_edge_leader_instance.mesh = _build_edge_label_leaders(label_registry, aabb.get_center())
-		if _wireframe_only:
-			_render_edge_labels([], aabb.get_center())
-		else:
-			_render_edge_labels(label_registry, aabb.get_center())
+		# Default-no-labels: edge id callouts are now handled by the
+		# `cad_edge_number` annotation kind, not auto-emitted. The leader
+		# helpers and Label3D root remain but stay empty unless something
+		# else populates them.
+		_edge_leader_instance.mesh = null
+		_render_edge_labels([], aabb.get_center())
 		_auto_frame(raw_verts, aabb)
 
 
@@ -302,6 +289,8 @@ func _parse_color(raw_color: Variant) -> Color:
 	return DEFAULT_MESH_COLOR
 
 
+# Retained for the Round 2 annotation-driven `cad_edge_number` rendering path.
+# Currently called only with [] from update_mesh — no auto-emission.
 func _render_edge_labels(edge_registry: Variant, model_center: Vector3) -> void:
 	if not (edge_registry is Array):
 		return
@@ -332,6 +321,7 @@ func _render_edge_labels(edge_registry: Variant, model_center: Vector3) -> void:
 		_edge_label_root.add_child(label)
 
 
+# Retained for the Round 2 annotation-driven `cad_edge_number` rendering path.
 func _build_edge_label_leaders(edge_registry: Variant, model_center: Vector3) -> ImmediateMesh:
 	if not (edge_registry is Array):
 		return null
