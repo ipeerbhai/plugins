@@ -39,13 +39,19 @@ func set_host(host: AnnotationHost) -> void:
 		# script also works against a vanilla AnnotationHost during tests.
 		if _host.has_signal("annotations_changed") and _host.annotations_changed.is_connected(_on_annotations_changed):
 			_host.annotations_changed.disconnect(_on_annotations_changed)
-		if _host.selection_changed.is_connected(queue_redraw):
-			_host.selection_changed.disconnect(queue_redraw)
+		if _host.selection_changed.is_connected(_on_host_selection_changed):
+			_host.selection_changed.disconnect(_on_host_selection_changed)
 	_host = host
 	if _host != null:
 		if _host.has_signal("annotations_changed"):
 			_host.annotations_changed.connect(_on_annotations_changed)
-		_host.selection_changed.connect(queue_redraw)
+		_host.selection_changed.connect(_on_host_selection_changed)
+	queue_redraw()
+
+
+## selection_changed carries the new id (String). queue_redraw() takes no args,
+## so wrap it via a method that drops the argument.
+func _on_host_selection_changed(_annotation_id: String) -> void:
 	queue_redraw()
 
 

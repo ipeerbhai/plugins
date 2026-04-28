@@ -254,7 +254,7 @@ func _make_grid_mesh() -> ImmediateMesh:
 
 func _build_axis_gizmo() -> MeshInstance3D:
 	var mesh := ImmediateMesh.new()
-	var size := 20.0
+	var gizmo_size := 20.0
 
 	mesh.surface_begin(Mesh.PRIMITIVE_LINES)
 
@@ -262,19 +262,19 @@ func _build_axis_gizmo() -> MeshInstance3D:
 	mesh.surface_set_color(Color(1, 0, 0))
 	mesh.surface_add_vertex(Vector3.ZERO)
 	mesh.surface_set_color(Color(1, 0, 0))
-	mesh.surface_add_vertex(Vector3(size, 0, 0))
+	mesh.surface_add_vertex(Vector3(gizmo_size, 0, 0))
 
 	# Y axis — green
 	mesh.surface_set_color(Color(0, 1, 0))
 	mesh.surface_add_vertex(Vector3.ZERO)
 	mesh.surface_set_color(Color(0, 1, 0))
-	mesh.surface_add_vertex(Vector3(0, size, 0))
+	mesh.surface_add_vertex(Vector3(0, gizmo_size, 0))
 
 	# Z axis — blue
 	mesh.surface_set_color(Color(0.2, 0.4, 1))
 	mesh.surface_add_vertex(Vector3.ZERO)
 	mesh.surface_set_color(Color(0.2, 0.4, 1))
-	mesh.surface_add_vertex(Vector3(0, 0, size))
+	mesh.surface_add_vertex(Vector3(0, 0, gizmo_size))
 
 	mesh.surface_end()
 
