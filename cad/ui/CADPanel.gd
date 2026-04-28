@@ -291,6 +291,10 @@ func _on_panel_load_request(document: Dictionary) -> void:
 	var dsl_text: String = fa.get_as_text()
 	fa.close()
 
+	# Push document source into host so MCP can read it without IPC.
+	if _annotation_host != null and _annotation_host.has_method("set_document_source"):
+		_annotation_host.set_document_source(file_path, dsl_text)
+
 	_evaluate_and_render(dsl_text)
 
 
@@ -357,6 +361,12 @@ func _evaluate_and_render(dsl_text: String) -> void:
 	# Update panel state and re-push edge overlays + sidebar tree.
 	_last_mesh_data = mesh_data
 	_edge_registry = edges
+	# Mirror into host so MCP introspection tools can read without reaching into the panel.
+	if _annotation_host != null:
+		if _annotation_host.has_method("set_mesh_data"):
+			_annotation_host.set_mesh_data(mesh_data)
+		if _annotation_host.has_method("set_edge_registry"):
+			_annotation_host.set_edge_registry(edges)
 	_push_edges_to_overlays()
 	_render_edge_tree(_edge_registry)
 	# Re-apply mesh visibility (ortho panes hide the shaded mesh; iso shows it).

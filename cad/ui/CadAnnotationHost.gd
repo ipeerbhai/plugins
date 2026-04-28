@@ -288,6 +288,52 @@ func get_selected_edge_id() -> int:
 	return _selected_edge_id
 
 
+# ── MCP introspection state (task 019dd2049ff6) ────────────────────────────
+## Mesh data last pushed by CADPanel after a successful cad.evaluate reply.
+## Shape: {vertices: [[x,y,z],...], faces: [[i,j,k],...]} — same dict the
+## worker returns.  Empty dict = no geometry yet.
+var _mesh_data: Dictionary = {}
+
+## Edge registry last pushed by CADPanel after a successful cad.evaluate reply.
+## Array of edge dicts; exact shape from the worker (id, kind, length/radius, …).
+var _edge_registry_data: Array = []
+
+## Document source last pushed by CADPanel on load / evaluate.
+var _document_file_path: String = ""
+var _document_dsl_text: String = ""
+
+
+## Called by CADPanel after a successful cad.evaluate IPC reply.
+func set_mesh_data(mesh: Dictionary) -> void:
+	_mesh_data = mesh
+
+
+## Called by CADPanel after a successful cad.evaluate IPC reply.
+func set_edge_registry(edges: Array) -> void:
+	_edge_registry_data = edges
+
+
+## Return the current mesh data dict (may be empty if not yet evaluated).
+func get_mesh_data() -> Dictionary:
+	return _mesh_data
+
+
+## Return the current edge registry array (may be empty).
+func get_edge_registry() -> Array:
+	return _edge_registry_data
+
+
+## Called by CADPanel once both file_path and dsl_text are known.
+func set_document_source(file_path: String, dsl_text: String) -> void:
+	_document_file_path = file_path
+	_document_dsl_text = dsl_text
+
+
+## Return {file_path, dsl_text} for MCP introspection.
+func get_document_source() -> Dictionary:
+	return {"file_path": _document_file_path, "dsl_text": _document_dsl_text}
+
+
 ## Map a document-space point to screen-space for a specific viewport.
 ## Round 1 stub: identity. Round 2 will delegate to the viewport's Camera3D.
 ##
