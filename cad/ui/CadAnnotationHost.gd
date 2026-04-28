@@ -61,6 +61,15 @@ var _selected_edge_id: int = -1
 ## it loose for symmetry with the rest of the off-tree contract.
 var _viewport_for: Dictionary = {}
 
+## Map of view_id -> Camera3D, populated by CADPanel._ready() via
+## set_camera_for(). Used by get_panes() so cad_edge_number_kind can project
+## a 3-D world point into each pane's screen-space.
+var _camera_for: Dictionary = {}
+
+## Ordered list of pane ids (wide mode: the 4 standard CAD views).
+## Used by get_panes() to return panes in stable order.
+const WIDE_PANE_IDS: PackedStringArray = ["iso", "top", "front", "right"]
+
 ## Cache of last captured Image keyed by view_id. Invalidated when
 ## set_active_viewport() changes the active id, or when the cached frame
 ## number no longer matches the engine's current frame.
@@ -276,6 +285,78 @@ func set_viewport_for(view_id: String, vp: Node) -> void:
 		_viewport_for.erase(view_id)
 		return
 	_viewport_for[view_id] = vp
+
+
+## Register the Camera3D that backs a given view_id. CADPanel calls this once
+## per pane in _ready() (same call site as set_viewport_for). Stored untyped
+## for off-tree duck-typing symmetry; Camera3D.unproject_position() is accessed
+## via duck typing in cad_edge_number_kind.
+func set_camera_for(view_id: String, cam: Object) -> void:
+	if cam == null:
+		_camera_for.erase(view_id)
+		return
+	_camera_for[view_id] = cam
+
+
+## Return a list of active pane descriptors for multi-pane annotation rendering.
+##
+## Each element is a Dictionary:
+##   {
+##     "name":          String     — view_id, e.g. "iso", "top", "front", "right"
+##     "camera":        Object     — Camera3D (duck-typed); null if not registered
+##     "viewport_size": Vector2    — pixel size of this pane's SubViewport
+##   }
+##
+## Only panes that have BOTH a camera and a SubViewport registered are included.
+## This covers the 4 wide-mode panes. In narrow mode the single viewport is
+## registered under all preset ids; get_panes() returns only the active one
+## (stored under _active_viewport_id) to avoid duplicates.
+##
+## Round 2a-Unit2 callers (cad_edge_number_kind.render) use this to iterate
+## panes and project a 3-D world point into each pane's screen-space.
+func get_panes() -> Array:
+	var result: Array = []
+	# Wide mode: return the 4 canonical pane ids that have both camera + viewport.
+	var seen_viewports := {}
+	for pane_id in WIDE_PANE_IDS:
+		var cam: Variant = _camera_for.get(pane_id, null)
+		var vp: Variant = _viewport_for.get(pane_id, null)
+		if cam == null or vp == null:
+			continue
+		# In narrow mode all ids map to the same SubViewport — deduplicate.
+		var vp_id: int = vp.get_instance_id() if vp.has_method("get_instance_id") else 0
+		if vp_id != 0 and seen_viewports.has(vp_id):
+			# Narrow mode: all preset ids share one viewport — emit only once.
+			continue
+		seen_viewports[vp_id] = true
+		var vp_size := Vector2(512.0, 512.0)
+		if vp.has_method("get_visible_rect"):
+			vp_size = vp.get_visible_rect().size
+		elif "size" in vp:
+			vp_size = Vector2(vp.size)
+		result.append({
+			"name": pane_id,
+			"camera": cam,
+			"viewport_size": vp_size,
+		})
+
+	# Fallback: if we got nothing from WIDE_PANE_IDS (narrow mode / early init),
+	# emit the active viewport's pane so single-pane callers still work.
+	if result.is_empty():
+		var cam: Variant = _camera_for.get(_active_viewport_id, null)
+		var vp: Variant = _viewport_for.get(_active_viewport_id, null)
+		if cam != null and vp != null:
+			var vp_size := Vector2(512.0, 512.0)
+			if vp.has_method("get_visible_rect"):
+				vp_size = vp.get_visible_rect().size
+			elif "size" in vp:
+				vp_size = Vector2(vp.size)
+			result.append({
+				"name": _active_viewport_id,
+				"camera": cam,
+				"viewport_size": vp_size,
+			})
+	return result
 
 
 ## Set/get the currently selected edge id for the active viewport.

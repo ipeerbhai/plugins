@@ -82,6 +82,9 @@ func _draw() -> void:
 		1.0,
 		_host.get_view_context()
 	)
+	# Wire the host into the render context so multi-pane kinds (cad_edge_number
+	# Round 2a-Unit2) can call ctx.host.get_panes() for per-pane projection.
+	ctx.host = _host
 
 	for ann in _host.get_annotations():
 		if registry != null:

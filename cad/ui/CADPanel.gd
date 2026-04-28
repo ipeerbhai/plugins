@@ -426,12 +426,22 @@ func _apply_width_class(cls: StringName) -> void:
 func _register_host_viewports(is_narrow: bool) -> void:
 	if _annotation_host == null:
 		return
+	# Resolve cameras used in wide mode.
+	var grid := "ResponsiveContainer/WideLayout/VBoxContainer/GridContainer"
+	var iso_cam: Camera3D   = get_node_or_null(grid + "/IsoView/SubViewport/OrbitCamera")   as Camera3D
+	var top_cam: Camera3D   = get_node_or_null(grid + "/TopView/SubViewport/OrbitCamera")   as Camera3D
+	var front_cam: Camera3D = get_node_or_null(grid + "/FrontView/SubViewport/OrbitCamera") as Camera3D
+	var right_cam: Camera3D = get_node_or_null(grid + "/RightView/SubViewport/OrbitCamera") as Camera3D
 	if is_narrow:
 		var single_vp: SubViewport = _single_view_container.get_node("SubViewport") as SubViewport
 		# In narrow mode every projection id (incl. "iso") resolves to the
 		# single SubViewport whose camera preset the dropdown drives.
 		for proj in ["perspective", "top", "bottom", "front", "back", "left", "right", "iso"]:
 			_annotation_host.set_viewport_for(proj, single_vp)
+		# Register the single-view camera under the active viewport id.
+		if _annotation_host.has_method("set_camera_for"):
+			for proj in ["perspective", "top", "bottom", "front", "back", "left", "right", "iso"]:
+				_annotation_host.set_camera_for(proj, _single_view_camera)
 	else:
 		var iso_vp: SubViewport   = _iso_view_container.get_node("SubViewport") as SubViewport
 		var top_vp: SubViewport   = _top_view_container.get_node("SubViewport") as SubViewport
@@ -441,9 +451,17 @@ func _register_host_viewports(is_narrow: bool) -> void:
 		_annotation_host.set_viewport_for("top", top_vp)
 		_annotation_host.set_viewport_for("front", front_vp)
 		_annotation_host.set_viewport_for("right", right_vp)
+		# Register per-pane cameras for multi-pane annotation projection (Round 2a-Unit2).
+		if _annotation_host.has_method("set_camera_for"):
+			_annotation_host.set_camera_for("iso", iso_cam)
+			_annotation_host.set_camera_for("top", top_cam)
+			_annotation_host.set_camera_for("front", front_cam)
+			_annotation_host.set_camera_for("right", right_cam)
 		# Narrow-only ids unset in wide mode (they'd be unreachable anyway).
 		for proj in ["perspective", "bottom", "back", "left"]:
 			_annotation_host.set_viewport_for(proj, null)
+			if _annotation_host.has_method("set_camera_for"):
+				_annotation_host.set_camera_for(proj, null)
 
 
 ## Move the toolbar between the wide sidebar and the narrow VBox.

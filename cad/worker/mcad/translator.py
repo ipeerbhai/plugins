@@ -1386,6 +1386,7 @@ class Translator:
 
         all_edges = list(shape.edges())
         adjacency = self._build_edge_face_adjacency(shape, all_edges)
+        wire_membership = self._build_wire_membership(shape, all_edges)
 
         entries: list[dict[str, Any]] = []
         next_id = 1
@@ -1439,6 +1440,8 @@ class Translator:
                 normal_v = edge.normal()
                 normal = [float(normal_v.X), float(normal_v.Y), float(normal_v.Z)]
 
+            tags = self._derive_semantic_tags(kind, role, wire_membership[i])
+
             entries.append(
                 {
                     "id": entry_id,
@@ -1454,7 +1457,7 @@ class Translator:
                     "normal": normal,
                     "length": float(edge.length),
                     "role": role,
-                    "tags": [],
+                    "tags": tags,
                     "visible_in_views": list(self._GENERIC_VISIBLE_VIEWS),
                 }
             )
@@ -1497,6 +1500,66 @@ class Translator:
             entry.sort()
         return adjacency
 
+    def _build_wire_membership(
+        self, shape: Any, edges: list[Any]
+    ) -> list[set[str]]:
+        """For each edge in ``edges``, return the set of wire-membership labels.
+
+        Labels are ``"outer"`` (edge belongs to a face's outer wire) and/or
+        ``"inner"`` (edge belongs to a face's inner wire / hole boundary).
+
+        An edge can appear in both sets when it sits on the outer wire of one
+        face and the inner wire of another (rare but topologically valid).
+
+        Uses the same ``IsSame`` matching as ``_build_edge_face_adjacency``
+        because Python object identity does not work for OCCT shapes.
+        """
+        membership: list[set[str]] = [set() for _ in edges]
+        try:
+            faces = list(shape.faces())
+        except Exception:
+            return membership
+
+        for face in faces:
+            try:
+                outer_wire = face.outer_wire()
+                outer_edges = list(outer_wire.edges())
+            except Exception:
+                outer_edges = []
+
+            try:
+                inner_wire_edges: list[Any] = []
+                for iw in face.inner_wires():
+                    inner_wire_edges.extend(list(iw.edges()))
+            except Exception:
+                inner_wire_edges = []
+
+            for wire_edge in outer_edges:
+                we_shape = getattr(wire_edge, "wrapped", None)
+                if we_shape is None:
+                    continue
+                for i, edge in enumerate(edges):
+                    e_shape = getattr(edge, "wrapped", None)
+                    if e_shape is None:
+                        continue
+                    if e_shape.IsSame(we_shape):
+                        membership[i].add("outer")
+                        break
+
+            for wire_edge in inner_wire_edges:
+                we_shape = getattr(wire_edge, "wrapped", None)
+                if we_shape is None:
+                    continue
+                for i, edge in enumerate(edges):
+                    e_shape = getattr(edge, "wrapped", None)
+                    if e_shape is None:
+                        continue
+                    if e_shape.IsSame(we_shape):
+                        membership[i].add("inner")
+                        break
+
+        return membership
+
     @staticmethod
     def _classify_edge_role(kind: str, face_types: list[str]) -> str:
         """Classify an edge's geometric role from its curve kind plus the
@@ -1534,6 +1597,56 @@ class Translator:
             return "other"
         return "other"
 
+    @staticmethod
+    def _derive_semantic_tags(
+        kind: str,
+        role: str,
+        wire_labels: set[str],
+    ) -> list[str]:
+        """Return the semantic tag list for an edge given its curve kind, role,
+        and wire-membership labels.
+
+        Tag vocabulary
+        --------------
+        Curve-kind tags (mutually exclusive):
+          ``"linear"``      — straight (LINE) edge
+          ``"circular"``    — circle or arc edge
+          ``"curve"``       — any other parametric curve
+
+        Role-derived tags (may be combined):
+          ``"corner"``             — straight edge between two planar faces
+          ``"rim"``                — circle edge between a planar and curved face
+          ``"chamfer_connector"``  — straight edge between planar and curved faces
+          ``"feature"``            — superset: any of corner / rim / chamfer_connector
+
+        Wire-membership tags (may be combined):
+          ``"outer"``   — edge appears in at least one face's outer wire
+          ``"inner"``   — edge appears in at least one face's inner wire (hole)
+
+        Seam edges are never passed to this method (they are skipped before
+        tag assignment in both emission paths).
+        """
+        tags: list[str] = []
+
+        # Curve-kind tag.
+        if kind == "straight":
+            tags.append("linear")
+        elif kind == "circle":
+            tags.append("circular")
+        else:
+            tags.append("curve")
+
+        # Role-derived semantic tags.
+        if role in {"corner", "rim", "chamfer_connector"}:
+            tags.append(role)
+            tags.append("feature")
+
+        # Wire-membership tags (deduplication via set → sorted for stability).
+        for label in sorted(wire_labels):
+            tags.append(label)
+
+        return tags
+
     def _build_extruded_edge_registry(
         self,
         shape: Any,
@@ -1545,24 +1658,48 @@ class Translator:
         - XY plane numbers longitudinal Z edges from the source profile vertices.
         - XZ plane numbers X-parallel cap edges.
         - YZ plane numbers Y-parallel cap edges.
+
+        Wire membership (outer/inner) is computed once for the whole shape and
+        threaded through the sub-builders so semantic tags are consistent with
+        the generic path.
         """
+        # Build face-adjacency and wire-membership once for the whole shape.
+        # The sub-builders receive both tables and look up individual edges via
+        # IsSame when assembling each registry entry.
+        all_shape_edges = list(shape.edges())
+        adjacency = self._build_edge_face_adjacency(shape, all_shape_edges)
+        wire_membership = self._build_wire_membership(shape, all_shape_edges)
+
         registry: list[dict[str, Any]] = []
-        xy_entries = self._build_xy_registry_entries(shape, profile_vertices)
+        xy_entries = self._build_xy_registry_entries(
+            shape, profile_vertices, all_shape_edges, adjacency, wire_membership
+        )
         registry.extend(xy_entries)
 
         next_id = len(registry) + 1
         x_edges = list(shape.edges().filter_by(Axis.X))
-        registry.extend(self._build_axis_plane_entries(x_edges, "XZ", "X", next_id))
+        registry.extend(
+            self._build_axis_plane_entries(
+                x_edges, "XZ", "X", next_id, all_shape_edges, adjacency, wire_membership
+            )
+        )
 
         next_id = len(registry) + 1
         y_edges = list(shape.edges().filter_by(Axis.Y))
-        registry.extend(self._build_axis_plane_entries(y_edges, "YZ", "Y", next_id))
+        registry.extend(
+            self._build_axis_plane_entries(
+                y_edges, "YZ", "Y", next_id, all_shape_edges, adjacency, wire_membership
+            )
+        )
         return registry
 
     def _build_xy_registry_entries(
         self,
         shape: Any,
         profile_vertices: list[tuple[float, float]],
+        all_shape_edges: list[Any] | None = None,
+        adjacency: list[list[str]] | None = None,
+        wire_membership: list[set[str]] | None = None,
     ) -> list[dict[str, Any]]:
         """Number longitudinal edges from the 2D profile vertices."""
         numbering = number_edges_2d(profile_vertices)
@@ -1581,6 +1718,20 @@ class Translator:
                     break
             if matched_edge is None:
                 continue
+            face_types = self._lookup_face_types(matched_edge, all_shape_edges, adjacency)
+            role = self._classify_edge_role("straight", face_types)
+            wire_labels = self._lookup_wire_labels(
+                matched_edge, all_shape_edges, wire_membership
+            )
+            spatial_tags = self._derive_spatial_tags(matched_edge.center(), "Z")
+            semantic_tags = self._derive_semantic_tags("straight", role, wire_labels)
+            # Merge: spatial first, then semantic (deduped, order-stable).
+            seen: set[str] = set(spatial_tags)
+            combined = list(spatial_tags)
+            for t in semantic_tags:
+                if t not in seen:
+                    combined.append(t)
+                    seen.add(t)
             entries.append(
                 self._make_registry_entry(
                     edge_num=edge_num,
@@ -1589,7 +1740,7 @@ class Translator:
                     axis_name="Z",
                     kind="longitudinal",
                     source_point=[float(target_xy[0]), float(target_xy[1])],
-                    tags=self._derive_spatial_tags(matched_edge.center(), "Z"),
+                    tags=combined,
                 )
             )
         return entries
@@ -1600,6 +1751,9 @@ class Translator:
         source_plane: str,
         axis_name: str,
         start_id: int,
+        all_shape_edges: list[Any] | None = None,
+        adjacency: list[list[str]] | None = None,
+        wire_membership: list[set[str]] | None = None,
     ) -> list[dict[str, Any]]:
         """Number X- or Y-parallel cap edges by plane-local polar sweep."""
         projected = [self._project_midpoint(edge.center(), source_plane) for edge in edges]
@@ -1618,6 +1772,19 @@ class Translator:
         entries: list[dict[str, Any]] = []
         for offset, edge in enumerate(ordered_edges):
             midpoint = edge.center()
+            face_types = self._lookup_face_types(edge, all_shape_edges, adjacency)
+            role = self._classify_edge_role("straight", face_types)
+            wire_labels = self._lookup_wire_labels(
+                edge, all_shape_edges, wire_membership
+            )
+            spatial_tags = self._derive_spatial_tags(midpoint, axis_name)
+            semantic_tags = self._derive_semantic_tags("straight", role, wire_labels)
+            seen: set[str] = set(spatial_tags)
+            combined = list(spatial_tags)
+            for t in semantic_tags:
+                if t not in seen:
+                    combined.append(t)
+                    seen.add(t)
             entries.append(
                 self._make_registry_entry(
                     edge_num=start_id + offset,
@@ -1626,7 +1793,7 @@ class Translator:
                     axis_name=axis_name,
                     kind="cap_edge",
                     source_point=list(self._project_midpoint(midpoint, source_plane)),
-                    tags=self._derive_spatial_tags(midpoint, axis_name),
+                    tags=combined,
                 )
             )
         return entries
@@ -1710,6 +1877,55 @@ class Translator:
         )
         raw = "|".join(f"{x},{y},{z}" for x, y, z in coords)
         return hashlib.sha256(raw.encode()).hexdigest()
+
+    @staticmethod
+    def _lookup_wire_labels(
+        edge: Any,
+        all_shape_edges: list[Any] | None,
+        wire_membership: list[set[str]] | None,
+    ) -> set[str]:
+        """Return the wire-membership label set for ``edge`` by finding its
+        position in ``all_shape_edges`` via ``IsSame``.
+
+        Returns an empty set when either lookup table is absent (graceful
+        degradation for call-sites that don't have them).
+        """
+        if all_shape_edges is None or wire_membership is None:
+            return set()
+        e_shape = getattr(edge, "wrapped", None)
+        if e_shape is None:
+            return set()
+        for i, candidate in enumerate(all_shape_edges):
+            c_shape = getattr(candidate, "wrapped", None)
+            if c_shape is None:
+                continue
+            if e_shape.IsSame(c_shape):
+                return set(wire_membership[i])
+        return set()
+
+    @staticmethod
+    def _lookup_face_types(
+        edge: Any,
+        all_shape_edges: list[Any] | None,
+        adjacency: list[list[str]] | None,
+    ) -> list[str]:
+        """Return the sorted adjacent face-type list for ``edge`` by finding
+        its position in ``all_shape_edges`` via ``IsSame``.
+
+        Returns ``[]`` when either lookup table is absent.
+        """
+        if all_shape_edges is None or adjacency is None:
+            return []
+        e_shape = getattr(edge, "wrapped", None)
+        if e_shape is None:
+            return []
+        for i, candidate in enumerate(all_shape_edges):
+            c_shape = getattr(candidate, "wrapped", None)
+            if c_shape is None:
+                continue
+            if e_shape.IsSame(c_shape):
+                return list(adjacency[i])
+        return []
 
     def _derive_spatial_tags(self, point: Any, axis_name: str) -> list[str]:
         tags = [f"axis_{axis_name.lower()}"]
