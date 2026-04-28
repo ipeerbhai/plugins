@@ -28,7 +28,8 @@
           "cad.serialize",
           "cad.deserialize",
           "cad.collect_export",
-          "cad.apply_export"
+          "cad.apply_export",
+          "cad.evaluate"
         ],
         "save_mode": "host_owned"
       }
@@ -37,7 +38,8 @@
       "cad.serialize",
       "cad.deserialize",
       "cad.collect_export",
-      "cad.apply_export"
+      "cad.apply_export",
+      "cad.evaluate"
     ]
   },
   "editor_items": [

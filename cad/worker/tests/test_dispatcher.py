@@ -333,6 +333,42 @@ class TestEvaluate:
 
 
 @_b123d_mark
+class TestEvaluatePipelineIntegration:
+    """End-to-end test that mirrors the cad.evaluate MCP path: a small
+    inline .mcad source goes through handle_request and returns a mesh + edges
+    payload shaped exactly as the CAD panel expects.
+
+    A 10mm cube extrude is small enough to keep tessellation cheap.
+    """
+
+    _CUBE_SOURCE = (
+        "sketch:\n"
+        "    s = rect(10, 10)\n"
+        "b = extrude(s, 10)\n"
+    )
+
+    def test_evaluate_returns_panel_ready_payload(self):
+        resp = handle_request({
+            "id": 1,
+            "method": "evaluate",
+            "params": {"source": self._CUBE_SOURCE},
+        })
+        assert resp is not None
+        assert resp["ok"] is True, f"Expected ok=True, got: {resp}"
+        result = resp["result"]
+        # Panel reads result.mesh.vertices, result.mesh.faces, result.edges.
+        assert isinstance(result.get("shape_name"), str)
+        mesh = result["mesh"]
+        assert isinstance(mesh["vertices"], list)
+        assert len(mesh["vertices"]) > 0
+        assert isinstance(mesh["faces"], list)
+        assert len(mesh["faces"]) > 0
+        edges = result["edges"]
+        assert isinstance(edges, list)
+        assert len(edges) > 0
+
+
+@_b123d_mark
 class TestListEdges:
     """Tests for the real list_edges implementation (build123d required)."""
 

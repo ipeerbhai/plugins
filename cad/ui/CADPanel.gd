@@ -271,8 +271,96 @@ func _on_panel_save_request() -> Dictionary:
 	return {"version": 1}
 
 
-func _on_panel_load_request(_document: Dictionary) -> void:
-	pass
+func _on_panel_load_request(document: Dictionary) -> void:
+	# Round 3: live `.mcad` → CAD panel pipeline. The host loads the file path
+	# from the editor; we read the DSL text off disk and round-trip it through
+	# the worker's `evaluate` method. The reply carries {shape_name, mesh, edges}
+	# which we push to all 5 MeshDisplay instances + the edge overlays + the
+	# sidebar Tree.
+	var file_path: String = str(document.get("file_path", ""))
+	if file_path.is_empty():
+		return
+
+	var fa := FileAccess.open(file_path, FileAccess.READ)
+	if fa == null:
+		push_warning(
+			"[CADPanel] _on_panel_load_request: cannot open '%s' (err=%d)"
+			% [file_path, FileAccess.get_open_error()]
+		)
+		return
+	var dsl_text: String = fa.get_as_text()
+	fa.close()
+
+	_evaluate_and_render(dsl_text)
+
+
+## Round-trip a DSL string through the worker's evaluate method and update the
+## panel state (meshes, edges, sidebar) with the result. Centralised so a future
+## bottom-split editor (`019dd0211893`) can call the same path on save/run.
+func _evaluate_and_render(dsl_text: String) -> void:
+	var ipc := get_node_or_null("_MinervaIPC")
+	if ipc == null:
+		push_warning("[CADPanel] _evaluate_and_render: MinervaIPC helper not attached; cannot dispatch cad.evaluate")
+		return
+
+	var reply_id := "cad.evaluate:" + str(Time.get_ticks_usec())
+	request.emit("cad.evaluate", {"source": dsl_text}, reply_id)
+
+	# 30s timeout: build123d cold-start can take ~10s on first invocation; the
+	# default 10s is too tight for first-open of a fresh worker process.
+	var result: Dictionary = await ipc.await_reply(reply_id, 30000)
+
+	if not bool(result.get("success", false)):
+		var err_code: String = str(result.get("error_code", "unknown"))
+		var err_msg: String = str(result.get("error_message", ""))
+		push_warning(
+			"[CADPanel] cad.evaluate transport failure: %s — %s"
+			% [err_code, err_msg]
+		)
+		return
+
+	# PluginScenePanelBroker wraps the worker payload in PluginErrors.success(),
+	# so the visible shape is:
+	#   result = {success:true, result: <worker_payload>}
+	# where <worker_payload> is the raw worker dict {ok, result|error}.
+	var worker_payload: Dictionary = result.get("result", {})
+	if not (worker_payload is Dictionary):
+		push_warning("[CADPanel] cad.evaluate: missing worker payload")
+		return
+
+	if not bool(worker_payload.get("ok", false)):
+		var err: Dictionary = worker_payload.get("error", {}) as Dictionary
+		var kind: String = str(err.get("kind", "unknown"))
+		var msg: String = str(err.get("message", ""))
+		push_warning("[CADPanel] cad.evaluate worker error [%s]: %s" % [kind, msg])
+		return
+
+	var eval_result: Dictionary = worker_payload.get("result", {}) as Dictionary
+	var mesh_data: Dictionary = eval_result.get("mesh", {}) as Dictionary
+	var edges_var: Variant = eval_result.get("edges", [])
+	var edges: Array = edges_var if edges_var is Array else []
+
+	# Push mesh into all 5 MeshDisplay instances. The MeshRoot Node3D in each
+	# SubViewport has scripts/mesh_display.gd attached, exposing update_mesh().
+	var mesh_root_paths := [
+		"ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/TopView/SubViewport/MeshRoot",
+		"ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/FrontView/SubViewport/MeshRoot",
+		"ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/RightView/SubViewport/MeshRoot",
+		"ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/IsoView/SubViewport/MeshRoot",
+		"ResponsiveContainer/NarrowLayout/SingleView/SubViewport/MeshRoot",
+	]
+	for path in mesh_root_paths:
+		var mr := get_node_or_null(path)
+		if mr != null and mr.has_method("update_mesh"):
+			mr.call("update_mesh", mesh_data, edges)
+
+	# Update panel state and re-push edge overlays + sidebar tree.
+	_last_mesh_data = mesh_data
+	_edge_registry = edges
+	_push_edges_to_overlays()
+	_render_edge_tree(_edge_registry)
+	# Re-apply mesh visibility (ortho panes hide the shaded mesh; iso shows it).
+	_apply_mesh_visibility()
 
 
 # ── Width-class handling ────────────────────────────────────────────────────
