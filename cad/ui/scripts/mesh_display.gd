@@ -64,7 +64,10 @@ func _ready() -> void:
 ##
 ## TODO(scaffold-round-2): wire to plugin IPC instead of HTTP backend.
 ## In Round 2+, CADPanel._on_ipc_mesh_ready(data) calls update_mesh(data, edge_registry).
-func update_mesh(mesh_data: Dictionary, edge_registry: Variant = []) -> void:
+## edge_registry parameter retained on the signature but unused — Round 1 stripped
+## the auto-emitted Label3D edge callouts; the cad_edge_number annotation kind owns
+## that surface now. Underscore prefix silences UNUSED_PARAMETER.
+func update_mesh(mesh_data: Dictionary, _edge_registry: Variant = []) -> void:
 	clear_mesh()
 
 	var raw_verts = mesh_data.get("vertices", [])

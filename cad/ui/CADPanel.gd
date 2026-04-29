@@ -212,7 +212,12 @@ func _ready() -> void:
 	# (Round 2b-α Unit 1 fix for bug 019dd65c237d.)
 	_canvas_overlay = Control.new()
 	_canvas_overlay.name = "AnnotationCanvasOverlay"
-	_canvas_overlay.mouse_filter = Control.MOUSE_FILTER_PASS
+	# IGNORE so clicks fall through the overlay chain to the SubViewportContainer
+	# siblings underneath. PASS would NOT achieve this — Godot's PASS forwards
+	# events to the PARENT, not to siblings beneath. The overlay never needs to
+	# receive input directly; the canvas (its child) toggles its own filter to
+	# STOP when an authoring tool is active.
+	_canvas_overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_canvas_overlay.set_anchors_preset(Control.PRESET_FULL_RECT)
 	# Force draw-on-top regardless of sibling order — robust to future reordering.
 	_canvas_overlay.z_index = 1
@@ -221,7 +226,10 @@ func _ready() -> void:
 	# ── Build single AnnotationCanvas, parented to the panel-root overlay ────
 	_canvas = _CadAnnotationCanvasScript.new()
 	_canvas.name = "AnnotationCanvas"
-	_canvas.mouse_filter = Control.MOUSE_FILTER_PASS
+	# IGNORE in idle so clicks pass through to SubViewportContainers below.
+	# CadAnnotationCanvas.set_active_tool() flips this to STOP while a tool
+	# is active, so _gui_input fires and routes to the tool's pointer handlers.
+	_canvas.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_canvas.set_anchors_preset(Control.PRESET_FULL_RECT)
 	_canvas.set_host(_annotation_host)
 	_canvas_overlay.add_child(_canvas)

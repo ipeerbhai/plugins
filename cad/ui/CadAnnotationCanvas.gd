@@ -57,6 +57,15 @@ func _on_host_selection_changed(_annotation_id: String) -> void:
 
 ## Set or clear the active authoring tool. The toolbar pushes this on tool
 ## activation/deactivation via its active_tool_changed signal.
+##
+## Toggles mouse_filter to claim or release input:
+##   active   → MOUSE_FILTER_STOP — _gui_input fires; events forwarded to tool.
+##   inactive → MOUSE_FILTER_IGNORE — clicks fall through the canvas-overlay
+##              chain to the SubViewportContainers underneath (orbit/pan/etc.).
+##
+## Round 2b-α discovered that PASS does NOT forward to siblings/children
+## beneath — it forwards to the PARENT. Without IGNORE on idle, the
+## panel-root overlay swallows every click and the CAD UI freezes.
 func set_active_tool(tool: AnnotationAuthorTool) -> void:
 	if _active_tool != null:
 		if _active_tool.annotation_modified.is_connected(_on_tool_annotation_modified):
@@ -65,6 +74,9 @@ func set_active_tool(tool: AnnotationAuthorTool) -> void:
 	if _active_tool != null:
 		if not _active_tool.annotation_modified.is_connected(_on_tool_annotation_modified):
 			_active_tool.annotation_modified.connect(_on_tool_annotation_modified)
+		mouse_filter = Control.MOUSE_FILTER_STOP
+	else:
+		mouse_filter = Control.MOUSE_FILTER_IGNORE
 	queue_redraw()
 
 

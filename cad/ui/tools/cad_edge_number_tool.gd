@@ -35,8 +35,6 @@ enum _State { IDLE, DONE }
 
 var _state: int = _State.IDLE
 var _host: Object = null           # AnnotationHost (duck-typed; Cad_AnnotationHost actual)
-var _canvas_overlay: Object = null # Control node whose mouse_filter we temporarily flip
-var _saved_mouse_filter: int = 0   # restored on deactivate
 var _schema_version: int = 1
 
 
@@ -45,33 +43,12 @@ var _schema_version: int = 1
 func on_activate(host: AnnotationHost) -> void:
 	_host = host
 	_state = _State.IDLE
-
-	# Locate the _canvas_overlay via the host. In practice the host is a
-	# Cad_AnnotationHost and CADPanel pushes _canvas_overlay into it as
-	# _panel_root (set via host.set_panel_root(_canvas_overlay)). We walk
-	# the two available routes using duck typing:
-	#   1. host.get_canvas_overlay() — if the host exposes it explicitly.
-	#   2. host._panel_root — the fallback already wired by CADPanel._ready().
-	_canvas_overlay = null
-	if _host != null:
-		if _host.has_method("get_canvas_overlay"):
-			_canvas_overlay = _host.get_canvas_overlay()
-		elif "_panel_root" in _host:
-			_canvas_overlay = _host._panel_root
-
-	# Flip mouse_filter → STOP (0) so clicks land on the canvas overlay (and
-	# therefore on the canvas's _gui_input) rather than passing through to the
-	# SubViewports beneath. MOUSE_FILTER_STOP = 0.
-	if _canvas_overlay != null and "mouse_filter" in _canvas_overlay:
-		_saved_mouse_filter = _canvas_overlay.mouse_filter
-		_canvas_overlay.mouse_filter = 0
+	# Mouse-filter management lives on CadAnnotationCanvas.set_active_tool() —
+	# flipping STOP↔IGNORE based on whether any tool is bound. We don't need
+	# to touch the panel-root overlay here.
 
 
 func on_deactivate() -> void:
-	# Restore canvas overlay mouse_filter unconditionally.
-	if _canvas_overlay != null and "mouse_filter" in _canvas_overlay:
-		_canvas_overlay.mouse_filter = _saved_mouse_filter
-	_canvas_overlay = null
 	_host = null
 	_state = _State.IDLE
 
