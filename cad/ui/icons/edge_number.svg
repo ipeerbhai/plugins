@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Bubble background -->
+  <rect x="2" y="2" width="12" height="10" rx="3" ry="3" fill="#15181c" fill-opacity="0.94" stroke="#8c99ad" stroke-width="1"/>
+  <!-- "1" numeral -->
+  <text x="8" y="10.5" text-anchor="middle" font-family="monospace" font-size="8" font-weight="bold" fill="#ebf0f8">#</text>
+  <!-- leader dot -->
+  <circle cx="8" cy="14.5" r="1.5" fill="#c0cde0"/>
+  <!-- leader line -->
+  <line x1="8" y1="12" x2="8" y2="13" stroke="#c0cde0" stroke-width="1"/>
+</svg>

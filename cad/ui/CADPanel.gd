@@ -72,6 +72,11 @@ var _canvas = null
 ## In wide mode the canvas is overlaid on the Iso quadrant by default.
 var _active_viewport_id: String = "iso"
 
+## Panel-root overlay Control that parents the AnnotationCanvas so it spans all
+## 4 SubViewportContainers. Created in _ready() as a sibling-above the
+## ResponsiveContainer. mouse_filter=PASS so all clicks reach the SubViewports.
+var _canvas_overlay: Control = null
+
 # ── Annotation substrate ────────────────────────────────────────────────────
 
 var _annotation_registry: AnnotationRegistry = null
@@ -199,15 +204,34 @@ func _ready() -> void:
 	_toolbar.set_host(_annotation_host)
 	_toolbar.active_tool_changed.connect(_on_toolbar_active_tool_changed)
 
-	# ── Build single AnnotationCanvas, overlay on Iso (wide default) ───────
+	# ── Build panel-root overlay Control for the AnnotationCanvas ────────────
+	# The canvas must span ALL 4 SubViewportContainers so leaders for every pane
+	# draw at the correct panel-root-relative position. We create a full-rect
+	# Control sibling above the ResponsiveContainer, parent the canvas there, and
+	# set mouse_filter=PASS so all clicks still reach the SubViewports.
+	# (Round 2b-α Unit 1 fix for bug 019dd65c237d.)
+	_canvas_overlay = Control.new()
+	_canvas_overlay.name = "AnnotationCanvasOverlay"
+	_canvas_overlay.mouse_filter = Control.MOUSE_FILTER_PASS
+	_canvas_overlay.set_anchors_preset(Control.PRESET_FULL_RECT)
+	# Force draw-on-top regardless of sibling order — robust to future reordering.
+	_canvas_overlay.z_index = 1
+	add_child(_canvas_overlay)
+
+	# ── Build single AnnotationCanvas, parented to the panel-root overlay ────
 	_canvas = _CadAnnotationCanvasScript.new()
 	_canvas.name = "AnnotationCanvas"
 	_canvas.mouse_filter = Control.MOUSE_FILTER_PASS
 	_canvas.set_anchors_preset(Control.PRESET_FULL_RECT)
 	_canvas.set_host(_annotation_host)
-	# Initial parent = Iso quadrant in wide mode. _on_width_class_changed will
-	# move it to the single-view in narrow mode.
-	_iso_view_container.add_child(_canvas)
+	_canvas_overlay.add_child(_canvas)
+	# Inform the host about the panel root so it can compute panel-relative rects.
+	# get_panes() resolves rects lazily via Control.get_global_rect() at call
+	# time. By the time the first annotation _draw() runs, layout has settled
+	# and rects are accurate. Synchronous get_panes() callers during _ready()
+	# would receive the Rect2(0,0,512,512) fallback — that path is unused.
+	if _annotation_host.has_method("set_panel_root"):
+		_annotation_host.set_panel_root(_canvas_overlay)
 	_annotation_host.set_active_viewport(_active_viewport_id)
 
 	# ── Edge overlay wiring (one EdgeOverlay per SubViewport) ──────────────
@@ -442,6 +466,11 @@ func _register_host_viewports(is_narrow: bool) -> void:
 		if _annotation_host.has_method("set_camera_for"):
 			for proj in ["perspective", "top", "bottom", "front", "back", "left", "right", "iso"]:
 				_annotation_host.set_camera_for(proj, _single_view_camera)
+		# Register the single container for all narrow-mode pane ids so
+		# viewport_rect computation finds the right container.
+		if _annotation_host.has_method("set_container_for"):
+			for proj in ["perspective", "top", "bottom", "front", "back", "left", "right", "iso"]:
+				_annotation_host.set_container_for(proj, _single_view_container)
 	else:
 		var iso_vp: SubViewport   = _iso_view_container.get_node("SubViewport") as SubViewport
 		var top_vp: SubViewport   = _top_view_container.get_node("SubViewport") as SubViewport
@@ -457,11 +486,19 @@ func _register_host_viewports(is_narrow: bool) -> void:
 			_annotation_host.set_camera_for("top", top_cam)
 			_annotation_host.set_camera_for("front", front_cam)
 			_annotation_host.set_camera_for("right", right_cam)
+		# Register per-pane containers for viewport_rect computation (Round 2b-α Unit 1).
+		if _annotation_host.has_method("set_container_for"):
+			_annotation_host.set_container_for("iso",   _iso_view_container)
+			_annotation_host.set_container_for("top",   _top_view_container)
+			_annotation_host.set_container_for("front", _front_view_container)
+			_annotation_host.set_container_for("right", _right_view_container)
 		# Narrow-only ids unset in wide mode (they'd be unreachable anyway).
 		for proj in ["perspective", "bottom", "back", "left"]:
 			_annotation_host.set_viewport_for(proj, null)
 			if _annotation_host.has_method("set_camera_for"):
 				_annotation_host.set_camera_for(proj, null)
+			if _annotation_host.has_method("set_container_for"):
+				_annotation_host.set_container_for(proj, null)
 
 
 ## Move the toolbar between the wide sidebar and the narrow VBox.
@@ -477,24 +514,19 @@ func _reparent_toolbar(narrow: bool) -> void:
 	target_parent.add_child(_toolbar)
 
 
-## Move the AnnotationCanvas overlay between the active wide quadrant (Iso) and
-## the narrow single-view container.
+## Update the active viewport id when the layout changes.
+##
+## Round 2b-α Unit 1: the canvas is permanently parented to _canvas_overlay
+## (a full-rect Control above ALL SubViewportContainers), so we no longer
+## reparent it on wide↔narrow transitions. We only update the host's active
+## viewport id so MCP queries and render_content_to_image target the right pane.
+## (Previously this method moved the canvas between iso and single-view containers;
+## that approach caused leaders for non-iso panes to draw at wrong positions.)
 func _reparent_canvas(narrow: bool) -> void:
-	if _canvas == null:
-		return
-	var current_parent: Node = _canvas.get_parent()
-	var target_parent: Node
 	if narrow:
-		target_parent = _single_view_container
 		_active_viewport_id = _projection_preset_to_viewport_id(_current_projection_preset())
 	else:
-		target_parent = _iso_view_container
 		_active_viewport_id = "iso"
-	if current_parent != target_parent:
-		if current_parent != null:
-			current_parent.remove_child(_canvas)
-		target_parent.add_child(_canvas)
-		_canvas.set_anchors_preset(Control.PRESET_FULL_RECT)
 	if _annotation_host != null and _annotation_host.has_method("set_active_viewport"):
 		_annotation_host.set_active_viewport(_active_viewport_id)
 

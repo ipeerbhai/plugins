@@ -298,13 +298,41 @@ func set_camera_for(view_id: String, cam: Object) -> void:
 	_camera_for[view_id] = cam
 
 
+## Map of view_id -> SubViewportContainer node, populated by CADPanel._ready() via
+## set_container_for(). Used by get_panes() to compute each pane's viewport_rect
+## (panel-relative screen-space rectangle) for canvas-coord offset correction.
+var _container_for: Dictionary = {}
+
+## Panel-root overlay Control node. Set by CADPanel when it reparents the canvas
+## to the panel root. Used to compute panel-relative rects in get_panes().
+var _panel_root: Control = null
+
+
+## Register the SubViewportContainer that backs a given view_id. CADPanel calls
+## this so get_panes() can compute viewport_rect via container.get_global_rect()
+## minus _panel_root.global_position.
+func set_container_for(view_id: String, container: Control) -> void:
+	if container == null:
+		_container_for.erase(view_id)
+		return
+	_container_for[view_id] = container
+
+
+## Set the panel-root overlay Control used to compute panel-relative rects.
+func set_panel_root(root: Control) -> void:
+	_panel_root = root
+
+
 ## Return a list of active pane descriptors for multi-pane annotation rendering.
 ##
 ## Each element is a Dictionary:
 ##   {
-##     "name":          String     — view_id, e.g. "iso", "top", "front", "right"
-##     "camera":        Object     — Camera3D (duck-typed); null if not registered
-##     "viewport_size": Vector2    — pixel size of this pane's SubViewport
+##     "name":          String  — view_id, e.g. "iso", "top", "front", "right"
+##     "camera":        Object  — Camera3D (duck-typed); null if not registered
+##     "viewport_rect": Rect2   — pane's screen-space rect within the panel-root
+##                                canvas (used to offset projected coords so leaders
+##                                land in the correct quadrant). Defaults to
+##                                Rect2(0,0,512,512) when container not registered.
 ##   }
 ##
 ## Only panes that have BOTH a camera and a SubViewport registered are included.
@@ -312,8 +340,15 @@ func set_camera_for(view_id: String, cam: Object) -> void:
 ## registered under all preset ids; get_panes() returns only the active one
 ## (stored under _active_viewport_id) to avoid duplicates.
 ##
-## Round 2a-Unit2 callers (cad_edge_number_kind.render) use this to iterate
-## panes and project a 3-D world point into each pane's screen-space.
+## Narrow-mode handling: when all WIDE_PANE_IDS collapse to a single SubViewport
+## (via dedup), the fallback path returns one pane for the active viewport id.
+## Its viewport_rect covers the single-view container's full area (offset from
+## the panel root). If the container is not registered, rect defaults to
+## Rect2(0,0,512,512) so the kind still works correctly for single-pane scenarios.
+##
+## Round 2b-α callers (cad_edge_number_kind.render) use this to iterate panes,
+## project a 3-D world point into each pane's screen-space, then add
+## viewport_rect.position to translate into panel-root canvas coordinates.
 func get_panes() -> Array:
 	var result: Array = []
 	# Wide mode: return the 4 canonical pane ids that have both camera + viewport.
@@ -329,15 +364,10 @@ func get_panes() -> Array:
 			# Narrow mode: all preset ids share one viewport — emit only once.
 			continue
 		seen_viewports[vp_id] = true
-		var vp_size := Vector2(512.0, 512.0)
-		if vp.has_method("get_visible_rect"):
-			vp_size = vp.get_visible_rect().size
-		elif "size" in vp:
-			vp_size = Vector2(vp.size)
 		result.append({
 			"name": pane_id,
 			"camera": cam,
-			"viewport_size": vp_size,
+			"viewport_rect": _compute_viewport_rect(pane_id),
 		})
 
 	# Fallback: if we got nothing from WIDE_PANE_IDS (narrow mode / early init),
@@ -346,17 +376,32 @@ func get_panes() -> Array:
 		var cam: Variant = _camera_for.get(_active_viewport_id, null)
 		var vp: Variant = _viewport_for.get(_active_viewport_id, null)
 		if cam != null and vp != null:
-			var vp_size := Vector2(512.0, 512.0)
-			if vp.has_method("get_visible_rect"):
-				vp_size = vp.get_visible_rect().size
-			elif "size" in vp:
-				vp_size = Vector2(vp.size)
 			result.append({
 				"name": _active_viewport_id,
 				"camera": cam,
-				"viewport_size": vp_size,
+				"viewport_rect": _compute_viewport_rect(_active_viewport_id),
 			})
 	return result
+
+
+## Compute the panel-relative Rect2 for a given pane id using the registered
+## SubViewportContainer. Returns Rect2(0,0,512,512) as a safe default when the
+## container or panel root is not set (e.g. in tests without a live scene tree).
+func _compute_viewport_rect(pane_id: String) -> Rect2:
+	var container: Variant = _container_for.get(pane_id, null)
+	if container == null or not is_instance_valid(container):
+		return Rect2(0.0, 0.0, 512.0, 512.0)
+	if _panel_root == null or not is_instance_valid(_panel_root):
+		# No panel root reference — return the container's global rect as-is.
+		if container.has_method("get_global_rect"):
+			return container.get_global_rect()
+		return Rect2(0.0, 0.0, 512.0, 512.0)
+	# Panel-relative rect: global rect minus panel root's global position.
+	if container.has_method("get_global_rect"):
+		var global_rect: Rect2 = container.get_global_rect()
+		var panel_origin: Vector2 = _panel_root.global_position
+		return Rect2(global_rect.position - panel_origin, global_rect.size)
+	return Rect2(0.0, 0.0, 512.0, 512.0)
 
 
 ## Set/get the currently selected edge id for the active viewport.

@@ -36,6 +36,9 @@ extends AnnotationKind
 ## indexing and work fine from here. preload() is used by CADPanel.gd and tests
 ## to load this script.
 
+## Authoring tool — loaded lazily so the tool script can itself preload base classes.
+const _CadEdgeNumberToolScript: Script = preload("../tools/cad_edge_number_tool.gd")
+
 # Visual constants — match the existing "white number on dark bubble" style
 # that edge_overlay.gd used for its old built-in labels.
 const _BUBBLE_FILL := Color(0.08, 0.09, 0.11, 0.94)
@@ -57,6 +60,13 @@ func _init() -> void:
 	owning_plugin = &"cad"
 	primitives_optional = true
 	default_payload = {"edge_id": 0}
+	# Toolbar icon: small SVG with a numbered bubble + leader dot.
+	# ImageTexture.create_from_image is not available in headless tests without a
+	# display, so we guard with a null check and silently omit the icon there.
+	var icon_img := Image.new()
+	var err := icon_img.load("res://../../plugins/cad/ui/icons/edge_number.svg")
+	if err == OK and icon_img != null:
+		toolbar_icon = ImageTexture.create_from_image(icon_img)
 
 
 # ── Validation ────────────────────────────────────────────────────────────────
@@ -122,7 +132,7 @@ func render(ctx: AnnotationRenderContext, annotation: Dictionary) -> void:
 ## visible_in_views (annotation metadata) lists which panes show this annotation.
 ## If absent or empty, all 4 default panes are used.
 ##
-## ctx.host must respond to get_panes() → Array[{name, camera, viewport_size}].
+## ctx.host must respond to get_panes() → Array[{name, camera, viewport_rect}].
 ## If ctx.host is null or has no get_panes(), falls back to the 2D-screen path
 ## using the first two elements of the at array.
 func _render_multi_pane(
@@ -167,6 +177,11 @@ func _render_multi_pane(
 
 		# Project the 3D world point into this pane's screen-space.
 		var screen_pos: Vector2 = camera.unproject_position(world_pos)
+		# Translate from pane-local screen coords to panel-root canvas coords.
+		# viewport_rect.position is the pane's top-left corner within the panel
+		# root overlay (computed by Cad_AnnotationHost._compute_viewport_rect).
+		var rect: Rect2 = (pane as Dictionary).get("viewport_rect", Rect2())
+		screen_pos += rect.position
 		_draw_callout(ctx, screen_pos, label_text, leader_color)
 
 
@@ -186,10 +201,14 @@ func bounds(annotation: Dictionary) -> Rect2:
 	return Rect2(bubble_center - approx_half, approx_half * 2.0)
 
 
-# ── author_ui: null for Round 1 (toolbar stub, no click-to-place UX yet) ─────
+# ── author_ui: returns a fresh CadEdgeNumberTool for Round 2b-α ──────────────
 
+## Returns a fresh cad_edge_number_tool instance so the AnnotationToolbar can
+## activate click-to-add authoring. Each call returns a NEW instance to avoid
+## stale state leaking across deactivate/reactivate cycles (mirrors the arrow
+## and text kind patterns).
 func author_ui() -> Object:
-	return null
+	return _CadEdgeNumberToolScript.new()
 
 
 # ── Private drawing helpers ───────────────────────────────────────────────────
