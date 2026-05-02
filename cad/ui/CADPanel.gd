@@ -23,7 +23,6 @@ extends MinervaPluginPanel
 ##   subscription works via duck typing.
 
 const _CadAnnotationHostScript: Script = preload("CadAnnotationHost.gd")
-const _CadAnnotationCanvasScript: Script = preload("CadAnnotationCanvas.gd")
 const _ResponsiveContainerScript: Script = preload("res://Scripts/UI/Controls/responsive_container.gd")
 const _AnnotationToolbarScript: Script = preload("res://Scripts/Services/Annotations/AnnotationToolbar.gd")
 const _BuiltinKindsScript: Script = preload("res://Scripts/Services/Annotations/BuiltinKinds.gd")
@@ -63,18 +62,14 @@ var _wide_sidebar: VBoxContainer = null
 ## AnnotationToolbar.
 var _toolbar = null
 
-## Cad_AnnotationCanvas instance — single canvas, overlaid on the active
-## viewport's SubViewportContainer. Untyped for the same reason.
-var _canvas = null
-
 ## Currently active viewport id, one of: "top","front","right","iso" (wide mode)
 ## or "perspective","top","bottom","front","back","left","right" (narrow mode).
 ## In wide mode the canvas is overlaid on the Iso quadrant by default.
 var _active_viewport_id: String = "iso"
 
-## Panel-root overlay Control that parents the AnnotationCanvas so it spans all
-## 4 SubViewportContainers. Created in _ready() as a sibling-above the
-## ResponsiveContainer. mouse_filter=PASS so all clicks reach the SubViewports.
+## Full-rect overlay Control that spans all 4 SubViewportContainers.
+## mouse_filter=IGNORE so all clicks pass through to SubViewports.
+## Used as panel_root reference so host.get_panes() can compute panel-relative rects.
 var _canvas_overlay: Control = null
 
 # ── Annotation substrate ────────────────────────────────────────────────────
@@ -202,42 +197,18 @@ func _ready() -> void:
 	_wide_sidebar.add_child(_toolbar)
 	_toolbar.set_registry(_annotation_registry)
 	_toolbar.set_host(_annotation_host)
-	_toolbar.active_tool_changed.connect(_on_toolbar_active_tool_changed)
-
-	# ── Build panel-root overlay Control for the AnnotationCanvas ────────────
-	# The canvas must span ALL 4 SubViewportContainers so leaders for every pane
-	# draw at the correct panel-root-relative position. We create a full-rect
-	# Control sibling above the ResponsiveContainer, parent the canvas there, and
-	# set mouse_filter=PASS so all clicks still reach the SubViewports.
-	# (Round 2b-α Unit 1 fix for bug 019dd65c237d.)
+	# ── Build panel-root overlay Control spanning all SubViewportContainers ──
+	# Used as the panel_root reference so host.get_panes() can compute
+	# panel-relative rects for multi-pane annotation projection. The platform's
+	# PlatformAnnotationOverlay (auto-mounted via get_annotation_host()) handles
+	# all annotation drawing; this Control is purely a coordinate anchor.
 	_canvas_overlay = Control.new()
 	_canvas_overlay.name = "AnnotationCanvasOverlay"
-	# IGNORE so clicks fall through the overlay chain to the SubViewportContainer
-	# siblings underneath. PASS would NOT achieve this — Godot's PASS forwards
-	# events to the PARENT, not to siblings beneath. The overlay never needs to
-	# receive input directly; the canvas (its child) toggles its own filter to
-	# STOP when an authoring tool is active.
 	_canvas_overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_canvas_overlay.set_anchors_preset(Control.PRESET_FULL_RECT)
-	# Force draw-on-top regardless of sibling order — robust to future reordering.
 	_canvas_overlay.z_index = 1
 	add_child(_canvas_overlay)
 
-	# ── Build single AnnotationCanvas, parented to the panel-root overlay ────
-	_canvas = _CadAnnotationCanvasScript.new()
-	_canvas.name = "AnnotationCanvas"
-	# IGNORE in idle so clicks pass through to SubViewportContainers below.
-	# CadAnnotationCanvas.set_active_tool() flips this to STOP while a tool
-	# is active, so _gui_input fires and routes to the tool's pointer handlers.
-	_canvas.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_canvas.set_anchors_preset(Control.PRESET_FULL_RECT)
-	_canvas.set_host(_annotation_host)
-	_canvas_overlay.add_child(_canvas)
-	# Inform the host about the panel root so it can compute panel-relative rects.
-	# get_panes() resolves rects lazily via Control.get_global_rect() at call
-	# time. By the time the first annotation _draw() runs, layout has settled
-	# and rects are accurate. Synchronous get_panes() callers during _ready()
-	# would receive the Rect2(0,0,512,512) fallback — that path is unused.
 	if _annotation_host.has_method("set_panel_root"):
 		_annotation_host.set_panel_root(_canvas_overlay)
 	_annotation_host.set_active_viewport(_active_viewport_id)
@@ -272,6 +243,10 @@ func _ready() -> void:
 	_apply_width_class(_responsive.width_class)
 
 
+func get_annotation_host() -> RefCounted:
+	return _annotation_host
+
+
 # ── Plugin platform lifecycle hooks (override MinervaPluginPanel virtuals) ──
 
 func _on_panel_loaded(ctx: Dictionary) -> void:
@@ -290,13 +265,6 @@ func _on_panel_unload() -> void:
 	if _registered_editor_name != "":
 		AnnotationHostRegistry.deregister(_registered_editor_name)
 		_registered_editor_name = ""
-
-	# Disconnect toolbar signal and detach canvas from host.
-	if _toolbar != null and _toolbar.active_tool_changed.is_connected(_on_toolbar_active_tool_changed):
-		_toolbar.active_tool_changed.disconnect(_on_toolbar_active_tool_changed)
-	if _canvas != null:
-		_canvas.set_host(null)
-		_canvas.set_active_tool(null)
 
 
 # ── Save/load contract (overrides MinervaPluginPanel virtuals) ──────────────
@@ -836,13 +804,5 @@ func _step_selected_edge(delta: int) -> void:
 	var next_idx := posmod(idx + delta, ids.size())
 	_set_selected_edge_id(ids[next_idx])
 
-
-# ── Toolbar → canvas plumbing ──────────────────────────────────────────────
-
-## Called when the AnnotationToolbar emits active_tool_changed. Forwards the
-## new tool to the canvas so it can route pointer events / draw previews.
-func _on_toolbar_active_tool_changed(tool: AnnotationAuthorTool) -> void:
-	if _canvas != null:
-		_canvas.set_active_tool(tool)
 
 

@@ -83,6 +83,28 @@ func get_registry() -> AnnotationRegistry:
 	return _registry
 
 
+func get_capabilities() -> Dictionary:
+	return {
+		"kinds": ["callout", "2d_arrow", "2d_text", "cad_edge_number"],
+		"tools": ["select"],
+		"anchor_types": ["cad/edge", "core/canvas.point"],
+		"lifecycle": {
+			"resolve": true,
+			"reopen": true,
+			"delete": true,
+			"repair": false,
+			"apply": false,
+		},
+		"authoring": {
+			"add": false,
+			"domain_pickers": false,
+		},
+		"panes": true,
+		"body_views": false,
+		"filters": ["all", "open", "applied", "resolved", "broken"],
+	}
+
+
 ## Add an annotation. Assigns an id if missing, stamps anchor, emits signal.
 func add_annotation(annotation: Dictionary) -> String:
 	var id: String = str(annotation.get("id", ""))
