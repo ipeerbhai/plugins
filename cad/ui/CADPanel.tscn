@@ -3,7 +3,7 @@
 [ext_resource type="Script" path="CADPanel.gd" id="1_cadpanel"]
 [ext_resource type="Script" path="scripts/orbit_camera.gd" id="2_orbitcam"]
 [ext_resource type="Script" path="scripts/mesh_display.gd" id="3_meshdisplay"]
-[ext_resource type="Script" path="scripts/edge_overlay.gd" id="4_edgeoverlay"]
+[ext_resource type="Script" path="scripts/Cad_GeometryOverlay.gd" id="4_geomoverlay"]
 [ext_resource type="Script" path="res://Scripts/UI/Controls/responsive_container.gd" id="5_responsive"]
 
 [sub_resource type="ProceduralSkyMaterial" id="ProceduralSkyMaterial_cad"]
@@ -77,7 +77,7 @@ anchor_right = 1.0
 anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
-script = ExtResource("4_edgeoverlay")
+script = ExtResource("4_geomoverlay")
 
 [node name="WorldEnvironment" type="WorldEnvironment" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/TopView/SubViewport"]
 environment = SubResource("Environment_cad")
@@ -105,7 +105,7 @@ anchor_right = 1.0
 anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
-script = ExtResource("4_edgeoverlay")
+script = ExtResource("4_geomoverlay")
 
 [node name="WorldEnvironment" type="WorldEnvironment" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/FrontView/SubViewport"]
 environment = SubResource("Environment_cad")
@@ -133,7 +133,7 @@ anchor_right = 1.0
 anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
-script = ExtResource("4_edgeoverlay")
+script = ExtResource("4_geomoverlay")
 
 [node name="WorldEnvironment" type="WorldEnvironment" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/RightView/SubViewport"]
 environment = SubResource("Environment_cad")
@@ -161,7 +161,7 @@ anchor_right = 1.0
 anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
-script = ExtResource("4_edgeoverlay")
+script = ExtResource("4_geomoverlay")
 
 [node name="WorldEnvironment" type="WorldEnvironment" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/IsoView/SubViewport"]
 environment = SubResource("Environment_cad")
@@ -219,7 +219,7 @@ anchor_right = 1.0
 anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
-script = ExtResource("4_edgeoverlay")
+script = ExtResource("4_geomoverlay")
 
 [node name="WorldEnvironment" type="WorldEnvironment" parent="ResponsiveContainer/NarrowLayout/SingleView/SubViewport"]
 environment = SubResource("Environment_cad")

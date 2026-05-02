@@ -19,7 +19,7 @@
           "ui/CADPanel.gd",
           "ui/CadAnnotationHost.gd",
           "ui/scripts/mesh_display.gd",
-          "ui/scripts/edge_overlay.gd",
+          "ui/scripts/Cad_GeometryOverlay.gd",
           "ui/scripts/orbit_camera.gd"
         ],
         "file_extensions": [".mcad"],

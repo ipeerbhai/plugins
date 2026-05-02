@@ -86,10 +86,8 @@ var _ctx: Dictionary = {}
 
 # ── Edge enumeration / overlay state ────────────────────────────────────────
 
-## Per-pane EdgeOverlay refs (the EdgeOverlayRoot Control nodes, scripted with
-## scripts/edge_overlay.gd). Map view_id (str) → Control. Untyped values for
-## off-tree class_name discipline.
-var _edge_overlays: Dictionary = {}
+## Per-pane Cad_GeometryOverlay refs. Map view_id (str) → Control.
+var _geometry_overlays: Dictionary = {}
 
 ## Last-known edge registry (Array of edge dicts). Built either from the IPC
 ## mcad_list_edges reply or synthesised from the stub cube in _ready().
@@ -213,24 +211,15 @@ func _ready() -> void:
 		_annotation_host.set_panel_root(_canvas_overlay)
 	_annotation_host.set_active_viewport(_active_viewport_id)
 
-	# ── Edge overlay wiring (one EdgeOverlay per SubViewport) ──────────────
+	# ── Geometry overlay wiring (one Cad_GeometryOverlay per SubViewport) ────
 	# Resolve and store refs to all five EdgeOverlayRoot Control nodes that
 	# already live in the .tscn under each SubViewport.
-	_edge_overlays["top"]   = get_node_or_null(grid + "/TopView/SubViewport/EdgeOverlayRoot")
-	_edge_overlays["front"] = get_node_or_null(grid + "/FrontView/SubViewport/EdgeOverlayRoot")
-	_edge_overlays["right"] = get_node_or_null(grid + "/RightView/SubViewport/EdgeOverlayRoot")
-	_edge_overlays["iso"]   = get_node_or_null(grid + "/IsoView/SubViewport/EdgeOverlayRoot")
-	_edge_overlays["single"] = get_node_or_null(
+	_geometry_overlays["top"]   = get_node_or_null(grid + "/TopView/SubViewport/EdgeOverlayRoot")
+	_geometry_overlays["front"] = get_node_or_null(grid + "/FrontView/SubViewport/EdgeOverlayRoot")
+	_geometry_overlays["right"] = get_node_or_null(grid + "/RightView/SubViewport/EdgeOverlayRoot")
+	_geometry_overlays["iso"]   = get_node_or_null(grid + "/IsoView/SubViewport/EdgeOverlayRoot")
+	_geometry_overlays["single"] = get_node_or_null(
 		"ResponsiveContainer/NarrowLayout/SingleView/SubViewport/EdgeOverlayRoot")
-	for ov_id in _edge_overlays.keys():
-		var ov: Control = _edge_overlays[ov_id] as Control
-		if ov != null and ov.has_signal("edge_selected"):
-			ov.connect("edge_selected", Callable(self, "_on_edge_selected"))
-
-	# Edge registry stays empty until the DSL→mesh bridge wires the worker's
-	# mcad_list_edges reply into _edge_registry and calls _push_edges_to_overlays.
-	# Push the empty registry now so any pre-existing overlay state is cleared.
-	_push_edges_to_overlays()
 
 	# ── Wide-mode sidebar: edge Tree + Prev/Next/Clear buttons ─────────────
 	_build_edge_sidebar()
@@ -370,7 +359,7 @@ func _evaluate_and_render(dsl_text: String) -> void:
 			_annotation_host.set_mesh_data(mesh_data)
 		if _annotation_host.has_method("set_edge_registry"):
 			_annotation_host.set_edge_registry(edges)
-	_push_edges_to_overlays()
+	_push_mesh_to_geometry_overlays()
 	_render_edge_tree(_edge_registry)
 	# Re-apply mesh visibility (ortho panes hide the shaded mesh; iso shows it).
 	_apply_mesh_visibility()
@@ -414,11 +403,8 @@ func _apply_width_class(cls: StringName) -> void:
 	# overlap between layouts but resolve to different SubViewports).
 	_register_host_viewports(is_narrow)
 
-	# Active edge-pick pane shifts wide↔narrow; ortho x-ray for the narrow
-	# single view also depends on the current dropdown selection.
-	if not _edge_overlays.is_empty():
-		_apply_active_overlay_filter()
-		_apply_mesh_visibility()
+	# Ortho x-ray for the narrow single view depends on the current dropdown selection.
+	_apply_mesh_visibility()
 
 
 ## Populate Cad_AnnotationHost's viewport map for the active layout. Called
@@ -522,13 +508,10 @@ func _on_projection_selected(index: int) -> void:
 	_active_viewport_id = _projection_preset_to_viewport_id(preset)
 	if _annotation_host != null and _annotation_host.has_method("set_active_viewport"):
 		_annotation_host.set_active_viewport(_active_viewport_id)
-	# Push the new preset down to the single-view EdgeOverlay (so it switches
-	# between perspective-pick mode and ortho x-ray rendering) and toggle the
-	# single-view mesh accordingly.
-	var single_ov: Control = _edge_overlays.get("single", null) as Control
-	if single_ov != null and single_ov.has_method("set_overlay_data"):
-		single_ov.call("set_overlay_data",
-			_single_view_camera, _edge_registry, preset, Vector3.ZERO, _last_mesh_data)
+	# Update the single-view geometry overlay camera and toggle mesh visibility.
+	var single_ov: Control = _geometry_overlays.get("single", null) as Control
+	if single_ov != null and single_ov.has_method("set_camera"):
+		single_ov.call("set_camera", _single_view_camera)
 	_apply_mesh_visibility()
 
 
@@ -644,56 +627,27 @@ func _render_edge_tree(edges: Array) -> void:
 		_edge_tree_items[edge_id] = item
 
 
-## Push the current edge registry + mesh + active-pane wiring to every
-## EdgeOverlay. Called whenever a new mesh/edge set arrives or when layout
-## transitions change which pane is the active edge-pick target.
-func _push_edges_to_overlays() -> void:
-	# View-id → preset string for set_overlay_data.
-	var view_presets := {
-		"top": "Top",
-		"front": "Front",
-		"right": "Right",
-		"iso": "Perspective",
-		"single": _current_projection_preset(),
-	}
-	# View-id → Camera3D
+## Push the current mesh data + per-pane cameras to every Cad_GeometryOverlay.
+## Called whenever a new mesh arrives from the DSL→mesh bridge.
+func _push_mesh_to_geometry_overlays() -> void:
+	var grid := "ResponsiveContainer/WideLayout/VBoxContainer/GridContainer"
 	var view_cameras := {
-		"top":   $ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/TopView/SubViewport/OrbitCamera,
-		"front": $ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/FrontView/SubViewport/OrbitCamera,
-		"right": $ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/RightView/SubViewport/OrbitCamera,
-		"iso":   $ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/IsoView/SubViewport/OrbitCamera,
+		"top":   get_node_or_null(grid + "/TopView/SubViewport/OrbitCamera") as Camera3D,
+		"front": get_node_or_null(grid + "/FrontView/SubViewport/OrbitCamera") as Camera3D,
+		"right": get_node_or_null(grid + "/RightView/SubViewport/OrbitCamera") as Camera3D,
+		"iso":   get_node_or_null(grid + "/IsoView/SubViewport/OrbitCamera") as Camera3D,
 		"single": _single_view_camera,
 	}
-	var center := Vector3.ZERO
-	for ov_id in _edge_overlays.keys():
-		var ov: Control = _edge_overlays[ov_id] as Control
+	for ov_id in _geometry_overlays.keys():
+		var ov: Control = _geometry_overlays[ov_id] as Control
 		if ov == null:
 			continue
+		if ov.has_method("set_mesh_data"):
+			ov.call("set_mesh_data", _last_mesh_data)
 		var cam: Camera3D = view_cameras.get(ov_id, null)
-		var preset: String = view_presets.get(ov_id, "Perspective")
-		if ov.has_method("set_overlay_data"):
-			ov.call("set_overlay_data", cam, _edge_registry, preset, center, _last_mesh_data)
-		ov.visible = true
-
-	# Active edge-pick pane: STOP; others: IGNORE. The active pane in wide mode
-	# is the iso quadrant; in narrow mode it's the single view.
-	_apply_active_overlay_filter()
-	# Mesh visibility for ortho panes (x-ray view) vs Iso/Perspective.
+		if ov.has_method("set_camera"):
+			ov.call("set_camera", cam)
 	_apply_mesh_visibility()
-
-
-## Set mouse_filter on each EdgeOverlay so only the active pane intercepts
-## clicks. Wide mode → "iso". Narrow mode → "single".
-func _apply_active_overlay_filter() -> void:
-	var is_narrow := _narrow_layout != null and _narrow_layout.visible
-	var active_id := "single" if is_narrow else "iso"
-	for ov_id in _edge_overlays.keys():
-		var ov: Control = _edge_overlays[ov_id] as Control
-		if ov == null:
-			continue
-		ov.mouse_filter = (Control.MOUSE_FILTER_STOP
-				if String(ov_id) == active_id
-				else Control.MOUSE_FILTER_IGNORE)
 
 
 ## Hide the shaded mesh in ortho-only panes (Top/Front/Right; narrow non-
@@ -732,9 +686,8 @@ func _set_selected_edge_id(edge_id: int, sync_tree: bool = true) -> void:
 			_sync_tree_selection()
 		return
 	_selected_edge_id = edge_id
-	# Highlight in every pane.
-	for ov_id in _edge_overlays.keys():
-		var ov: Control = _edge_overlays[ov_id] as Control
+	for ov_id in _geometry_overlays.keys():
+		var ov: Control = _geometry_overlays[ov_id] as Control
 		if ov != null and ov.has_method("set_selected_edge"):
 			ov.call("set_selected_edge", edge_id)
 	# Mirror to host for MCP visibility.
