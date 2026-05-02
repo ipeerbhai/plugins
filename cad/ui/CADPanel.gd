@@ -6,25 +6,21 @@ extends MinervaPluginPanel
 ##   * ResponsiveContainer wraps the panel content. width_class drives a
 ##     stack-style swap between WideLayout (4-view + sidebar HSplit) and
 ##     NarrowLayout (single-view + projection dropdown + tools).
-##   * AnnotationToolbar (real platform widget, not the R1 stub) is built at
-##     runtime, bound to the registry/host, and rebuilt with the matching
-##     presentation_mode whenever width_class changes.
-##   * Cad_AnnotationCanvas is overlaid on whichever SubViewportContainer is
-##     currently the "active" viewport (Iso in wide mode, the dropdown
-##     selection in narrow mode). One canvas, repointed across mode changes.
+##   * The platform AnnotationDockPane (auto-mounted via get_annotation_host())
+##     provides annotation tooling. CADPanel owns only the CAD-specific edge
+##     geometry inspector tree in the wide sidebar.
 ##
 ## Off-tree class_name gotcha:
 ##   This plugin lives at ~/github/plugins/cad/, OUTSIDE Minerva's res:// tree,
 ##   so Godot's parser cache cannot statically resolve plugin or platform
 ##   class_names from typed field declarations in this file. Fields whose
-##   types are platform classes (ResponsiveContainer, AnnotationToolbar) are
-##   typed with the platform BASE class (Container, VBoxContainer) or kept
-##   untyped, and assigned via preload(...).new(). Property access and signal
-##   subscription works via duck typing.
+##   types are platform classes (ResponsiveContainer) are typed with the
+##   platform BASE class (Container) or kept untyped, and assigned via
+##   preload(...).new(). Property access and signal subscription works via
+##   duck typing.
 
 const _CadAnnotationHostScript: Script = preload("CadAnnotationHost.gd")
 const _ResponsiveContainerScript: Script = preload("res://Scripts/UI/Controls/responsive_container.gd")
-const _AnnotationToolbarScript: Script = preload("res://Scripts/Services/Annotations/AnnotationToolbar.gd")
 const _BuiltinKindsScript: Script = preload("res://Scripts/Services/Annotations/BuiltinKinds.gd")
 const _CadEdgeNumberKindScript: Script = preload("kinds/cad_edge_number_kind.gd")
 
@@ -54,13 +50,8 @@ var _single_view_camera: Camera3D = null
 ## Projection dropdown used to switch the single-view camera preset.
 var _projection_dropdown: OptionButton = null
 
-## Wide-layout sidebar (where the toolbar is parented in wide mode).
+## Wide-layout sidebar (edge geometry inspector tree).
 var _wide_sidebar: VBoxContainer = null
-
-## AnnotationToolbar instance — built at runtime; reparented across mode
-## changes. Untyped because off-tree scripts can't type fields as
-## AnnotationToolbar.
-var _toolbar = null
 
 ## Currently active viewport id, one of: "top","front","right","iso" (wide mode)
 ## or "perspective","top","bottom","front","back","left","right" (narrow mode).
@@ -96,9 +87,6 @@ var _edge_registry: Array = []
 ## Last-known mesh data (passed to EdgeOverlay so it can rebuild silhouettes
 ## on camera moves).
 var _last_mesh_data: Dictionary = {}
-
-## Currently selected edge id (mirrored to host + Tree). -1 = none.
-var _selected_edge_id: int = -1
 
 ## Tree node in the wide sidebar listing all edges. Built in _ready().
 var _edge_tree: Tree = null
@@ -189,12 +177,6 @@ func _ready() -> void:
 	# matches the visible layout.
 	_register_host_viewports(false)  # wide by default; corrected below in _apply_width_class
 
-	# ── Build AnnotationToolbar (parented in the wide sidebar by default) ──
-	_toolbar = _AnnotationToolbarScript.new()
-	_toolbar.name = "AnnotationToolbar"
-	_wide_sidebar.add_child(_toolbar)
-	_toolbar.set_registry(_annotation_registry)
-	_toolbar.set_host(_annotation_host)
 	# ── Build panel-root overlay Control spanning all SubViewportContainers ──
 	# Used as the panel_root reference so host.get_panes() can compute
 	# panel-relative rects for multi-pane annotation projection. The platform's
@@ -227,7 +209,7 @@ func _ready() -> void:
 
 	# ── Connect ResponsiveContainer width-class signal & apply initial mode
 	_responsive.width_class_changed.connect(_on_width_class_changed)
-	# Apply the initial layout state so toolbar/canvas are correctly placed
+	# Apply the initial layout state so the canvas is correctly placed
 	# even before the first resize transition fires.
 	_apply_width_class(_responsive.width_class)
 
@@ -248,8 +230,14 @@ func _on_panel_loaded(ctx: Dictionary) -> void:
 			AnnotationHostRegistry.register(ed_name, _annotation_host)
 			_registered_editor_name = ed_name
 
+	if _annotation_host != null and not _annotation_host.selection_changed.is_connected(_on_host_selection_changed):
+		_annotation_host.selection_changed.connect(_on_host_selection_changed)
+
 
 func _on_panel_unload() -> void:
+	if _annotation_host != null and _annotation_host.selection_changed.is_connected(_on_host_selection_changed):
+		_annotation_host.selection_changed.disconnect(_on_host_selection_changed)
+
 	# Symmetric teardown for the AnnotationHostRegistry entry.
 	if _registered_editor_name != "":
 		AnnotationHostRegistry.deregister(_registered_editor_name)
@@ -373,8 +361,8 @@ func _on_width_class_changed(new_class: StringName) -> void:
 
 
 ## Apply the layout for the given width class. Idempotent.
-##   xs / sm  → narrow (single view + projection dropdown), toolbar = COMPACT
-##   md / lg / xl → wide (4-view + sidebar), toolbar = LABELED
+##   xs / sm  → narrow (single view + projection dropdown)
+##   md / lg / xl → wide (4-view + sidebar)
 func _apply_width_class(cls: StringName) -> void:
 	var is_narrow := (cls == _ResponsiveContainerScript.CLASS_XS or cls == _ResponsiveContainerScript.CLASS_SM)
 
@@ -382,18 +370,6 @@ func _apply_width_class(cls: StringName) -> void:
 		_wide_layout.visible = not is_narrow
 	if _narrow_layout != null:
 		_narrow_layout.visible = is_narrow
-
-	# Reparent toolbar into the appropriate layout's tools area.
-	if _toolbar != null:
-		_reparent_toolbar(is_narrow)
-		# Set presentation_mode AFTER reparent so the rebuild lays out under
-		# the new parent. Use the platform enum constants by name on the
-		# toolbar instance (off-tree consumers can't reference the enum from
-		# the type itself, but enum values on the instance are fine).
-		# COMPACT = 1, LABELED = 0 per AnnotationToolbar.PresentationMode.
-		var compact: int = 1
-		var labeled: int = 0
-		_toolbar.set_presentation_mode(compact if is_narrow else labeled)
 
 	# Reparent the canvas to the appropriate viewport container.
 	_reparent_canvas(is_narrow)
@@ -463,19 +439,6 @@ func _register_host_viewports(is_narrow: bool) -> void:
 				_annotation_host.set_container_for(proj, null)
 
 
-## Move the toolbar between the wide sidebar and the narrow VBox.
-func _reparent_toolbar(narrow: bool) -> void:
-	if _toolbar == null:
-		return
-	var current_parent: Node = _toolbar.get_parent()
-	var target_parent: Node = _narrow_layout if narrow else _wide_sidebar
-	if current_parent == target_parent:
-		return
-	if current_parent != null:
-		current_parent.remove_child(_toolbar)
-	target_parent.add_child(_toolbar)
-
-
 ## Update the active viewport id when the layout changes.
 ##
 ## Round 2b-α Unit 1: the canvas is permanently parented to _canvas_overlay
@@ -534,10 +497,8 @@ func _projection_preset_to_viewport_id(preset: String) -> String:
 
 # ── Edge overlay / sidebar wiring ───────────────────────────────────────────
 
-## Build the wide-mode edge Tree under WideSidebar (below AnnotationToolbar).
-## Three buttons (Prev / Next / Clear) sit beneath the tree. Both the tree
-## and the buttons live in the same VBoxContainer as the toolbar, so the
-## sidebar shows toolbar-then-edges in wide mode.
+## Build the wide-mode edge Tree under WideSidebar.
+## Three buttons (Prev / Next / Clear) sit beneath the tree.
 func _build_edge_sidebar() -> void:
 	if _wide_sidebar == null:
 		return
@@ -677,28 +638,20 @@ func _set_pane_mesh_visible(mesh_root_path: String, visible_flag: bool) -> void:
 		mi.visible = visible_flag
 
 
-## Edge selection routing — called from EdgeOverlay clicks, from the Tree, and
-## from Prev/Next buttons. Highlights all panes, syncs the Tree, and pushes
-## the new id to Cad_AnnotationHost so MCP queries can read it.
-func _set_selected_edge_id(edge_id: int, sync_tree: bool = true) -> void:
-	if _selected_edge_id == edge_id:
-		if sync_tree:
-			_sync_tree_selection()
-		return
-	_selected_edge_id = edge_id
+## Push a new edge selection to the host and geometry overlays, then sync the tree.
+## Single entry point for all callers (overlay clicks, Prev/Next, Clear).
+func _select_edge(edge_id: int) -> void:
+	if _annotation_host != null:
+		_annotation_host.set_selected_edge_id(edge_id)
 	for ov_id in _geometry_overlays.keys():
 		var ov: Control = _geometry_overlays[ov_id] as Control
 		if ov != null and ov.has_method("set_selected_edge"):
 			ov.call("set_selected_edge", edge_id)
-	# Mirror to host for MCP visibility.
-	if _annotation_host != null and _annotation_host.has_method("set_selected_edge_id"):
-		_annotation_host.set_selected_edge_id(edge_id)
-	if sync_tree:
-		_sync_tree_selection()
+	_update_tree_selection()
 
 
 func _on_edge_selected(edge_id: int) -> void:
-	_set_selected_edge_id(edge_id)
+	_select_edge(edge_id)
 
 
 func _on_edge_tree_item_selected() -> void:
@@ -710,15 +663,30 @@ func _on_edge_tree_item_selected() -> void:
 	var meta: Variant = item.get_metadata(0)
 	if meta == null:
 		return
-	_set_selected_edge_id(int(meta), false)
+	var edge_id := int(meta)
+	if _annotation_host != null:
+		_annotation_host.set_selected_edge_id(edge_id)
+	for ov_id in _geometry_overlays.keys():
+		var ov: Control = _geometry_overlays[ov_id] as Control
+		if ov != null and ov.has_method("set_selected_edge"):
+			ov.call("set_selected_edge", edge_id)
 
 
-func _sync_tree_selection() -> void:
-	if _edge_tree == null:
+## Called when the host emits selection_changed (annotation selection). Also
+## called directly after edge selection changes so the tree row stays current.
+func _on_host_selection_changed(_annotation_id: String = "") -> void:
+	_update_tree_selection()
+
+
+## Update the tree's highlighted row to match the host's current edge selection.
+## Reads from host; writes no panel-local state.
+func _update_tree_selection() -> void:
+	if _edge_tree == null or _annotation_host == null:
 		return
+	var edge_id: int = _annotation_host.get_selected_edge_id()
 	_suppress_tree_selection = true
-	if _selected_edge_id != -1 and _edge_tree_items.has(_selected_edge_id):
-		var item: TreeItem = _edge_tree_items[_selected_edge_id]
+	if edge_id != -1 and _edge_tree_items.has(edge_id):
+		var item: TreeItem = _edge_tree_items[edge_id]
 		_edge_tree.set_selected(item, 0)
 		_edge_tree.scroll_to_item(item, true)
 	else:
@@ -735,7 +703,7 @@ func _on_next_edge_pressed() -> void:
 
 
 func _on_clear_edge_pressed() -> void:
-	_set_selected_edge_id(-1)
+	_select_edge(-1)
 
 
 func _step_selected_edge(delta: int) -> void:
@@ -744,18 +712,21 @@ func _step_selected_edge(delta: int) -> void:
 		if edge_info is Dictionary:
 			ids.append(int(edge_info.get("id", 0)))
 	ids.sort()
+	var current_id: int = -1
+	if _annotation_host != null:
+		current_id = _annotation_host.get_selected_edge_id()
 	if ids.is_empty():
-		_set_selected_edge_id(-1)
+		_select_edge(-1)
 		return
-	if _selected_edge_id == -1:
-		_set_selected_edge_id(ids[0] if delta >= 0 else ids[ids.size() - 1])
+	if current_id == -1:
+		_select_edge(ids[0] if delta >= 0 else ids[ids.size() - 1])
 		return
-	var idx := ids.find(_selected_edge_id)
+	var idx := ids.find(current_id)
 	if idx == -1:
-		_set_selected_edge_id(ids[0])
+		_select_edge(ids[0])
 		return
 	var next_idx := posmod(idx + delta, ids.size())
-	_set_selected_edge_id(ids[next_idx])
+	_select_edge(ids[next_idx])
 
 
 
