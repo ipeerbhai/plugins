@@ -31,10 +31,14 @@ extends "res://Scripts/Services/Annotations/AnnotationAuthorTool.gd"
 ## "clicked". Clicks farther than this from every edge midpoint are ignored.
 const EDGE_PICK_THRESHOLD_PX: float = 30.0
 
-## Default world-space distance for the text-box offset from the edge midpoint.
-## Direction is (camera_right + camera_up).normalized() at placement time.
-## Pragmatic v1 default; bbox-relative scaling is a future refinement.
-const DEFAULT_BOX_OFFSET_WORLD: float = 30.0
+## Default screen-space pixel offset from edge midpoint to text-box center
+## at placement time. Back-projected to world space at the edge's depth so
+## the stored Vector3 box_offset puts the box at this screen distance for
+## the placement-time camera view. Camera-orbit changes the apparent angle
+## (cost of world-space attachment), but placement is always visually clean
+## regardless of model scale. (150, -120) puts the box up-and-right of the
+## edge with enough clearance for the 200-px-wide callout.
+const DEFAULT_BOX_SCREEN_OFFSET: Vector2 = Vector2(150.0, -120.0)
 
 ## State for this one-shot tool. AWAITING_TEXT spans the time the modal text
 ## dialog is open — the tool is committed to a particular edge but waiting on
@@ -70,7 +74,14 @@ func on_activate(host: AnnotationHost) -> void:
 	var camera: Camera3D = _find_perspective_camera(host)
 	if camera == null:
 		return
-	var box_offset: Vector3 = _compute_default_box_offset(camera)
+	# Resolve to edge midpoint so we can compute a screen-relative offset.
+	if not host.has_method("_resolve_edge_anchor"):
+		return
+	var resolved: Variant = host._resolve_edge_anchor(anchor)
+	if not (resolved is Dictionary):
+		return
+	var edge_world: Vector3 = (resolved as Dictionary).get("position", Vector3.ZERO)
+	var box_offset: Vector3 = _compute_default_box_offset(camera, edge_world)
 	var annotation := _build_annotation(int(anchor.get("id", -1)), box_offset)
 	_open_text_dialog(annotation)
 
@@ -114,8 +125,9 @@ func on_pointer_down(pos: Vector2, button: int, mods: int) -> bool:
 		return true
 
 	var camera: Camera3D = _find_perspective_camera(_host)
+	var edge_world: Vector3 = result.get("world_pos", Vector3.ZERO)
 	var box_offset: Vector3 = (
-		_compute_default_box_offset(camera) if camera != null else Vector3.ZERO
+		_compute_default_box_offset(camera, edge_world) if camera != null else Vector3.ZERO
 	)
 	var annotation := _build_annotation(int(result.get("edge_id", -1)), box_offset)
 	_open_text_dialog(annotation)
@@ -279,17 +291,42 @@ static func _find_perspective_camera(host: Object) -> Camera3D:
 	return null
 
 
-## Compute a default box_offset in world-space using the camera's basis.
-## Direction: (camera_right + camera_up).normalized(). Magnitude:
-## DEFAULT_BOX_OFFSET_WORLD. Pragmatic v1; bbox-relative is future work.
-static func _compute_default_box_offset(camera: Camera3D) -> Vector3:
-	var basis := camera.global_transform.basis
-	var right: Vector3 = basis.x.normalized()
-	var up: Vector3 = basis.y.normalized()
-	var dir: Vector3 = right + up
-	if dir.length_squared() < 0.0001:
-		return Vector3(DEFAULT_BOX_OFFSET_WORLD, DEFAULT_BOX_OFFSET_WORLD, 0.0)
-	return dir.normalized() * DEFAULT_BOX_OFFSET_WORLD
+## Compute a default box_offset in world-space such that, at the placement-time
+## camera view, the box center projects to (edge_screen + DEFAULT_BOX_SCREEN_OFFSET).
+##
+## Approach: project edge_world to its screen position, add the screen offset,
+## back-project a ray through that screen target, walk the ray to the same
+## camera-z depth as edge_world, return (world_target - edge_world).
+##
+## The result is a world-space Vector3, so the stored offset attaches the box
+## to the part (it follows re-evaluation). Only the placement-time view
+## determines the offset's magnitude/direction in world space — camera orbit
+## later changes the apparent angle but not the world relationship.
+##
+## Returns Vector3.ZERO when projection is degenerate (edge behind camera,
+## ray nearly parallel to view plane). Caller should treat ZERO as fallback
+## ("box overlaps edge"); rare in practice.
+static func _compute_default_box_offset(camera: Camera3D, edge_world: Vector3) -> Vector3:
+	if camera == null:
+		return Vector3.ZERO
+	var cam_origin: Vector3 = camera.global_transform.origin
+	var look_dir: Vector3 = -camera.global_transform.basis.z.normalized()
+	var edge_depth: float = look_dir.dot(edge_world - cam_origin)
+	if edge_depth < 0.001:
+		return Vector3.ZERO
+
+	var screen_edge: Vector2 = camera.unproject_position(edge_world)
+	var screen_target: Vector2 = screen_edge + DEFAULT_BOX_SCREEN_OFFSET
+
+	var ray_origin: Vector3 = camera.project_ray_origin(screen_target)
+	var ray_dir: Vector3 = camera.project_ray_normal(screen_target)
+	var dz: float = look_dir.dot(ray_dir)
+	if abs(dz) < 0.001:
+		return Vector3.ZERO
+
+	var t: float = (edge_depth - look_dir.dot(ray_origin - cam_origin)) / dz
+	var world_target: Vector3 = ray_origin + ray_dir * t
+	return world_target - edge_world
 
 
 # ── Text-input dialog ─────────────────────────────────────────────────────────
