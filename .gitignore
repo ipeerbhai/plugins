@@ -3,6 +3,9 @@
 */cad-plugin
 */cad-plugin.exe
 */cad-plugin-*
+*/presentation-plugin
+*/presentation-plugin.exe
+*/presentation-plugin-*
 # Generic catch for plugin binaries built at the plugin root.
 # Add new patterns here as additional plugins land.
 

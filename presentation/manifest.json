@@ -1,0 +1,51 @@
+{
+  "id": "presentation",
+  "name": "Presentation",
+  "version": "0.0.1",
+  "host_api_version": "1",
+  "backend": {
+    "transport": "stdio",
+    "entrypoint": "./presentation-plugin",
+    "args": []
+  },
+  "tools": [],
+  "ui": {
+    "panels": [
+      {
+        "name": "slide_editor_panel",
+        "kind": "godot_scene",
+        "entry_scene": "ui/SlideEditorPanel.tscn",
+        "scripts": [
+          "ui/SlideEditorPanel.gd",
+          "ui/slide_model.gd"
+        ],
+        "file_extensions": [".mdeck"],
+        "ipc_channels": [],
+        "save_mode": "host_owned"
+      }
+    ],
+    "ipc_messages": []
+  },
+  "editor_items": [
+    {
+      "id": "new_mdeck",
+      "name": "New Slide Deck",
+      "panel": "slide_editor_panel",
+      "default_filename": "untitled.mdeck"
+    }
+  ],
+  "capabilities": ["host_owned_save"],
+  "permissions": {
+    "host_capabilities": [],
+    "network": {
+      "mode": "none"
+    },
+    "filesystem": {
+      "mode": "none",
+      "paths": []
+    }
+  },
+  "data_directory": "",
+  "autostart": false,
+  "auto_reload": true
+}
