@@ -20,7 +20,12 @@
           "ui/slide_model.gd",
           "ui/slide_list_panel.gd",
           "ui/slide_canvas.gd",
-          "ui/tile_inspector.gd"
+          "ui/tile_inspector.gd",
+          "ui/presentation_tile_kind_base.gd",
+          "ui/presentation_tile_kind_text.gd",
+          "ui/presentation_tile_kind_image.gd",
+          "ui/presentation_tile_kind_spreadsheet.gd",
+          "ui/presentation_tile_annotation_host.gd"
         ],
         "file_extensions": [".mdeck"],
         "ipc_channels": [],
