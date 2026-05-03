@@ -10,7 +10,7 @@ extends SceneTree
 ##   Round-trip: deck → JSON → deck preserves structure
 ##   IDs: gen_id uniqueness across rapid calls
 
-const SlideModel: Script = preload("/home/imran/github/plugins/presentation/ui/slide_model.gd")
+const SlideModel: Script = preload("/Users/ipeerbhai/github/plugins/presentation/ui/slide_model.gd")
 
 var _pass_count: int = 0
 var _fail_count: int = 0
@@ -66,6 +66,46 @@ func _init() -> void:
 	test_validate_tile_non_dict()
 	test_validate_spreadsheet_row_not_array()
 	test_validate_background_image_kind_empty_value()
+
+	## tile.rotation field
+	test_rotation_text_tile_no_arg()
+	test_rotation_text_tile_zero()
+	test_rotation_text_tile_nonzero()
+	test_rotation_image_tile_no_arg()
+	test_rotation_image_tile_zero()
+	test_rotation_image_tile_nonzero()
+	test_rotation_spreadsheet_tile_no_arg()
+	test_rotation_spreadsheet_tile_zero()
+	test_rotation_spreadsheet_tile_nonzero()
+	test_validate_tile_rotation_absent()
+	test_validate_tile_rotation_float()
+	test_validate_tile_rotation_whole_number_float()
+	test_validate_tile_rotation_int()
+	test_validate_tile_rotation_rejects_string()
+	test_validate_tile_rotation_rejects_array()
+	test_set_tile_rotation_writes_value()
+	test_set_tile_rotation_zero_removes_key()
+	test_set_tile_rotation_unknown_id_returns_false()
+	test_rotation_json_roundtrip()
+
+	## slide.annotations[] field
+	test_annotations_make_slide_no_arg()
+	test_annotations_make_slide_empty_array()
+	test_annotations_make_slide_with_envelopes()
+	test_validate_slide_accepts_missing_annotations()
+	test_validate_slide_accepts_empty_annotations_array()
+	test_validate_slide_accepts_annotations_array_of_dicts()
+	test_validate_slide_rejects_annotations_non_array()
+	test_validate_slide_rejects_annotations_array_with_non_dict()
+	test_add_annotation_appends_and_second_call()
+	test_add_annotation_rejects_missing_or_empty_id()
+	test_update_annotation_replaces_by_id()
+	test_update_annotation_forces_id_match()
+	test_update_annotation_unknown_id_returns_false()
+	test_remove_annotation_removes_by_id()
+	test_remove_annotation_unknown_id_returns_false()
+	test_remove_annotation_last_deletes_key()
+	test_annotations_json_roundtrip()
 
 	print("\n=== Results: %d passed, %d failed ===" % [_pass_count, _fail_count])
 	if _fail_count > 0:
@@ -489,3 +529,356 @@ func test_gen_id_uniqueness() -> void:
 			collisions += 1
 		seen[id] = true
 	check_eq("no collisions across 200 calls", collisions, 0)
+
+
+# ── tile.rotation field ────────────────────────────────────────────────────
+
+func test_rotation_text_tile_no_arg() -> void:
+	print("test_rotation_text_tile_no_arg:")
+	var t: Dictionary = SlideModel.make_text_tile()
+	check("no rotation key when arg omitted", not t.has("rotation"))
+
+
+func test_rotation_text_tile_zero() -> void:
+	print("test_rotation_text_tile_zero:")
+	var t: Dictionary = SlideModel.make_text_tile(0.1, 0.1, 0.4, 0.2, "", SlideModel.TEXT_MODE_PLAIN, 0.0)
+	check("no rotation key when 0.0", not t.has("rotation"))
+
+
+func test_rotation_text_tile_nonzero() -> void:
+	print("test_rotation_text_tile_nonzero:")
+	var t: Dictionary = SlideModel.make_text_tile(0.1, 0.1, 0.4, 0.2, "", SlideModel.TEXT_MODE_PLAIN, 1.5)
+	check("rotation key present when non-zero", t.has("rotation"))
+	check_eq("rotation value correct", t["rotation"], 1.5)
+
+
+func test_rotation_image_tile_no_arg() -> void:
+	print("test_rotation_image_tile_no_arg:")
+	var t: Dictionary = SlideModel.make_image_tile("dGVzdA==")
+	check("no rotation key when arg omitted", not t.has("rotation"))
+
+
+func test_rotation_image_tile_zero() -> void:
+	print("test_rotation_image_tile_zero:")
+	var t: Dictionary = SlideModel.make_image_tile("dGVzdA==", 0.1, 0.1, 0.4, 0.4, 0.0)
+	check("no rotation key when 0.0", not t.has("rotation"))
+
+
+func test_rotation_image_tile_nonzero() -> void:
+	print("test_rotation_image_tile_nonzero:")
+	var t: Dictionary = SlideModel.make_image_tile("dGVzdA==", 0.1, 0.1, 0.4, 0.4, 1.5)
+	check("rotation key present when non-zero", t.has("rotation"))
+	check_eq("rotation value correct", t["rotation"], 1.5)
+
+
+func test_rotation_spreadsheet_tile_no_arg() -> void:
+	print("test_rotation_spreadsheet_tile_no_arg:")
+	var t: Dictionary = SlideModel.make_spreadsheet_tile(2, 2)
+	check("no rotation key when arg omitted", not t.has("rotation"))
+
+
+func test_rotation_spreadsheet_tile_zero() -> void:
+	print("test_rotation_spreadsheet_tile_zero:")
+	var t: Dictionary = SlideModel.make_spreadsheet_tile(2, 2, [], 0.1, 0.1, 0.6, 0.3, false, false, 0.0)
+	check("no rotation key when 0.0", not t.has("rotation"))
+
+
+func test_rotation_spreadsheet_tile_nonzero() -> void:
+	print("test_rotation_spreadsheet_tile_nonzero:")
+	var t: Dictionary = SlideModel.make_spreadsheet_tile(2, 2, [], 0.1, 0.1, 0.6, 0.3, false, false, 1.5)
+	check("rotation key present when non-zero", t.has("rotation"))
+	check_eq("rotation value correct", t["rotation"], 1.5)
+
+
+func test_validate_tile_rotation_absent() -> void:
+	print("test_validate_tile_rotation_absent:")
+	var t: Dictionary = SlideModel.make_text_tile()
+	check("validates without rotation key", SlideModel.validate_tile(t).is_empty())
+
+
+func test_validate_tile_rotation_float() -> void:
+	print("test_validate_tile_rotation_float:")
+	var t: Dictionary = SlideModel.make_text_tile()
+	t["rotation"] = 1.5
+	check("validates with float rotation", SlideModel.validate_tile(t).is_empty())
+
+
+func test_validate_tile_rotation_whole_number_float() -> void:
+	print("test_validate_tile_rotation_whole_number_float:")
+	var t: Dictionary = SlideModel.make_text_tile()
+	t["rotation"] = 0.0
+	check("validates with 0.0 float rotation", SlideModel.validate_tile(t).is_empty())
+	t["rotation"] = 2.0
+	check("validates with 2.0 float rotation", SlideModel.validate_tile(t).is_empty())
+
+
+func test_validate_tile_rotation_int() -> void:
+	print("test_validate_tile_rotation_int:")
+	var t: Dictionary = SlideModel.make_text_tile()
+	t["rotation"] = 0
+	check("validates with int 0 rotation", SlideModel.validate_tile(t).is_empty())
+	t["rotation"] = 2
+	check("validates with int 2 rotation", SlideModel.validate_tile(t).is_empty())
+
+
+func test_validate_tile_rotation_rejects_string() -> void:
+	print("test_validate_tile_rotation_rejects_string:")
+	var t: Dictionary = SlideModel.make_text_tile()
+	t["rotation"] = "0.5"
+	var errs: Array = SlideModel.validate_tile(t)
+	check("rejects string rotation", not errs.is_empty())
+	check("error mentions rotation", str(errs).contains("rotation"))
+
+
+func test_validate_tile_rotation_rejects_array() -> void:
+	print("test_validate_tile_rotation_rejects_array:")
+	var t: Dictionary = SlideModel.make_text_tile()
+	t["rotation"] = [1.5]
+	var errs: Array = SlideModel.validate_tile(t)
+	check("rejects array rotation", not errs.is_empty())
+	check("error mentions rotation", str(errs).contains("rotation"))
+
+
+func test_set_tile_rotation_writes_value() -> void:
+	print("test_set_tile_rotation_writes_value:")
+	var s: Dictionary = SlideModel.make_slide()
+	var t: Dictionary = SlideModel.make_text_tile()
+	(s["tiles"] as Array).append(t)
+	var ok: bool = SlideModel.set_tile_rotation(s, t["id"], 45.0)
+	check("returns true for known tile", ok)
+	check("rotation key written", t.has("rotation"))
+	check_eq("rotation value correct", t["rotation"], 45.0)
+
+
+func test_set_tile_rotation_zero_removes_key() -> void:
+	print("test_set_tile_rotation_zero_removes_key:")
+	var s: Dictionary = SlideModel.make_slide()
+	var t: Dictionary = SlideModel.make_text_tile(0.1, 0.1, 0.4, 0.2, "", SlideModel.TEXT_MODE_PLAIN, 45.0)
+	(s["tiles"] as Array).append(t)
+	check("rotation key present before clear", t.has("rotation"))
+	var ok: bool = SlideModel.set_tile_rotation(s, t["id"], 0.0)
+	check("returns true", ok)
+	check("rotation key removed after set to 0.0", not t.has("rotation"))
+
+
+func test_set_tile_rotation_unknown_id_returns_false() -> void:
+	print("test_set_tile_rotation_unknown_id_returns_false:")
+	var s: Dictionary = SlideModel.make_slide()
+	var ok: bool = SlideModel.set_tile_rotation(s, "nonexistent_id", 45.0)
+	check("returns false for unknown tile_id", not ok)
+
+
+func test_rotation_json_roundtrip() -> void:
+	print("test_rotation_json_roundtrip:")
+	var d: Dictionary = SlideModel.make_deck()
+	var s: Dictionary = SlideModel.make_slide("s_rot")
+	var t: Dictionary = SlideModel.make_text_tile(0.1, 0.1, 0.4, 0.2, "hello", SlideModel.TEXT_MODE_PLAIN, 45.0)
+	(s["tiles"] as Array).append(t)
+	SlideModel.add_slide(d, s)
+
+	var json_str: String = JSON.stringify(d)
+	var parser: JSON = JSON.new()
+	var rc: int = parser.parse(json_str)
+	check_eq("JSON parses", rc, OK)
+	var d2: Dictionary = parser.data as Dictionary
+	var errs: Array = SlideModel.validate_deck(d2)
+	check("round-trip deck validates", errs.is_empty())
+	# Find the rotated tile in the round-tripped deck.
+	var s2: Variant = SlideModel.find_slide(d2, "s_rot")
+	check("slide found in round-trip", s2 != null)
+	if s2 != null:
+		var tiles2: Array = (s2 as Dictionary).get("tiles", []) as Array
+		check("one tile in round-trip slide", tiles2.size() == 1)
+		if tiles2.size() == 1:
+			var t2: Dictionary = tiles2[0] as Dictionary
+			check("rotation key preserved", t2.has("rotation"))
+			check_eq("rotation value preserved", float(t2.get("rotation", 0.0)), 45.0)
+
+
+# ── slide.annotations[] field ─────────────────────────────────────────────
+
+func test_annotations_make_slide_no_arg() -> void:
+	print("test_annotations_make_slide_no_arg:")
+	var s: Dictionary = SlideModel.make_slide()
+	check("no annotations key when arg omitted", not s.has("annotations"))
+
+
+func test_annotations_make_slide_empty_array() -> void:
+	print("test_annotations_make_slide_empty_array:")
+	var s: Dictionary = SlideModel.make_slide("", "", [])
+	check("no annotations key when empty array passed", not s.has("annotations"))
+
+
+func test_annotations_make_slide_with_envelopes() -> void:
+	print("test_annotations_make_slide_with_envelopes:")
+	var env: Dictionary = {"id": "a", "kind": "callout"}
+	var s: Dictionary = SlideModel.make_slide("", "", [env])
+	check("annotations key present", s.has("annotations"))
+	var anns: Array = s["annotations"] as Array
+	check_eq("one annotation stored", anns.size(), 1)
+	check_eq("envelope id preserved", (anns[0] as Dictionary).get("id", ""), "a")
+	check_eq("envelope kind preserved", (anns[0] as Dictionary).get("kind", ""), "callout")
+
+
+func test_validate_slide_accepts_missing_annotations() -> void:
+	print("test_validate_slide_accepts_missing_annotations:")
+	var s: Dictionary = SlideModel.make_slide()
+	check("no annotations key", not s.has("annotations"))
+	check("validates without annotations", SlideModel.validate_slide(s).is_empty())
+
+
+func test_validate_slide_accepts_empty_annotations_array() -> void:
+	print("test_validate_slide_accepts_empty_annotations_array:")
+	var s: Dictionary = SlideModel.make_slide()
+	s["annotations"] = []
+	check("validates with empty annotations array", SlideModel.validate_slide(s).is_empty())
+
+
+func test_validate_slide_accepts_annotations_array_of_dicts() -> void:
+	print("test_validate_slide_accepts_annotations_array_of_dicts:")
+	var s: Dictionary = SlideModel.make_slide()
+	s["annotations"] = [{"id": "x", "kind": "arrow"}, {"id": "y", "kind": "callout"}]
+	check("validates with array of dicts", SlideModel.validate_slide(s).is_empty())
+
+
+func test_validate_slide_rejects_annotations_non_array() -> void:
+	print("test_validate_slide_rejects_annotations_non_array:")
+	var s_str: Dictionary = SlideModel.make_slide()
+	s_str["annotations"] = "not an array"
+	check("rejects string annotations", not SlideModel.validate_slide(s_str).is_empty())
+	check("error mentions annotations (string)", str(SlideModel.validate_slide(s_str)).contains("annotations"))
+
+	var s_int: Dictionary = SlideModel.make_slide()
+	s_int["annotations"] = 42
+	check("rejects int annotations", not SlideModel.validate_slide(s_int).is_empty())
+	check("error mentions annotations (int)", str(SlideModel.validate_slide(s_int)).contains("annotations"))
+
+	var s_dict: Dictionary = SlideModel.make_slide()
+	s_dict["annotations"] = {"id": "x"}
+	check("rejects dict annotations", not SlideModel.validate_slide(s_dict).is_empty())
+	check("error mentions annotations (dict)", str(SlideModel.validate_slide(s_dict)).contains("annotations"))
+
+
+func test_validate_slide_rejects_annotations_array_with_non_dict() -> void:
+	print("test_validate_slide_rejects_annotations_array_with_non_dict:")
+	var s: Dictionary = SlideModel.make_slide()
+	s["annotations"] = [{"id": "x"}, "not a dict", 99]
+	var errs: Array = SlideModel.validate_slide(s)
+	check("rejects array with non-dict elements", not errs.is_empty())
+	check("error mentions annotations[1]", str(errs).contains("annotations[1]"))
+
+
+func test_add_annotation_appends_and_second_call() -> void:
+	print("test_add_annotation_appends_and_second_call:")
+	var s: Dictionary = SlideModel.make_slide()
+	var env1: Dictionary = {"id": "ann1", "kind": "callout"}
+	var ok1: bool = SlideModel.add_annotation(s, env1)
+	check("first add returns true", ok1)
+	check("annotations key created", s.has("annotations"))
+	check_eq("one annotation after first add", (s["annotations"] as Array).size(), 1)
+
+	var env2: Dictionary = {"id": "ann2", "kind": "arrow"}
+	var ok2: bool = SlideModel.add_annotation(s, env2)
+	check("second add returns true", ok2)
+	check_eq("two annotations after second add", (s["annotations"] as Array).size(), 2)
+	check_eq("second envelope id correct", ((s["annotations"] as Array)[1] as Dictionary).get("id", ""), "ann2")
+
+
+func test_add_annotation_rejects_missing_or_empty_id() -> void:
+	print("test_add_annotation_rejects_missing_or_empty_id:")
+	var s: Dictionary = SlideModel.make_slide()
+	var env_no_id: Dictionary = {"kind": "callout"}
+	check("rejects envelope with no id key", not SlideModel.add_annotation(s, env_no_id))
+	check("no annotations key after rejection", not s.has("annotations"))
+
+	var env_empty_id: Dictionary = {"id": "", "kind": "callout"}
+	check("rejects envelope with empty id", not SlideModel.add_annotation(s, env_empty_id))
+	check("no annotations key after rejection (empty id)", not s.has("annotations"))
+
+
+func test_update_annotation_replaces_by_id() -> void:
+	print("test_update_annotation_replaces_by_id:")
+	var s: Dictionary = SlideModel.make_slide()
+	SlideModel.add_annotation(s, {"id": "ann1", "kind": "callout", "text": "old"})
+	var new_env: Dictionary = {"id": "ann1", "kind": "arrow", "text": "new"}
+	var ok: bool = SlideModel.update_annotation(s, "ann1", new_env)
+	check("update returns true", ok)
+	var stored: Dictionary = (s["annotations"] as Array)[0] as Dictionary
+	check_eq("kind updated", stored.get("kind", ""), "arrow")
+	check_eq("text updated", stored.get("text", ""), "new")
+
+
+func test_update_annotation_forces_id_match() -> void:
+	print("test_update_annotation_forces_id_match:")
+	var s: Dictionary = SlideModel.make_slide()
+	SlideModel.add_annotation(s, {"id": "ann1", "kind": "callout"})
+	# Pass envelope with a DIFFERENT id — update should force it to match annotation_id.
+	var new_env: Dictionary = {"id": "wrong_id", "kind": "arrow"}
+	SlideModel.update_annotation(s, "ann1", new_env)
+	var stored: Dictionary = (s["annotations"] as Array)[0] as Dictionary
+	check_eq("id forced to annotation_id", stored.get("id", ""), "ann1")
+
+
+func test_update_annotation_unknown_id_returns_false() -> void:
+	print("test_update_annotation_unknown_id_returns_false:")
+	var s: Dictionary = SlideModel.make_slide()
+	SlideModel.add_annotation(s, {"id": "ann1", "kind": "callout"})
+	var ok: bool = SlideModel.update_annotation(s, "nonexistent", {"id": "nonexistent", "kind": "arrow"})
+	check("returns false for unknown id", not ok)
+	check_eq("array unchanged (still 1)", (s["annotations"] as Array).size(), 1)
+
+
+func test_remove_annotation_removes_by_id() -> void:
+	print("test_remove_annotation_removes_by_id:")
+	var s: Dictionary = SlideModel.make_slide()
+	SlideModel.add_annotation(s, {"id": "ann1", "kind": "callout"})
+	SlideModel.add_annotation(s, {"id": "ann2", "kind": "arrow"})
+	var ok: bool = SlideModel.remove_annotation(s, "ann1")
+	check("remove returns true", ok)
+	check_eq("one annotation remains", (s["annotations"] as Array).size(), 1)
+	check_eq("remaining annotation is ann2", ((s["annotations"] as Array)[0] as Dictionary).get("id", ""), "ann2")
+
+
+func test_remove_annotation_unknown_id_returns_false() -> void:
+	print("test_remove_annotation_unknown_id_returns_false:")
+	var s: Dictionary = SlideModel.make_slide()
+	SlideModel.add_annotation(s, {"id": "ann1", "kind": "callout"})
+	var ok: bool = SlideModel.remove_annotation(s, "nonexistent")
+	check("returns false for unknown id", not ok)
+	check_eq("array unchanged (still 1)", (s["annotations"] as Array).size(), 1)
+
+
+func test_remove_annotation_last_deletes_key() -> void:
+	print("test_remove_annotation_last_deletes_key:")
+	var s: Dictionary = SlideModel.make_slide()
+	SlideModel.add_annotation(s, {"id": "ann1", "kind": "callout"})
+	check("annotations key present before remove", s.has("annotations"))
+	var ok: bool = SlideModel.remove_annotation(s, "ann1")
+	check("remove returns true", ok)
+	check("annotations key deleted after last removal (omit-when-empty)", not s.has("annotations"))
+
+
+func test_annotations_json_roundtrip() -> void:
+	print("test_annotations_json_roundtrip:")
+	var d: Dictionary = SlideModel.make_deck()
+	var s: Dictionary = SlideModel.make_slide("s_ann")
+	SlideModel.add_annotation(s, {"id": "ann1", "kind": "callout", "text": "hello"})
+	SlideModel.add_annotation(s, {"id": "ann2", "kind": "arrow"})
+	SlideModel.add_slide(d, s)
+
+	var json_str: String = JSON.stringify(d)
+	var parser: JSON = JSON.new()
+	var rc: int = parser.parse(json_str)
+	check_eq("JSON parses", rc, OK)
+	var d2: Dictionary = parser.data as Dictionary
+	var errs: Array = SlideModel.validate_deck(d2)
+	check("round-trip deck validates", errs.is_empty())
+
+	var s2: Variant = SlideModel.find_slide(d2, "s_ann")
+	check("annotated slide found in round-trip", s2 != null)
+	if s2 != null:
+		var anns2: Array = (s2 as Dictionary).get("annotations", []) as Array
+		check_eq("two annotations preserved", anns2.size(), 2)
+		check_eq("first annotation id preserved", (anns2[0] as Dictionary).get("id", ""), "ann1")
+		check_eq("first annotation kind preserved", (anns2[0] as Dictionary).get("kind", ""), "callout")
+		check_eq("second annotation id preserved", (anns2[1] as Dictionary).get("id", ""), "ann2")

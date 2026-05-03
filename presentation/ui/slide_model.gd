@@ -61,7 +61,8 @@ static func make_deck() -> Dictionary:
 ## per project_presentation_llm_edit_model.md, it's used for LLM list_slides
 ## summaries and the slide-list UI panel (T3). Speaker notes are NOT a field;
 ## per-slide ink annotations cover that use case via the substrate.
-static func make_slide(slide_id: String = "", title: String = "") -> Dictionary:
+## `annotations` is optional; omitted from the dict when empty (omit-when-default).
+static func make_slide(slide_id: String = "", title: String = "", annotations: Array = []) -> Dictionary:
 	var s: Dictionary = {
 		"id": slide_id if slide_id != "" else gen_id("slide"),
 		"background": BG_DEFAULT.duplicate(true),
@@ -70,6 +71,8 @@ static func make_slide(slide_id: String = "", title: String = "") -> Dictionary:
 	}
 	if title != "":
 		s["title"] = title
+	if not annotations.is_empty():
+		s["annotations"] = annotations
 	return s
 
 
@@ -87,15 +90,19 @@ static func make_text_tile(
 	w: float = 0.4,
 	h: float = 0.2,
 	content: String = "",
-	text_mode: String = TEXT_MODE_PLAIN
+	text_mode: String = TEXT_MODE_PLAIN,
+	rotation: float = 0.0
 ) -> Dictionary:
-	return {
+	var t: Dictionary = {
 		"id": gen_id("tile"),
 		"kind": TILE_TEXT,
 		"x": x, "y": y, "w": w, "h": h,
 		"text_mode": text_mode,
 		"content": content,
 	}
+	if not is_zero_approx(rotation):
+		t["rotation"] = rotation
+	return t
 
 
 static func make_image_tile(
@@ -103,14 +110,18 @@ static func make_image_tile(
 	x: float = 0.1,
 	y: float = 0.1,
 	w: float = 0.4,
-	h: float = 0.4
+	h: float = 0.4,
+	rotation: float = 0.0
 ) -> Dictionary:
-	return {
+	var t: Dictionary = {
 		"id": gen_id("tile"),
 		"kind": TILE_IMAGE,
 		"x": x, "y": y, "w": w, "h": h,
 		"src": src_base64,
 	}
+	if not is_zero_approx(rotation):
+		t["rotation"] = rotation
+	return t
 
 
 static func make_spreadsheet_tile(
@@ -122,11 +133,12 @@ static func make_spreadsheet_tile(
 	w: float = 0.6,
 	h: float = 0.3,
 	header_row: bool = false,
-	header_col: bool = false
+	header_col: bool = false,
+	rotation: float = 0.0
 ) -> Dictionary:
 	# If caller didn't supply cells, build an empty rows×cols grid.
 	var grid: Array = cells if cells.size() > 0 else _empty_cell_grid(rows, cols)
-	return {
+	var t: Dictionary = {
 		"id": gen_id("tile"),
 		"kind": TILE_SPREADSHEET,
 		"x": x, "y": y, "w": w, "h": h,
@@ -136,6 +148,9 @@ static func make_spreadsheet_tile(
 		"header_row": header_row,
 		"header_col": header_col,
 	}
+	if not is_zero_approx(rotation):
+		t["rotation"] = rotation
+	return t
 
 
 ## Cell dict mirroring SpreadsheetCell.to_dict() — empty by default; extra
@@ -230,6 +245,16 @@ static func validate_slide(slide: Variant) -> Array:
 			if not ((reveal as Array)[r_idx] is String):
 				errors.append("reveal[%d]: expected String annotation id" % r_idx)
 
+	# annotations is optional; if present, must be Array of Dictionary.
+	if s.has("annotations"):
+		var ann: Variant = s["annotations"]
+		if not (ann is Array):
+			errors.append("annotations: expected Array, got %s" % str(ann))
+		else:
+			for a_idx in range((ann as Array).size()):
+				if not ((ann as Array)[a_idx] is Dictionary):
+					errors.append("annotations[%d]: expected Dictionary" % a_idx)
+
 	return errors
 
 
@@ -273,6 +298,13 @@ static func validate_tile(tile: Variant) -> Array:
 			var fv: float = float(v)
 			if fv < 0.0 or fv > 1.0:
 				errors.append("%s: out of [0,1], got %f" % [axis, fv])
+
+	# rotation is optional; if present must be int or float (JSON round-trip may
+	# deliver whole-number floats for integer values).
+	if t.has("rotation"):
+		var rotation_v: Variant = t["rotation"]
+		if not (rotation_v is int or rotation_v is float):
+			errors.append("rotation: expected int or float, got %s" % str(rotation_v))
 
 	match kind:
 		TILE_TEXT:
@@ -358,6 +390,62 @@ static func resize_tile(slide: Dictionary, tile_id: String, w: float, h: float) 
 	(t as Dictionary)["w"] = clampf(w, 0.0, 1.0)
 	(t as Dictionary)["h"] = clampf(h, 0.0, 1.0)
 	return true
+
+
+static func set_tile_rotation(slide: Dictionary, tile_id: String, rotation: float) -> bool:
+	var t: Variant = find_tile(slide, tile_id)
+	if t == null:
+		return false
+	if is_zero_approx(rotation):
+		(t as Dictionary).erase("rotation")
+	else:
+		(t as Dictionary)["rotation"] = rotation
+	return true
+
+
+## Append an annotation envelope to slide.annotations[].
+## Creates the key if absent. Envelope must have a non-empty "id" string.
+## Returns true on success, false if envelope id is missing or empty.
+static func add_annotation(slide: Dictionary, envelope: Dictionary) -> bool:
+	var env_id: Variant = envelope.get("id", "")
+	if not (env_id is String) or (env_id as String).is_empty():
+		return false
+	if not slide.has("annotations"):
+		slide["annotations"] = []
+	(slide["annotations"] as Array).append(envelope)
+	return true
+
+
+## Replace the annotation with the given id in slide.annotations[].
+## Forces new_envelope["id"] = annotation_id regardless of what was passed.
+## Returns false if annotation_id is not found.
+static func update_annotation(slide: Dictionary, annotation_id: String, new_envelope: Dictionary) -> bool:
+	var anns: Array = slide.get("annotations", []) as Array
+	for i in range(anns.size()):
+		var a: Dictionary = anns[i] as Dictionary
+		if a.get("id", "") == annotation_id:
+			new_envelope["id"] = annotation_id
+			anns[i] = new_envelope
+			return true
+	return false
+
+
+## Remove the annotation with the given id from slide.annotations[].
+## If removal empties the array, deletes the "annotations" key entirely
+## (preserves omit-when-default invariant).
+## Returns false if annotation_id is not found.
+static func remove_annotation(slide: Dictionary, annotation_id: String) -> bool:
+	if not slide.has("annotations"):
+		return false
+	var anns: Array = slide["annotations"] as Array
+	for i in range(anns.size()):
+		var a: Dictionary = anns[i] as Dictionary
+		if a.get("id", "") == annotation_id:
+			anns.remove_at(i)
+			if anns.is_empty():
+				slide.erase("annotations")
+			return true
+	return false
 
 
 # ---------------------------------------------------------------------------
