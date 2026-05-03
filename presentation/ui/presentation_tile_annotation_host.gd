@@ -216,6 +216,13 @@ func get_selected_annotation_id() -> String:
 	return _selected_id
 
 
+## Notify listeners that the slide changed externally (e.g., tile created via
+## PLACE flow, tile deleted via Del key, background swapped). Used by slide_canvas
+## after mutations that don't go through update/add/remove.
+func notify_changed() -> void:
+	annotations_changed.emit()
+
+
 ## No semantic anchoring on slides yet.
 func describe_point(_doc_pos: Vector2) -> String:
 	return ""

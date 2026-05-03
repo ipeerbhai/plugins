@@ -26,10 +26,9 @@ signal content_mutated                           # any change worth marking the 
 signal tool_changed(tool: int)                   # so the panel toolbar can reflect active tool
 
 const _SlideModel: Script = preload("slide_model.gd")
+const _Host: Script = preload("presentation_tile_annotation_host.gd")
 
 const ASPECT_RATIO: float = 16.0 / 9.0
-const HANDLE_SIZE: float = 12.0
-const SELECTION_PADDING: float = 4.0
 const MIN_TILE_NORM: float = 0.02
 const CLICK_PLACE_NORM_W: float = 0.35           # default size when user just clicks (no drag) in a tool
 const CLICK_PLACE_NORM_H: float = 0.20
@@ -37,14 +36,10 @@ const CLICK_PLACE_NORM_H: float = 0.20
 # Tool modes (public — panel toolbar uses these).
 enum Tool { SELECT, TEXT, IMAGE, SHEET }
 
-# Resize-direction flags (bit field).
-const RESIZE_N: int = 1
-const RESIZE_S: int = 2
-const RESIZE_E: int = 4
-const RESIZE_W: int = 8
-
-# Drag mode states.
-enum DragMode { NONE, MOVE, RESIZE, PLACE }
+# Drag mode states. SELECT-mode movement (translate/scale/rotate of tiles) is
+# now driven by the substrate AnnotationTransformTool via AnnotationOverlay; the
+# canvas only owns PLACE for the TEXT/IMAGE/SHEET rubber-band placement flow.
+enum DragMode { NONE, PLACE }
 
 # ---------------------------------------------------------------------------
 # State
@@ -69,10 +64,7 @@ const ZOOM_STEP: float = 1.10
 var _preview_mode: bool = false
 
 var _drag_mode: int = DragMode.NONE
-var _drag_tile_id: String = ""
 var _drag_start_mouse: Vector2 = Vector2.ZERO
-var _drag_start_norm: Rect2 = Rect2()
-var _drag_resize_flags: int = 0
 
 # Middle-mouse pan state (separate from tile drag).
 var _pan_drag_active: bool = false
@@ -93,6 +85,18 @@ var _content_layer: Control = null
 var _inline_edit: TextEdit = null
 var _inline_edit_tile_id: String = ""
 
+# Substrate annotation integration (Round 3 of universal-select DRY refactor).
+# AnnotationHost owns selection state + tile-as-annotation synthesis. AnnotationOverlay
+# routes input to the active AnnotationAuthorTool and writes mutations back through
+# the host. SELECT tool = AnnotationTransformTool (corner scale / edge axis-lock /
+# rotate-ring / inside translate). TEXT/IMAGE/SHEET keep the canvas-local PLACE drag.
+var _host: AnnotationHost = null
+var _overlay: AnnotationOverlay = null
+var _active_select_tool: AnnotationAuthorTool = null
+# Set true when we are emitting a tile_selected signal in response to the host's
+# selection_changed; prevents the host's setter from re-firing the round trip.
+var _suppress_selection_signal: bool = false
+
 
 func _ready() -> void:
 	clip_contents = true
@@ -105,6 +109,24 @@ func _ready() -> void:
 	_content_layer = Control.new()
 	_content_layer.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	add_child(_content_layer)
+
+	# Substrate AnnotationHost + AnnotationOverlay. The overlay sits above
+	# tile content (added after _content_layer) and consumes mouse input ONLY
+	# while a SELECT-style tool is active. Wheel zoom, middle-pan, Del key, and
+	# double-click-to-edit-text are routed through _input/_unhandled_key_input
+	# so they bypass the overlay regardless of its mouse_filter.
+	_host = _Host.new()
+	_overlay = AnnotationOverlay.new()
+	add_child(_overlay)
+	_overlay.set_host(_host)
+	_host.selection_changed.connect(_on_host_selection_changed)
+	_host.annotations_changed.connect(_on_host_annotations_changed)
+	# Bootstrap the SELECT tool — set_tool early-returns when the requested
+	# tool equals the current one, and SELECT is the default.
+	if _tool == Tool.SELECT:
+		_active_select_tool = AnnotationTransformTool.new()
+		_overlay.set_active_tool(_active_select_tool)
+
 	_recompute_slide_rect()
 
 
@@ -119,11 +141,15 @@ func set_slide(slide: Dictionary) -> void:
 	if _selected_tile_id != "" and _SlideModel.find_tile(_slide, _selected_tile_id) == null:
 		_selected_tile_id = ""
 	_rebuild_views()
+	if _host != null:
+		_host.set_slide(_slide)
 	queue_redraw()
 
 
 func set_selected_tile_id(tile_id: String) -> void:
 	_selected_tile_id = tile_id
+	if _host != null and not _suppress_selection_signal:
+		_host.set_selected_annotation_id(tile_id)
 	queue_redraw()
 
 
@@ -134,9 +160,22 @@ func set_tool(tool: int) -> void:
 	_drag_mode = DragMode.NONE
 	_commit_inline_edit()
 	_tool = tool
+	# Swap the overlay's active tool. SELECT activates the substrate
+	# AnnotationTransformTool (corner scale / edge axis-lock / rotate-ring /
+	# inside translate). Non-SELECT tools clear the active tool so the
+	# overlay's mouse_filter goes IGNORE and canvas _gui_input handles PLACE.
+	if _overlay != null:
+		if _tool == Tool.SELECT:
+			_active_select_tool = AnnotationTransformTool.new()
+			_overlay.set_active_tool(_active_select_tool)
+		else:
+			_overlay.clear_active_tool()
+			_active_select_tool = null
 	# In a non-SELECT tool, deselecting any current tile reduces accidental edits.
 	if _tool != Tool.SELECT:
 		_selected_tile_id = ""
+		if _host != null:
+			_host.set_selected_annotation_id("")
 		tile_selected.emit("")
 	tool_changed.emit(_tool)
 	queue_redraw()
@@ -184,6 +223,9 @@ func delete_selected() -> void:
 			tiles.remove_at(i)
 			break
 	_selected_tile_id = ""
+	if _host != null:
+		_host.set_selected_annotation_id("")
+		_host.notify_changed()
 	tile_selected.emit("")
 	tile_deleted.emit(deleted_id)
 	content_mutated.emit()
@@ -217,6 +259,8 @@ func _recompute_slide_rect() -> void:
 	_content_layer.size = Vector2(w, h)
 	_layout_views()
 	_layout_inline_edit()
+	if _host != null:
+		_host.set_slide_rect(_slide_rect)
 	queue_redraw()
 
 
@@ -486,121 +530,116 @@ func _norm_to_local(tile: Dictionary) -> Rect2:
 # Input — tool-dependent
 # ---------------------------------------------------------------------------
 
+## Canvas-level mouse input — only handles PLACE drag for non-SELECT tools. SELECT
+## input is handled by the AnnotationOverlay → AnnotationTransformTool. Wheel zoom,
+## middle pan, and double-click-to-edit are intercepted in `_input` so they keep
+## working even when the overlay is mouse_filter STOP.
 func _gui_input(event: InputEvent) -> void:
 	if _preview_mode:
 		return
-	# Wheel zoom (anchored at the cursor).
-	if event is InputEventMouseButton:
-		var mb_pre: InputEventMouseButton = event
-		if mb_pre.button_index == MOUSE_BUTTON_WHEEL_UP and mb_pre.pressed:
-			set_zoom(_zoom * ZOOM_STEP, mb_pre.position)
-			accept_event()
-			return
-		if mb_pre.button_index == MOUSE_BUTTON_WHEEL_DOWN and mb_pre.pressed:
-			set_zoom(_zoom / ZOOM_STEP, mb_pre.position)
-			accept_event()
-			return
-		if mb_pre.button_index == MOUSE_BUTTON_MIDDLE:
-			# Middle-drag pan when zoomed in.
-			if mb_pre.pressed:
-				_drag_mode = DragMode.NONE   # cancel any other drag
-				_pan_drag_active = true
-				_pan_drag_start_mouse = mb_pre.position
-				_pan_drag_start_pan = _pan
-			else:
-				_pan_drag_active = false
-			accept_event()
-			return
-	if _pan_drag_active and event is InputEventMouseMotion:
-		var mm: InputEventMouseMotion = event
-		_pan = _pan_drag_start_pan + (mm.position - _pan_drag_start_mouse)
-		set_zoom(_zoom, null)   # re-clamp + recompute
-		accept_event()
+	if _tool == Tool.SELECT:
 		return
-	if event is InputEventKey:
-		var k: InputEventKey = event
-		if k.pressed and (k.keycode == KEY_DELETE or k.keycode == KEY_BACKSPACE):
-			if _inline_edit == null and _selected_tile_id != "":
-				delete_selected()
-				accept_event()
-				return
-		if k.pressed and k.keycode == KEY_ESCAPE:
-			if _inline_edit != null:
-				_commit_inline_edit()
-				accept_event()
-				return
 	if event is InputEventMouseButton:
 		var mb: InputEventMouseButton = event
 		if mb.button_index != MOUSE_BUTTON_LEFT:
 			return
 		if mb.pressed:
-			grab_focus()   # so key events come our way
-			if mb.double_click and _tool == Tool.SELECT:
-				_handle_double_click(mb.position)
-			else:
-				_handle_press(mb.position)
+			grab_focus()
+			_handle_press(mb.position)
 		else:
 			_handle_release(mb.position)
 		accept_event()
 		return
-	if event is InputEventMouseMotion and _drag_mode != DragMode.NONE:
+	if event is InputEventMouseMotion and _drag_mode == DragMode.PLACE:
 		var mm: InputEventMouseMotion = event
 		_handle_motion(mm.position)
 		accept_event()
 
 
+## Pre-GUI input hook: wheel zoom + middle pan + double-click. These run before
+## any Control's _gui_input so the AnnotationOverlay (which STOPs mouse events
+## while SELECT-active) doesn't block them. Gated by global_rect to avoid firing
+## when the cursor is outside the canvas.
+func _input(event: InputEvent) -> void:
+	if _preview_mode:
+		return
+	if not (event is InputEventMouseButton or event is InputEventMouseMotion):
+		return
+	# Resolve cursor position in our local space; bail if outside canvas.
+	var global_pos: Vector2 = (event as InputEventMouse).global_position
+	if not get_global_rect().has_point(global_pos):
+		# Still need to release pan if we lose focus mid-drag.
+		if _pan_drag_active and event is InputEventMouseButton:
+			var mb_out: InputEventMouseButton = event
+			if mb_out.button_index == MOUSE_BUTTON_MIDDLE and not mb_out.pressed:
+				_pan_drag_active = false
+		return
+	var local_pos: Vector2 = global_pos - global_position
+	if event is InputEventMouseButton:
+		var mb: InputEventMouseButton = event
+		if mb.button_index == MOUSE_BUTTON_WHEEL_UP and mb.pressed:
+			set_zoom(_zoom * ZOOM_STEP, local_pos)
+			get_viewport().set_input_as_handled()
+			return
+		if mb.button_index == MOUSE_BUTTON_WHEEL_DOWN and mb.pressed:
+			set_zoom(_zoom / ZOOM_STEP, local_pos)
+			get_viewport().set_input_as_handled()
+			return
+		if mb.button_index == MOUSE_BUTTON_MIDDLE:
+			if mb.pressed:
+				_pan_drag_active = true
+				_pan_drag_start_mouse = local_pos
+				_pan_drag_start_pan = _pan
+			else:
+				_pan_drag_active = false
+			get_viewport().set_input_as_handled()
+			return
+		# Double-click on a text tile in SELECT mode opens the inline editor. We
+		# steal this from the overlay so the substrate transform tool only sees
+		# single-click selection.
+		if mb.button_index == MOUSE_BUTTON_LEFT and mb.pressed and mb.double_click \
+				and _tool == Tool.SELECT:
+			grab_focus()
+			_handle_double_click(local_pos)
+			get_viewport().set_input_as_handled()
+			return
+	if _pan_drag_active and event is InputEventMouseMotion:
+		_pan = _pan_drag_start_pan + (local_pos - _pan_drag_start_mouse)
+		set_zoom(_zoom, null)   # re-clamp + recompute
+		get_viewport().set_input_as_handled()
+
+
+## Key shortcuts. Bypasses overlay mouse_filter — keys are not routed through
+## GUI mouse dispatch.
+func _unhandled_key_input(event: InputEvent) -> void:
+	if _preview_mode or not (event is InputEventKey):
+		return
+	var k: InputEventKey = event
+	if not k.pressed:
+		return
+	if k.keycode == KEY_DELETE or k.keycode == KEY_BACKSPACE:
+		if _inline_edit == null and _selected_tile_id != "":
+			delete_selected()
+			get_viewport().set_input_as_handled()
+			return
+	if k.keycode == KEY_ESCAPE:
+		if _inline_edit != null:
+			_commit_inline_edit()
+			get_viewport().set_input_as_handled()
+			return
+
+
 func _handle_press(local_pos: Vector2) -> void:
-	if _tool != Tool.SELECT:
-		# Any non-SELECT tool starts a placement drag if the press is inside
-		# the slide rect; otherwise no-op.
-		if not _slide_rect.has_point(local_pos):
-			return
-		_drag_mode = DragMode.PLACE
-		_drag_start_mouse = local_pos
-		_place_rect_local = Rect2(local_pos - _slide_rect.position, Vector2.ZERO)
-		_place_dragged = false
-		queue_redraw()
+	# SELECT-mode press is handled by the AnnotationOverlay → AnnotationTransformTool;
+	# this path is only reached for TEXT/IMAGE/SHEET (overlay is mouse_filter IGNORE).
+	if _tool == Tool.SELECT:
 		return
-
-	# SELECT tool. Resize handles first when something is selected.
-	if _selected_tile_id != "":
-		var sel: Variant = _SlideModel.find_tile(_slide, _selected_tile_id)
-		if sel != null:
-			var sel_tile: Dictionary = sel
-			var rect_local := _norm_to_local(sel_tile)
-			var rect_canvas := Rect2(_slide_rect.position + rect_local.position, rect_local.size)
-			var flags: int = _hit_test_handles(rect_canvas, local_pos)
-			if flags != 0:
-				_drag_mode = DragMode.RESIZE
-				_drag_tile_id = _selected_tile_id
-				_drag_resize_flags = flags
-				_drag_start_mouse = local_pos
-				_drag_start_norm = Rect2(
-					float(sel_tile["x"]), float(sel_tile["y"]),
-					float(sel_tile["w"]), float(sel_tile["h"])
-				)
-				return
-
-	var hit_id: String = _hit_test_tiles(local_pos)
-	if hit_id != "":
-		var hit_v: Variant = _SlideModel.find_tile(_slide, hit_id)
-		if hit_v == null:
-			return
-		var hit_tile: Dictionary = hit_v
-		_selected_tile_id = hit_id
-		tile_selected.emit(hit_id)
-		_drag_mode = DragMode.MOVE
-		_drag_tile_id = hit_id
-		_drag_start_mouse = local_pos
-		_drag_start_norm = Rect2(
-			float(hit_tile["x"]), float(hit_tile["y"]),
-			float(hit_tile["w"]), float(hit_tile["h"])
-		)
-		queue_redraw()
+	if not _slide_rect.has_point(local_pos):
 		return
-
-	_selected_tile_id = ""
-	tile_selected.emit("")
+	_drag_mode = DragMode.PLACE
+	_drag_start_mouse = local_pos
+	_place_rect_local = Rect2(local_pos - _slide_rect.position, Vector2.ZERO)
+	_place_dragged = false
 	queue_redraw()
 
 
@@ -622,82 +661,29 @@ func _handle_double_click(local_pos: Vector2) -> void:
 
 
 func _handle_motion(local_pos: Vector2) -> void:
-	var slide_w: float = _slide_rect.size.x
-	var slide_h: float = _slide_rect.size.y
-	if slide_w <= 0 or slide_h <= 0:
+	if _drag_mode != DragMode.PLACE:
 		return
-
-	if _drag_mode == DragMode.PLACE:
-		var origin: Vector2 = _drag_start_mouse
-		var p1: Vector2 = origin
-		var p2: Vector2 = local_pos
-		var x: float = min(p1.x, p2.x)
-		var y: float = min(p1.y, p2.y)
-		var w: float = abs(p2.x - p1.x)
-		var h: float = abs(p2.y - p1.y)
-		_place_rect_local = Rect2(Vector2(x, y) - _slide_rect.position, Vector2(w, h))
-		if w > 2.0 or h > 2.0:
-			_place_dragged = true
-		queue_redraw()
+	if _slide_rect.size.x <= 0 or _slide_rect.size.y <= 0:
 		return
-
-	var dx_norm: float = (local_pos.x - _drag_start_mouse.x) / slide_w
-	var dy_norm: float = (local_pos.y - _drag_start_mouse.y) / slide_h
-	var tile: Variant = _SlideModel.find_tile(_slide, _drag_tile_id)
-	if tile == null:
-		return
-	var t: Dictionary = tile
-
-	if _drag_mode == DragMode.MOVE:
-		t["x"] = clampf(_drag_start_norm.position.x + dx_norm, 0.0, 1.0 - _drag_start_norm.size.x)
-		t["y"] = clampf(_drag_start_norm.position.y + dy_norm, 0.0, 1.0 - _drag_start_norm.size.y)
-		_layout_views()
-		_layout_inline_edit()
-		queue_redraw()
-	elif _drag_mode == DragMode.RESIZE:
-		var nx: float = _drag_start_norm.position.x
-		var ny: float = _drag_start_norm.position.y
-		var nw: float = _drag_start_norm.size.x
-		var nh: float = _drag_start_norm.size.y
-		if (_drag_resize_flags & RESIZE_W) != 0:
-			var new_x: float = clampf(nx + dx_norm, 0.0, nx + nw - MIN_TILE_NORM)
-			nw += (nx - new_x)
-			nx = new_x
-		if (_drag_resize_flags & RESIZE_E) != 0:
-			nw = clampf(nw + dx_norm, MIN_TILE_NORM, 1.0 - nx)
-		if (_drag_resize_flags & RESIZE_N) != 0:
-			var new_y: float = clampf(ny + dy_norm, 0.0, ny + nh - MIN_TILE_NORM)
-			nh += (ny - new_y)
-			ny = new_y
-		if (_drag_resize_flags & RESIZE_S) != 0:
-			nh = clampf(nh + dy_norm, MIN_TILE_NORM, 1.0 - ny)
-		t["x"] = nx; t["y"] = ny; t["w"] = nw; t["h"] = nh
-		_layout_views()
-		_layout_inline_edit()
-		queue_redraw()
+	var origin: Vector2 = _drag_start_mouse
+	var x: float = min(origin.x, local_pos.x)
+	var y: float = min(origin.y, local_pos.y)
+	var w: float = abs(local_pos.x - origin.x)
+	var h: float = abs(local_pos.y - origin.y)
+	_place_rect_local = Rect2(Vector2(x, y) - _slide_rect.position, Vector2(w, h))
+	if w > 2.0 or h > 2.0:
+		_place_dragged = true
+	queue_redraw()
 
 
 func _handle_release(_local_pos: Vector2) -> void:
-	if _drag_mode == DragMode.PLACE:
-		var rect_norm := _place_rect_to_norm()
-		_drag_mode = DragMode.NONE
-		_place_rect_local = Rect2()
-		queue_redraw()
-		_finish_placement(rect_norm)
+	if _drag_mode != DragMode.PLACE:
 		return
-	if _drag_mode == DragMode.NONE:
-		return
-	var t: Variant = _SlideModel.find_tile(_slide, _drag_tile_id)
-	if t != null:
-		var d: Dictionary = t
-		if _drag_mode == DragMode.MOVE:
-			tile_moved.emit(_drag_tile_id, float(d["x"]), float(d["y"]))
-		elif _drag_mode == DragMode.RESIZE:
-			tile_resized.emit(_drag_tile_id, float(d["x"]), float(d["y"]), float(d["w"]), float(d["h"]))
-		content_mutated.emit()
+	var rect_norm := _place_rect_to_norm()
 	_drag_mode = DragMode.NONE
-	_drag_tile_id = ""
-	_drag_resize_flags = 0
+	_place_rect_local = Rect2()
+	queue_redraw()
+	_finish_placement(rect_norm)
 
 
 # Translate the live PLACE rect into normalized coords; if user just clicked
@@ -747,6 +733,9 @@ func _finish_placement(rect_norm: Rect2) -> void:
 	tile_selected.emit(tile["id"])
 	content_mutated.emit()
 	_rebuild_views()
+	if _host != null:
+		_host.notify_changed()
+		_host.set_selected_annotation_id(tile["id"])
 	set_tool(Tool.SELECT)
 	queue_redraw()
 	# Auto-enter inline edit for text tiles.
@@ -774,6 +763,9 @@ func _run_image_picker_then_place(rect_norm: Rect2) -> void:
 			tile_selected.emit(tile["id"])
 			content_mutated.emit()
 			_rebuild_views()
+			if _host != null:
+				_host.notify_changed()
+				_host.set_selected_annotation_id(tile["id"])
 			queue_redraw()
 		picker.queue_free()
 		set_tool(Tool.SELECT)
@@ -810,25 +802,6 @@ func _hit_test_tiles(local_pos: Vector2) -> String:
 		if rect_canvas.has_point(local_pos):
 			return str(tile.get("id", ""))
 	return ""
-
-
-func _hit_test_handles(rect_canvas: Rect2, pt: Vector2) -> int:
-	var pad: float = SELECTION_PADDING
-	var pos: Vector2 = rect_canvas.position - Vector2(pad, pad)
-	var sz: Vector2 = rect_canvas.size + Vector2(pad * 2.0, pad * 2.0)
-	var corners: Dictionary = {
-		(RESIZE_N | RESIZE_W): pos,
-		(RESIZE_N | RESIZE_E): pos + Vector2(sz.x, 0),
-		(RESIZE_S | RESIZE_W): pos + Vector2(0, sz.y),
-		(RESIZE_S | RESIZE_E): pos + sz,
-	}
-	var half: float = HANDLE_SIZE / 2.0
-	for flags in corners.keys():
-		var center: Vector2 = corners[flags]
-		var r := Rect2(center - Vector2(half, half), Vector2(HANDLE_SIZE, HANDLE_SIZE))
-		if r.has_point(pt):
-			return flags
-	return 0
 
 
 # ---------------------------------------------------------------------------
@@ -910,41 +883,53 @@ func _layout_inline_edit() -> void:
 # ---------------------------------------------------------------------------
 
 func _draw() -> void:
-	# Slide letterbox border.
+	# Slide letterbox border. Selection halo + handles are drawn by the
+	# AnnotationOverlay → AnnotationTransformTool gizmo.
 	draw_rect(_slide_rect.grow(0.5), Color(0.5, 0.5, 0.5, 1.0), false, 1.0)
 
-	# Rubber-band rect during PLACE.
+	# Rubber-band rect during PLACE (TEXT/IMAGE/SHEET tools only).
 	if _drag_mode == DragMode.PLACE and _place_dragged:
 		var canvas_rect := Rect2(_slide_rect.position + _place_rect_local.position, _place_rect_local.size)
 		draw_rect(canvas_rect, Color(0.3, 0.7, 1.0, 0.15), true)
 		draw_rect(canvas_rect, Color(0.3, 0.7, 1.0, 0.95), false, 1.5)
 
-	# Selection halo + corner handles.
-	if _selected_tile_id == "":
+
+# ---------------------------------------------------------------------------
+# Host signal handlers (substrate-driven selection + writeback)
+# ---------------------------------------------------------------------------
+
+## The host's selected_id changed (typically because the user clicked a tile or
+## empty space, routed via AnnotationTransformTool._do_selection). Mirror it
+## into _selected_tile_id and re-emit tile_selected so the panel keeps working.
+## The _suppress_selection_signal flag prevents set_selected_tile_id from
+## bouncing back to the host.
+func _on_host_selection_changed(annotation_id: String) -> void:
+	if _selected_tile_id == annotation_id:
 		return
-	var tile: Variant = _SlideModel.find_tile(_slide, _selected_tile_id)
-	if tile == null:
+	# Only mirror tile-kind ids — substrate annotations (callouts etc.) live in
+	# slide.annotations[] and don't correspond to a tile. Tile ids are tile.id;
+	# substrate annotation ids are "ann_<hex>".
+	var maps_to_tile: bool = annotation_id == "" or _SlideModel.find_tile(_slide, annotation_id) != null
+	if not maps_to_tile:
 		return
-	var rect_local := _norm_to_local(tile as Dictionary)
-	var rect_canvas := Rect2(_slide_rect.position + rect_local.position, rect_local.size)
-	var halo := rect_canvas.grow(SELECTION_PADDING)
-	var pts := PackedVector2Array([
-		halo.position,
-		halo.position + Vector2(halo.size.x, 0),
-		halo.position + halo.size,
-		halo.position + Vector2(0, halo.size.y),
-		halo.position,
-	])
-	draw_polyline(pts, Color(0.3, 0.7, 1.0, 0.95), 1.5)
-	for corner in [
-		halo.position,
-		halo.position + Vector2(halo.size.x, 0),
-		halo.position + halo.size,
-		halo.position + Vector2(0, halo.size.y),
-	]:
-		var r := Rect2((corner as Vector2) - Vector2(HANDLE_SIZE / 2, HANDLE_SIZE / 2), Vector2(HANDLE_SIZE, HANDLE_SIZE))
-		draw_rect(r, Color.WHITE)
-		draw_rect(r, Color.BLACK, false, 1.0)
+	_suppress_selection_signal = true
+	_selected_tile_id = annotation_id
+	tile_selected.emit(annotation_id)
+	_suppress_selection_signal = false
+	queue_redraw()
+
+
+## Host emitted annotations_changed — typically after the SRT tool wrote a new
+## tile geometry through update_annotation. Re-layout tile views so the Control
+## children move to match the updated tile.x/y/w/h. Also emit content_mutated so
+## the panel marks the document dirty.
+func _on_host_annotations_changed() -> void:
+	_layout_views()
+	_layout_inline_edit()
+	# Best-effort tile_moved/tile_resized notification: we can't tell which tile
+	# changed, but content_mutated is the dirty marker the panel needs.
+	content_mutated.emit()
+	queue_redraw()
 
 
 # ---------------------------------------------------------------------------
