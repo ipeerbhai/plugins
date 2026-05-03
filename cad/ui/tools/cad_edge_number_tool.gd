@@ -36,12 +36,22 @@ const EDGE_PICK_THRESHOLD_PX: float = 30.0
 ## Pragmatic v1 default; bbox-relative scaling is a future refinement.
 const DEFAULT_BOX_OFFSET_WORLD: float = 30.0
 
-## State for this one-shot tool.
-enum _State { IDLE, DONE }
+## State for this one-shot tool. AWAITING_TEXT spans the time the modal text
+## dialog is open — the tool is committed to a particular edge but waiting on
+## the user to type (or cancel) the annotation body.
+enum _State { IDLE, AWAITING_TEXT, DONE }
 
 var _state: int = _State.IDLE
 var _host: Object = null
 var _schema_version: int = 2
+
+## Annotation envelope held during AWAITING_TEXT. payload.text is patched in
+## from the dialog's LineEdit before annotation_ready.emit().
+var _pending_annotation: Dictionary = {}
+
+## Reference to the open AcceptDialog so on_deactivate can tear it down without
+## firing confirmed/canceled (silent cleanup on tool-switch / host-rebind).
+var _active_dialog: AcceptDialog = null
 
 
 # ── Lifecycle ──────────────────────────────────────────────────────────────────
@@ -49,7 +59,7 @@ var _schema_version: int = 2
 func on_activate(host: AnnotationHost) -> void:
 	_host = host
 	_state = _State.IDLE
-	# Fast-path: if an edge is already selected, emit immediately.
+	# Fast-path: if an edge is already selected, open the text dialog directly.
 	if host == null:
 		return
 	if not host.has_method("get_current_selection_anchor"):
@@ -60,22 +70,17 @@ func on_activate(host: AnnotationHost) -> void:
 	var camera: Camera3D = _find_perspective_camera(host)
 	if camera == null:
 		return
-	var resolved: Variant = (
-		host._resolve_edge_anchor(anchor) if host.has_method("_resolve_edge_anchor") else null
-	)
-	if not (resolved is Dictionary):
-		return
-	var edge_pos: Vector3 = (resolved as Dictionary).get("position", Vector3.ZERO)
 	var box_offset: Vector3 = _compute_default_box_offset(camera)
 	var annotation := _build_annotation(int(anchor.get("id", -1)), box_offset)
-
-	_state = _State.DONE
-	annotation_ready.emit(annotation)
-	on_deactivate()
-	cancelled.emit()
+	_open_text_dialog(annotation)
 
 
 func on_deactivate() -> void:
+	# Silent dialog tear-down — fires when the toolbar switches tools, the
+	# host is rebound, or the panel goes away. We do NOT want the dialog's
+	# confirmed/canceled signals to leak into the post-deactivate state.
+	_close_dialog_silently()
+	_pending_annotation = {}
 	_host = null
 	_state = _State.IDLE
 
@@ -113,11 +118,7 @@ func on_pointer_down(pos: Vector2, button: int, mods: int) -> bool:
 		_compute_default_box_offset(camera) if camera != null else Vector3.ZERO
 	)
 	var annotation := _build_annotation(int(result.get("edge_id", -1)), box_offset)
-
-	_state = _State.DONE
-	annotation_ready.emit(annotation)
-	on_deactivate()
-	cancelled.emit()
+	_open_text_dialog(annotation)
 	return true
 
 
@@ -289,6 +290,113 @@ static func _compute_default_box_offset(camera: Camera3D) -> Vector3:
 	if dir.length_squared() < 0.0001:
 		return Vector3(DEFAULT_BOX_OFFSET_WORLD, DEFAULT_BOX_OFFSET_WORLD, 0.0)
 	return dir.normalized() * DEFAULT_BOX_OFFSET_WORLD
+
+
+# ── Text-input dialog ─────────────────────────────────────────────────────────
+
+## Open a modal AcceptDialog with a LineEdit for the annotation body. On OK /
+## Enter the dialog confirms with the typed text → annotation_ready emits with
+## payload.text patched in. On Cancel / Escape the dialog cancels → annotation
+## is dropped, cancelled.emit() un-toggles the toolbar button.
+##
+## Single-shot fire guard mirrors AnnotationTextAuthorTool — confirmed and
+## canceled may both arrive (dialog hide order), so we ensure exactly one of
+## _emit_pending_with_text or _cancel_pending runs.
+func _open_text_dialog(annotation: Dictionary) -> void:
+	_pending_annotation = annotation
+	_state = _State.AWAITING_TEXT
+
+	var loop := Engine.get_main_loop()
+	if not (loop is SceneTree):
+		# Headless / no-tree path: emit with empty text and bail. Keeps tests
+		# that drive the tool without a SceneTree from hanging.
+		_emit_pending_with_text("")
+		return
+	var tree: SceneTree = loop
+	var root: Window = tree.root
+	if root == null:
+		_emit_pending_with_text("")
+		return
+
+	var dialog := AcceptDialog.new()
+	dialog.title = "Edge annotation"
+	dialog.dialog_hide_on_ok = true
+	dialog.add_cancel_button("Cancel")
+
+	var line_edit := LineEdit.new()
+	line_edit.placeholder_text = "e.g. Fillet this edge"
+	line_edit.custom_minimum_size = Vector2(280, 0)
+	dialog.add_child(line_edit)
+
+	var fired: Array = [false]
+	var finish := func(text_or_null: Variant) -> void:
+		if fired[0]:
+			return
+		fired[0] = true
+		_active_dialog = null
+		dialog.queue_free()
+		if text_or_null == null:
+			_cancel_pending()
+		else:
+			_emit_pending_with_text(str(text_or_null))
+
+	dialog.confirmed.connect(func() -> void:
+		finish.call(line_edit.text)
+	)
+	dialog.canceled.connect(func() -> void:
+		finish.call(null)
+	)
+	# Enter inside the LineEdit submits without forcing the user to mouse the OK.
+	line_edit.text_submitted.connect(func(submitted: String) -> void:
+		finish.call(submitted)
+	)
+
+	_active_dialog = dialog
+	root.add_child(dialog)
+	dialog.popup_centered()
+	line_edit.grab_focus()
+
+
+## Tear down the active dialog without firing its confirmed / canceled signals.
+## Used by on_deactivate when the toolbar swaps tools mid-typing. queue_free
+## stops the dialog without dispatching its hide signals to our finish lambda
+## as long as we clear _active_dialog first (the lambda's `fired` guard then
+## ensures any in-flight signal is a no-op).
+func _close_dialog_silently() -> void:
+	if _active_dialog == null:
+		return
+	var dialog := _active_dialog
+	_active_dialog = null
+	dialog.queue_free()
+
+
+## Patch the pending envelope's payload.text and emit. Mirrors the legacy
+## annotation_ready → on_deactivate → cancelled.emit() commit pattern.
+func _emit_pending_with_text(text: String) -> void:
+	if _pending_annotation.is_empty():
+		_finalize_post_emit()
+		return
+	var annotation: Dictionary = _pending_annotation
+	if annotation.has("payload") and annotation.payload is Dictionary:
+		(annotation.payload as Dictionary)["text"] = text
+	_state = _State.DONE
+	annotation_ready.emit(annotation)
+	_finalize_post_emit()
+
+
+## User canceled the dialog — drop the pending annotation, un-toggle the
+## toolbar button via cancelled.emit().
+func _cancel_pending() -> void:
+	_pending_annotation = {}
+	_state = _State.IDLE
+	on_deactivate()
+	cancelled.emit()
+
+
+func _finalize_post_emit() -> void:
+	_pending_annotation = {}
+	on_deactivate()
+	cancelled.emit()
 
 
 # ── Internal ───────────────────────────────────────────────────────────────────

@@ -527,6 +527,31 @@ func get_current_selection_anchor(kind: String = "") -> Dictionary:
 	}
 
 
+# ── Phase B2 follow-up: camera-tracking → AnnotationOverlay redraw ────────────
+
+## Cache of last-known per-pane camera global_transform. _process compares the
+## live transform against this cache and emits annotations_changed when any
+## differs, so substrate AnnotationOverlay re-projects camera-dependent kinds
+## (the Phase B2 leader+box callout). Without this, kinds that call
+## camera.unproject_position only re-run on annotations_changed (data change),
+## leaving the callout frozen at the projection state of the last data event.
+var _camera_xform_cache: Dictionary = {}
+
+func _process(_delta: float) -> void:
+	var any_moved := false
+	for vid in _camera_for:
+		var cam: Variant = _camera_for[vid]
+		if cam == null or not (cam is Camera3D):
+			continue
+		var current: Transform3D = (cam as Camera3D).global_transform
+		var cached: Variant = _camera_xform_cache.get(vid, null)
+		if cached == null or not (cached is Transform3D) or (cached as Transform3D) != current:
+			_camera_xform_cache[vid] = current
+			any_moved = true
+	if any_moved:
+		annotations_changed.emit()
+
+
 ## Resolve a CAD edge anchor to its current world-space midpoint.
 ##
 ## anchor shape: { "plugin": "cad", "type": "edge", "id": <int> }
