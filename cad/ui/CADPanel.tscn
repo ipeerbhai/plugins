@@ -58,7 +58,7 @@ columns = 2
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
-custom_minimum_size = Vector2(400, 300)
+custom_minimum_size = Vector2(300, 225)
 stretch = true
 
 [node name="SubViewport" type="SubViewport" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/TopView"]
@@ -86,7 +86,7 @@ environment = SubResource("Environment_cad")
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
-custom_minimum_size = Vector2(400, 300)
+custom_minimum_size = Vector2(300, 225)
 stretch = true
 
 [node name="SubViewport" type="SubViewport" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/FrontView"]
@@ -114,7 +114,7 @@ environment = SubResource("Environment_cad")
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
-custom_minimum_size = Vector2(400, 300)
+custom_minimum_size = Vector2(300, 225)
 stretch = true
 
 [node name="SubViewport" type="SubViewport" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/RightView"]
@@ -142,7 +142,7 @@ environment = SubResource("Environment_cad")
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
-custom_minimum_size = Vector2(400, 300)
+custom_minimum_size = Vector2(300, 225)
 stretch = true
 
 [node name="SubViewport" type="SubViewport" parent="ResponsiveContainer/WideLayout/VBoxContainer/GridContainer/IsoView"]
@@ -171,12 +171,6 @@ layout_mode = 2
 custom_minimum_size = Vector2(220, 0)
 size_flags_horizontal = 0
 size_flags_vertical = 3
-
-[node name="AnnotationsHeader" type="Label" parent="ResponsiveContainer/WideLayout/WideSidebar"]
-layout_mode = 2
-size_flags_horizontal = 3
-text = "Annotations"
-horizontal_alignment = 1
 
 [node name="NarrowLayout" type="VBoxContainer" parent="ResponsiveContainer"]
 visible = false
@@ -224,8 +218,3 @@ script = ExtResource("4_geomoverlay")
 [node name="WorldEnvironment" type="WorldEnvironment" parent="ResponsiveContainer/NarrowLayout/SingleView/SubViewport"]
 environment = SubResource("Environment_cad")
 
-[node name="NarrowAnnotationsHeader" type="Label" parent="ResponsiveContainer/NarrowLayout"]
-layout_mode = 2
-size_flags_horizontal = 3
-text = "Annotations"
-horizontal_alignment = 1

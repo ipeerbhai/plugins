@@ -313,9 +313,12 @@ func _evaluate_and_render(dsl_text: String) -> void:
 		return
 
 	if not bool(worker_payload.get("ok", false)):
-		var err: Dictionary = worker_payload.get("error", {}) as Dictionary
+		# Worker may emit `error` as either a structured dict {kind, message} or a
+		# bare string for older/parse-stage error paths. Defend against both.
+		var err_var: Variant = worker_payload.get("error", {})
+		var err: Dictionary = err_var if err_var is Dictionary else {}
 		var kind: String = str(err.get("kind", "unknown"))
-		var msg: String = str(err.get("message", ""))
+		var msg: String = str(err.get("message", err_var if err_var is String else ""))
 		push_warning("[CADPanel] cad.evaluate worker error [%s]: %s" % [kind, msg])
 		return
 
@@ -362,9 +365,19 @@ func _on_width_class_changed(new_class: StringName) -> void:
 
 ## Apply the layout for the given width class. Idempotent.
 ##   xs / sm  → narrow (single view + projection dropdown)
-##   md / lg / xl → wide (4-view + sidebar)
+##   md / lg / xl → wide (4-view 2×2 grid + edge-tree sidebar)
+##
+## WideLayout sizing: each viewport column has a 300 px minimum (.tscn) and
+## WideSidebar has a 220 px minimum, so the layout fits any panel width
+## ≥ 820 px. That covers all of MD (≥ 768) in the realistic case where the
+## substrate AnnotationDockPane is open (dock RIGHT activates at editor width
+## ≥ 1024 and consumes ~260 px, leaving the CAD plugin ~764+ px). NarrowLayout
+## kicks in below MD, where 4 ortho panes simply can't be useful.
 func _apply_width_class(cls: StringName) -> void:
-	var is_narrow := (cls == _ResponsiveContainerScript.CLASS_XS or cls == _ResponsiveContainerScript.CLASS_SM)
+	var is_narrow := (
+		cls == _ResponsiveContainerScript.CLASS_XS
+		or cls == _ResponsiveContainerScript.CLASS_SM
+	)
 
 	if _wide_layout != null:
 		_wide_layout.visible = not is_narrow
@@ -608,6 +621,14 @@ func _push_mesh_to_geometry_overlays() -> void:
 		var cam: Camera3D = view_cameras.get(ov_id, null)
 		if ov.has_method("set_camera"):
 			ov.call("set_camera", cam)
+		if ov.has_method("set_edge_registry"):
+			ov.call("set_edge_registry", _edge_registry)
+		# Connect the overlay's pick signal to the panel's selection handler.
+		# Idempotent — repeated _push_mesh_to_geometry_overlays() calls
+		# (re-evaluate, layout swap) MUST NOT stack callbacks.
+		if ov.has_signal("edge_selected") \
+				and not ov.edge_selected.is_connected(_on_edge_selected):
+			ov.edge_selected.connect(_on_edge_selected)
 	_apply_mesh_visibility()
 
 
