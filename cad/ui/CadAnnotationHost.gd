@@ -1,5 +1,7 @@
 class_name Cad_AnnotationHost
 extends AnnotationHost
+
+const _CadAnchorTypesScript = preload("scripts/CadAnchorTypes.gd")
 ## AnnotationHost for the CAD plugin panel (Round 1 scaffold).
 ##
 ## Follows the canonical pattern established by Helloscene_AnnotationHost
@@ -492,3 +494,51 @@ func get_document_source() -> Dictionary:
 ## requires a proper depth from the working plane or a BVH raycast.)
 func transform_doc_to_viewport_screen(p: Vector2, _viewport_id: String) -> Vector2:
 	return p
+
+
+# ── Phase B1: edge anchor resolver ────────────────────────────────────────────
+
+## Override _init to chain to AnnotationHost._init() (sets resolve_cache) and
+## then register the edge anchor resolver on self.
+func _init() -> void:
+	super._init()
+	register_anchor_resolver(
+		_CadAnchorTypesScript.EDGE_ANCHOR_KEY,
+		_resolve_edge_anchor
+	)
+
+
+## Resolve a CAD edge anchor to its current world-space midpoint.
+##
+## anchor shape: { "plugin": "cad", "type": "edge", "id": <int> }
+## Returns a Dict with position (Vector3), edge_id (int), stale (bool).
+## Returns null when the anchor dict is malformed (substrate calls fallback).
+## Returns { stale: true, ... } when edge id is not in the live registry.
+func _resolve_edge_anchor(anchor: Dictionary) -> Variant:
+	if not anchor.has("id"):
+		return null
+	var edge_id: int = int(anchor["id"])
+	for edge_info in _edge_registry_data:
+		if not (edge_info is Dictionary):
+			continue
+		if int((edge_info as Dictionary).get("id", -1)) != edge_id:
+			continue
+		var start_raw: Variant = (edge_info as Dictionary).get("start", null)
+		var end_raw: Variant = (edge_info as Dictionary).get("end", null)
+		var start_3d := _vec3_from_raw(start_raw)
+		var end_3d := _vec3_from_raw(end_raw)
+		return {
+			"position": start_3d.lerp(end_3d, 0.5),
+			"edge_id": edge_id,
+			"stale": false,
+		}
+	return {"position": Vector3.ZERO, "edge_id": edge_id, "stale": true}
+
+
+## Convert a raw worker vertex ([x,y,z] or Vector3) to Vector3.
+func _vec3_from_raw(raw: Variant) -> Vector3:
+	if raw is Vector3:
+		return raw
+	if raw is Array and (raw as Array).size() >= 3:
+		return Vector3(float((raw as Array)[0]), float((raw as Array)[1]), float((raw as Array)[2]))
+	return Vector3.ZERO
