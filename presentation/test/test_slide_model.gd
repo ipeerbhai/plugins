@@ -10,7 +10,7 @@ extends SceneTree
 ##   Round-trip: deck → JSON → deck preserves structure
 ##   IDs: gen_id uniqueness across rapid calls
 
-const SlideModel: Script = preload("/Users/ipeerbhai/github/plugins/presentation/ui/slide_model.gd")
+var SlideModel: Script = load(OS.get_environment("HOME").path_join("github/plugins/presentation/ui/slide_model.gd"))
 
 var _pass_count: int = 0
 var _fail_count: int = 0
