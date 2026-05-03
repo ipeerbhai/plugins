@@ -125,6 +125,12 @@ func _ready() -> void:
 	# tool equals the current one, and SELECT is the default.
 	if _tool == Tool.SELECT:
 		_active_select_tool = AnnotationTransformTool.new()
+		# AnnotationOverlay is an input/render bridge — it does NOT call
+		# on_activate(host). Substrate's normal path is AnnotationToolbar
+		# (AnnotationToolbar.gd:528). We bypass the toolbar, so we must
+		# activate the tool ourselves; otherwise tool._host stays null and
+		# every pointer_down early-returns at AnnotationTransformTool.gd:122.
+		_active_select_tool.on_activate(_host)
 		_overlay.set_active_tool(_active_select_tool)
 
 	_recompute_slide_rect()
@@ -164,13 +170,19 @@ func set_tool(tool: int) -> void:
 	# AnnotationTransformTool (corner scale / edge axis-lock / rotate-ring /
 	# inside translate). Non-SELECT tools clear the active tool so the
 	# overlay's mouse_filter goes IGNORE and canvas _gui_input handles PLACE.
+	# AnnotationOverlay does NOT manage tool lifecycle — we mirror
+	# AnnotationToolbar's pattern (.gd:528) and call on_activate/on_deactivate
+	# explicitly so the tool's _host is bound before pointer events arrive.
 	if _overlay != null:
+		if _active_select_tool != null:
+			_active_select_tool.on_deactivate()
+			_active_select_tool = null
 		if _tool == Tool.SELECT:
 			_active_select_tool = AnnotationTransformTool.new()
+			_active_select_tool.on_activate(_host)
 			_overlay.set_active_tool(_active_select_tool)
 		else:
 			_overlay.clear_active_tool()
-			_active_select_tool = null
 	# In a non-SELECT tool, deselecting any current tile reduces accidental edits.
 	if _tool != Tool.SELECT:
 		_selected_tile_id = ""
