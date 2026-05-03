@@ -101,14 +101,22 @@ func get_document_identity() -> Dictionary:
 	}
 
 
-## DOC SPACE = slide-local pixels. Subtract slide_rect.position.
+## DOC SPACE = canvas-local pixels (matches the overlay's local coords).
+##
+## We chose canvas-local rather than slide-local because AnnotationOverlay creates
+## its render context with Transform2D.IDENTITY (AnnotationOverlay.gd:78) — i.e.,
+## tool-drawn gizmo handles render at doc-space coords AS IF they were overlay-local.
+## A slide-local doc space would draw gizmo handles offset by -slide_rect.position
+## from the visible tiles (invisible whenever the slide is letterboxed).
+##
+## Synthesized rect_px in get_annotations() therefore includes slide_rect.position;
+## writeback in _writeback_tile() subtracts it before normalizing.
 func transform_screen_to_doc(p: Vector2) -> Vector2:
-	return p - _slide_rect.position
+	return p
 
 
-## Inverse: add slide_rect.position.
 func transform_doc_to_screen(p: Vector2) -> Vector2:
-	return p + _slide_rect.position
+	return p
 
 
 ## Return CONCATENATION of synthesized tile annotations + persisted substrate
@@ -118,6 +126,7 @@ func get_annotations() -> Array:
 	if _slide.is_empty() or _slide_rect.size.x <= 0.0 or _slide_rect.size.y <= 0.0:
 		return result
 	var size_v: Vector2 = _slide_rect.size
+	var origin: Vector2 = _slide_rect.position
 	for tile in (_slide.get("tiles", []) as Array):
 		if not (tile is Dictionary):
 			continue
@@ -125,9 +134,10 @@ func get_annotations() -> Array:
 		var kind_name: String = _kind_for_tile(str(t.get("kind", "")))
 		if kind_name.is_empty():
 			continue
+		# rect_px is in canvas-local pixels (= overlay-local = doc-space for our host).
 		var rect_px := Rect2(
-			float(t.get("x", 0.0)) * size_v.x,
-			float(t.get("y", 0.0)) * size_v.y,
+			origin.x + float(t.get("x", 0.0)) * size_v.x,
+			origin.y + float(t.get("y", 0.0)) * size_v.y,
 			float(t.get("w", 0.0)) * size_v.x,
 			float(t.get("h", 0.0)) * size_v.y,
 		)
@@ -253,8 +263,10 @@ func _writeback_tile(tile_id: String, new_ann: Dictionary) -> bool:
 	var rect_px: Rect2 = payload.get("rect_px", Rect2())
 	var rotation_rad: float = float(payload.get("rotation_rad", 0.0))
 	var size_v: Vector2 = _slide_rect.size
-	var norm_x: float = rect_px.position.x / size_v.x
-	var norm_y: float = rect_px.position.y / size_v.y
+	var origin: Vector2 = _slide_rect.position
+	# rect_px is canvas-local — subtract slide_rect origin before normalizing.
+	var norm_x: float = (rect_px.position.x - origin.x) / size_v.x
+	var norm_y: float = (rect_px.position.y - origin.y) / size_v.y
 	var norm_w: float = rect_px.size.x / size_v.x
 	var norm_h: float = rect_px.size.y / size_v.y
 	# find_tile returns null if not found.
