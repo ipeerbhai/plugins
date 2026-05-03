@@ -508,6 +508,25 @@ func _init() -> void:
 	)
 
 
+## Phase B2: domain picker — surfaces the currently-selected edge as a
+## cad/edge anchor envelope. Authoring tools call this from on_activate to
+## skip the click-pick step when the user already has an edge selected.
+##
+## Returns {} when no edge is selected, or when the requested kind doesn't
+## match cad/edge. The "kind" filter is the substrate's mechanism for tools
+## that only want one anchor type.
+func get_current_selection_anchor(kind: String = "") -> Dictionary:
+	if _selected_edge_id < 0:
+		return {}
+	if kind != "" and kind != _CadAnchorTypesScript.EDGE_ANCHOR_KEY:
+		return {}
+	return {
+		"plugin": _CadAnchorTypesScript.PLUGIN,
+		"type":   _CadAnchorTypesScript.EDGE_TYPE,
+		"id":     _selected_edge_id,
+	}
+
+
 ## Resolve a CAD edge anchor to its current world-space midpoint.
 ##
 ## anchor shape: { "plugin": "cad", "type": "edge", "id": <int> }
