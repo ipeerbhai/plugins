@@ -197,6 +197,14 @@ func get_tool() -> int:
 	return _tool
 
 
+## Expose the canvas's AnnotationHost so the panel can forward it to the
+## editor chrome via Presentation_SlideEditorPanel.get_annotation_host(). The
+## editor pane uses the host to mount the annotations dock-pane and surface
+## the standard editor controls (Inject to LLM, Save All, Save, To Note).
+func get_host() -> AnnotationHost:
+	return _host
+
+
 func update_tile_view(tile_id: String) -> void:
 	if tile_id == "":
 		return

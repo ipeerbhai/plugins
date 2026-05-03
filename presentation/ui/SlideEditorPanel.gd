@@ -47,6 +47,10 @@ var _bg_popup: AcceptDialog = null
 var _bg_color_edit: LineEdit = null
 var _fullscreen_window: Window = null
 
+# Editor name we registered the host under in AnnotationHostRegistry, so we can
+# unregister cleanly on panel unload.
+var _registered_editor_name: String = ""
+
 
 func _ready() -> void:
 	if _deck.is_empty():
@@ -172,13 +176,35 @@ func _build_toolbar() -> Control:
 
 func _on_panel_loaded(ctx: Dictionary) -> void:
 	_ctx = ctx
+	# Register the host with AnnotationHostRegistry so MCP tools and the
+	# editor chrome can resolve it by tab name (mirror CAD CADPanel.gd:226-231).
+	var host: RefCounted = get_annotation_host()
+	var ed: Variant = ctx.get("editor", null)
+	if ed != null and "tab_title" in ed and host != null:
+		var ed_name: String = str(ed.tab_title)
+		if not ed_name.is_empty():
+			AnnotationHostRegistry.register(ed_name, host)
+			_registered_editor_name = ed_name
 	_refresh_all()
 
 
 func _on_panel_unload() -> void:
+	if _registered_editor_name != "":
+		AnnotationHostRegistry.deregister(_registered_editor_name)
+		_registered_editor_name = ""
 	if _fullscreen_window != null and is_instance_valid(_fullscreen_window):
 		_fullscreen_window.queue_free()
 		_fullscreen_window = null
+
+
+## Editor-chrome hook (MinervaPluginPanel virtual). Returning a non-null host
+## causes Editor.gd:704 to mount the annotations dock-pane around this panel
+## and surface the standard editor controls. The host is owned by
+## Presentation_SlideCanvas (created in its _ready); we forward.
+func get_annotation_host() -> RefCounted:
+	if _canvas == null or not _canvas.has_method("get_host"):
+		return null
+	return _canvas.get_host()
 
 
 func _on_panel_save_request() -> Dictionary:
