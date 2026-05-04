@@ -275,6 +275,157 @@ func _on_panel_load_request(doc: Dictionary) -> void:
 
 
 # ---------------------------------------------------------------------------
+# Editable plugin notes — DCR 019df4dc365f
+# ---------------------------------------------------------------------------
+
+## Plugin → Note: emit a plugin_data shape that round-trips back into this
+## panel via _on_panel_restore_from_note. Host backfills preview_image with
+## a panel screenshot if we omit it (see Editor._create_plugin_scene_note).
+func _on_panel_create_note_request(ctx: Dictionary) -> Dictionary:
+	var slides_count: int = (_deck.get("slides", []) as Array).size()
+	var alt_text: String = "Presentation deck"
+	if slides_count > 0:
+		alt_text = "Slide %d of %d" % [_selected_slide_index + 1, slides_count]
+	return {
+		"kind": "plugin_data",
+		"plugin_id": "presentation",
+		"panel_name": String(ctx.get("panel_name", "SlideEditorPanel")),
+		"payload": {
+			"version": 1,
+			"deck": _deck.duplicate(true),
+			"selected_slide": _selected_slide_index,
+		},
+		"preview_alt_text": alt_text,
+	}
+
+
+## Note → Plugin: restore the deck and selected slide from the saved payload.
+## Returns false on version mismatch / invalid deck so the host can toast and
+## leave the panel blank.
+func _on_panel_restore_from_note(payload: Dictionary) -> bool:
+	if int(payload.get("version", 0)) != 1:
+		push_warning("[presentation] restore_from_note: unsupported payload version %s" % str(payload.get("version", null)))
+		return false
+	var deck_v: Variant = payload.get("deck", null)
+	if not (deck_v is Dictionary):
+		push_warning("[presentation] restore_from_note: payload.deck is not a Dictionary")
+		return false
+	var deck: Dictionary = deck_v as Dictionary
+	var errors: Array = _SlideModel.validate_deck(deck)
+	if errors.size() > 0:
+		push_warning("[presentation] restore_from_note: deck failed validation: %s" % str(errors))
+		return false
+	_deck = deck
+	var slides: Array = deck.get("slides", []) as Array
+	var sel: int = int(payload.get("selected_slide", 0))
+	_selected_slide_index = clampi(sel, 0, max(0, slides.size() - 1))
+	_refresh_all()
+	return true
+
+
+## Plugin → LLM: emit canonical MultimodalPayload for chat injection. Per
+## slide: one text part (title + outline), one image part per image tile,
+## one text part per spreadsheet tile (CSV-ish — much cheaper than rasterising
+## a whole grid). Provider adapters (work_item 019df4ebf896) translate this
+## into per-provider wire formats.
+func _on_panel_render_for_llm(_ctx: Dictionary) -> Array:
+	var parts: Array = []
+	var slides: Array = _deck.get("slides", []) as Array
+	for i in range(slides.size()):
+		var slide: Dictionary = slides[i] as Dictionary
+		var slide_text: String = _slide_to_llm_text(i, slide)
+		if not slide_text.is_empty():
+			parts.append({"type": "text", "text": slide_text})
+		var tiles: Array = slide.get("tiles", []) as Array
+		for tile_v in tiles:
+			if not (tile_v is Dictionary):
+				continue
+			var tile: Dictionary = tile_v as Dictionary
+			# `match` patterns can't be const-references through preloaded
+			# scripts (they bind as locals), so dispatch by string compare.
+			var kind: String = String(tile.get("kind", ""))
+			if kind == _SlideModel.TILE_IMAGE:
+				var img: Image = _image_tile_to_image(tile)
+				if img != null:
+					var alt: String = "Image on slide %d" % (i + 1)
+					parts.append({"type": "image", "image": img, "alt": alt})
+			elif kind == _SlideModel.TILE_SPREADSHEET:
+				var csv: String = _spreadsheet_tile_to_text(tile)
+				if not csv.is_empty():
+					parts.append({"type": "text", "text": "Spreadsheet on slide %d:\n%s" % [i + 1, csv]})
+			# Text tiles fold into slide_text above; color/background tiles
+			# aren't useful LLM context.
+	return parts
+
+
+## Compose the textual representation of a slide for LLM consumption: title
+## (if present), then each text tile's content with its text_mode prefix
+## already baked in. We don't re-derive bullet glyphs here — the renderer
+## owns that — so the LLM sees the same ASCII the user typed.
+func _slide_to_llm_text(idx: int, slide: Dictionary) -> String:
+	var lines: Array[String] = []
+	lines.append("Slide %d:" % (idx + 1))
+	var title: String = String(slide.get("title", ""))
+	if not title.is_empty():
+		lines.append(title)
+	var tiles: Array = slide.get("tiles", []) as Array
+	for tile_v in tiles:
+		if not (tile_v is Dictionary):
+			continue
+		var tile: Dictionary = tile_v as Dictionary
+		if String(tile.get("kind", "")) == _SlideModel.TILE_TEXT:
+			var content: String = String(tile.get("content", "")).strip_edges()
+			if not content.is_empty():
+				lines.append(content)
+	if lines.size() <= 1:
+		return ""
+	return "\n".join(lines)
+
+
+## Decode an image tile's base64 src into a Godot Image. Returns null on
+## decode failure (LLM payload simply omits the image part).
+func _image_tile_to_image(tile: Dictionary) -> Image:
+	var src: String = String(tile.get("src", ""))
+	if src.is_empty():
+		return null
+	var bytes: PackedByteArray = Marshalls.base64_to_raw(src)
+	if bytes.is_empty():
+		return null
+	var img: = Image.new()
+	if img.load_png_from_buffer(bytes) == OK:
+		return img
+	if img.load_jpg_from_buffer(bytes) == OK:
+		return img
+	if img.load_webp_from_buffer(bytes) == OK:
+		return img
+	return null
+
+
+## Flatten a spreadsheet tile to a tab-separated grid (CSV-ish but tab-sep,
+## which is friendlier in chat output and avoids quoting comma-bearing values).
+func _spreadsheet_tile_to_text(tile: Dictionary) -> String:
+	var cells_v: Variant = tile.get("cells", [])
+	if not (cells_v is Array):
+		return ""
+	var rows: Array = cells_v as Array
+	var lines: PackedStringArray = PackedStringArray()
+	for row_v in rows:
+		if not (row_v is Array):
+			continue
+		var row: Array = row_v as Array
+		var fields: PackedStringArray = PackedStringArray()
+		for cell_v in row:
+			# str() (not String()) — cell.value can be int/float/bool, and the
+			# String() constructor rejects non-String Variants in Godot 4.
+			if cell_v is Dictionary:
+				fields.append(str((cell_v as Dictionary).get("value", "")))
+			else:
+				fields.append(str(cell_v))
+		lines.append("\t".join(fields))
+	return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Refresh
 # ---------------------------------------------------------------------------
 
