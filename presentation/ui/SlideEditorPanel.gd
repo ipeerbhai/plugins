@@ -66,6 +66,7 @@ var _annotation_host: AnnotationHost = null
 var _bg_popup: AcceptDialog = null
 var _bg_color_edit: LineEdit = null
 var _fullscreen_window: Window = null
+var _fullscreen_preview: Control = null   # Presentation_SlideCanvas inside the fullscreen Window
 
 # Editor name we registered the host under in AnnotationHostRegistry, so we can
 # unregister cleanly on panel unload.
@@ -485,7 +486,7 @@ func _on_fullscreen_pressed() -> void:
 	if slide.is_empty():
 		return
 	var win := Window.new()
-	win.title = "Slide preview — Esc to close"
+	win.title = "Slide preview — ←/→ navigate, Esc to close"
 	# Near-fullscreen size; user can resize.
 	var screen_size: Vector2i = DisplayServer.screen_get_size(DisplayServer.window_get_current_screen())
 	win.size = Vector2i(int(screen_size.x * 0.9), int(screen_size.y * 0.9))
@@ -508,16 +509,64 @@ func _on_fullscreen_pressed() -> void:
 	win.close_requested.connect(func() -> void:
 		win.queue_free()
 		_fullscreen_window = null
+		_fullscreen_preview = null
 	)
-	# Also bind Esc explicitly because Window doesn't always intercept it.
-	win.window_input.connect(func(event: InputEvent) -> void:
-		if event is InputEventKey and event.pressed and (event as InputEventKey).keycode == KEY_ESCAPE:
-			win.queue_free()
-			_fullscreen_window = null
-	)
+	win.window_input.connect(_on_fullscreen_window_input)
 	add_child(win)
 	_fullscreen_window = win
+	_fullscreen_preview = preview
 	win.popup_centered()
+
+
+func _on_fullscreen_window_input(event: InputEvent) -> void:
+	if _fullscreen_window == null or not is_instance_valid(_fullscreen_window):
+		return
+	if event is InputEventKey and event.pressed:
+		var key: int = (event as InputEventKey).keycode
+		match key:
+			KEY_ESCAPE:
+				_fullscreen_window.queue_free()
+				_fullscreen_window = null
+				_fullscreen_preview = null
+			KEY_RIGHT, KEY_DOWN, KEY_SPACE, KEY_PAGEDOWN, KEY_ENTER, KEY_KP_ENTER:
+				_step_fullscreen_slide(1)
+			KEY_LEFT, KEY_UP, KEY_PAGEUP, KEY_BACKSPACE:
+				_step_fullscreen_slide(-1)
+			KEY_HOME:
+				_jump_fullscreen_slide(0)
+			KEY_END:
+				var last: int = (_deck.get("slides", []) as Array).size() - 1
+				_jump_fullscreen_slide(last)
+	elif event is InputEventMouseButton and event.pressed:
+		var btn: int = (event as InputEventMouseButton).button_index
+		match btn:
+			MOUSE_BUTTON_LEFT, MOUSE_BUTTON_WHEEL_DOWN:
+				_step_fullscreen_slide(1)
+			MOUSE_BUTTON_RIGHT, MOUSE_BUTTON_WHEEL_UP:
+				_step_fullscreen_slide(-1)
+
+
+func _step_fullscreen_slide(delta: int) -> void:
+	var slides: Array = _deck.get("slides", []) as Array
+	if slides.is_empty():
+		return
+	var target: int = clampi(_selected_slide_index + delta, 0, slides.size() - 1)
+	_jump_fullscreen_slide(target)
+
+
+func _jump_fullscreen_slide(target_index: int) -> void:
+	var slides: Array = _deck.get("slides", []) as Array
+	if slides.is_empty():
+		return
+	target_index = clampi(target_index, 0, slides.size() - 1)
+	if target_index == _selected_slide_index:
+		return
+	_selected_slide_index = target_index
+	if _fullscreen_preview != null and is_instance_valid(_fullscreen_preview):
+		_fullscreen_preview.set_slide(slides[target_index] as Dictionary)
+	# Keep the editor underneath in sync so closing fullscreen lands on the
+	# same slide the presenter ended on.
+	_refresh_all()
 
 
 # ---------------------------------------------------------------------------
