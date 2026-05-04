@@ -436,18 +436,39 @@ func _build_text_view(tile: Dictionary) -> Control:
 	return rtl
 
 
+const _BULLET_GLYPHS: PackedStringArray = ["• ", "◦ ", "▪ ", "‣ "]
+const _INDENT_SPACES_PER_LEVEL: int = 4
+
+## Bullet/numbered formatter with whitespace-encoded outline levels.
+## Each line's leading whitespace (4 spaces or 1 tab per level) determines its
+## nesting depth; the renderer emits a level-appropriate glyph instead of a
+## flat "• " on every line. A leading "- " after the indent is tolerated so
+## hand-authored content like "    - foo" round-trips cleanly. Numbered mode
+## numbers only level-0 lines; nested lines fall back to bullet glyphs.
 func _format_text_content(content: String, mode: String) -> String:
 	if mode == _SlideModel.TEXT_MODE_PLAIN:
 		return content
-	var lines: PackedStringArray = content.split("\n")
 	var out: PackedStringArray = PackedStringArray()
-	for i in range(lines.size()):
-		var prefix: String = ""
-		if mode == _SlideModel.TEXT_MODE_BULLET:
-			prefix = "• "
-		elif mode == _SlideModel.TEXT_MODE_NUMBERED:
-			prefix = "%d. " % (i + 1)
-		out.append("%s%s" % [prefix, lines[i]])
+	var top_counter: int = 0
+	for raw_line in content.split("\n"):
+		var line: String = String(raw_line).replace("\t", " ".repeat(_INDENT_SPACES_PER_LEVEL))
+		if line.strip_edges().is_empty():
+			out.append(line)
+			continue
+		var stripped: String = line.lstrip(" ")
+		var indent_spaces: int = line.length() - stripped.length()
+		var level: int = mini(indent_spaces / _INDENT_SPACES_PER_LEVEL, _BULLET_GLYPHS.size() - 1)
+		var body: String = stripped
+		if body.begins_with("- "):
+			body = body.substr(2)
+		var indent: String = " ".repeat(indent_spaces)
+		var prefix: String
+		if mode == _SlideModel.TEXT_MODE_NUMBERED and level == 0:
+			top_counter += 1
+			prefix = "%d. " % top_counter
+		else:
+			prefix = _BULLET_GLYPHS[level]
+		out.append("%s%s%s" % [indent, prefix, body])
 	return "\n".join(out)
 
 
@@ -558,26 +579,45 @@ const _TEXT_INNER_PADDING_FACTOR: float = 0.95
 func _apply_tile_view_style(view: Control, tile: Dictionary, px: Rect2) -> void:
 	if str(tile.get("kind", "")) == _SlideModel.TILE_TEXT and view is RichTextLabel:
 		var rtl: RichTextLabel = view as RichTextLabel
-		# Couple font size to tile rect: drag-corner-resize-the-text. The font
-		# fills the tile vertically, divided by visual line count. This makes
-		# tile.h the single source of truth for visual size — no separate
-		# font_size knob to coordinate. Multi-line content (bullet/numbered, or
-		# plain with \n) divides the height per line so a 4-line tile renders
-		# four lines that fit. Authors control text size by dragging the rect.
-		# NOTE: This ignores word-wrap — if a content line is too long for the
-		# rect width and wraps, visible lines exceed line_count and overflow.
-		# Authors should size tiles wide enough to avoid wrapping or break
-		# content with explicit \n.
-		var content: String = str(tile.get("content", ""))
-		var line_count: int = max(1, content.split("\n").size())
-		var rendered_h: float = max(1.0, px.size.y)
-		var per_line_h: float = (rendered_h * _TEXT_INNER_PADDING_FACTOR) / float(line_count)
-		var font_px: int = clampi(int(round(per_line_h / _LINE_HEIGHT_FACTOR)), 8, 200)
+		var font_px: int = _compute_text_tile_font_px(tile, px)
 		rtl.add_theme_font_size_override("normal_font_size", font_px)
 		rtl.add_theme_font_size_override("bold_font_size", font_px)
 		rtl.add_theme_font_size_override("italics_font_size", font_px)
 		rtl.add_theme_font_size_override("bold_italics_font_size", font_px)
 		rtl.add_theme_font_size_override("mono_font_size", font_px)
+
+
+## Decide font_px for a text tile.
+##
+## Two modes:
+##
+## Fixed mode (opt-in) — if tile.font_size is a positive number, use it directly
+## as the font_px in the slide's render space. tile.h then controls only the
+## bounding box; longer wrapped content can use a bigger box without scaling
+## the font up. This decouples box size from text size for cases where word-
+## wrap pushes visible-line-count beyond the literal `\n`-line count.
+##
+## Coupled mode (default, "Option A") — derive font_px from tile.h ÷ line_count
+## (drag-corner-resize-the-text WYSIWYG). Tile.h is the single source of truth
+## for visual size; no separate font_size knob to coordinate. Multi-line content
+## (bullet/numbered, or plain with \n) divides the height per line so a 4-line
+## tile renders four lines that fit. Authors control text size by dragging the
+## rect. NOTE: this ignores word-wrap — if a content line is too long for the
+## rect width and wraps, visible lines exceed line_count and the surplus
+## overflows the box. Either size tiles wide enough, break content with \n,
+## or switch to fixed mode by setting tile.font_size.
+func _compute_text_tile_font_px(tile: Dictionary, px: Rect2) -> int:
+	var requested: Variant = tile.get("font_size", null)
+	if requested != null and (requested is int or requested is float):
+		var requested_px: int = int(round(float(requested)))
+		if requested_px > 0:
+			return clampi(requested_px, 8, 200)
+	# Coupled mode (default)
+	var content: String = str(tile.get("content", ""))
+	var line_count: int = max(1, content.split("\n").size())
+	var rendered_h: float = max(1.0, px.size.y)
+	var per_line_h: float = (rendered_h * _TEXT_INNER_PADDING_FACTOR) / float(line_count)
+	return clampi(int(round(per_line_h / _LINE_HEIGHT_FACTOR)), 8, 200)
 
 
 func _norm_to_local(tile: Dictionary) -> Rect2:
