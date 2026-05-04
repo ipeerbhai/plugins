@@ -26,6 +26,24 @@ const _SlideModel: Script = preload("slide_model.gd")
 const _SlideCanvas: Script = preload("slide_canvas.gd")
 const _Host: Script = preload("presentation_tile_annotation_host.gd")
 
+# Icon UIDs reused from Minerva's annotation toolbar / graphics editor / pcb
+# editor asset library. See AnnotationToolbar.gd:94-99 for the same pattern.
+const _ICON_UID_SELECT: String       = "uid://eckoinneympm"  # graphics_editor/select_tool_icon_24.png
+const _ICON_UID_TEXT: String         = "uid://obermhq5hkgs"  # graphics_editor/text_tool_icon_24.png
+const _ICON_UID_IMAGE: String        = "uid://cfi5hr0xyb2lw"  # generate_image/generate_image_icon_24.png
+const _ICON_UID_SPREADSHEET: String  = "uid://cu670w2c46b66"  # spreadsheet/spreadsheet_icon_white_no_bg_24.png
+const _ICON_UID_PREV: String         = "uid://dbeu0c8yh5jg2"  # arrow_left.svg
+const _ICON_UID_NEXT: String         = "uid://dr5q0d4id5wst"  # arrow_right.svg
+const _ICON_UID_ADD: String          = "uid://cnudc2tu7nyln"  # plus_icons/add_24.svg
+const _ICON_UID_REMOVE: String       = "uid://cnvsja4y7kp1m"  # remove_minus.png
+const _ICON_UID_BACKGROUND: String   = "uid://b05e37s8h1cni"  # color_picker_pipette.svg
+const _ICON_UID_RESET_ZOOM: String   = "uid://1q2kkovqy5qk"  # pcb_editor/expand-arrows_white_24.png
+const _ICON_UID_FULLSCREEN: String   = "uid://cb4ksle4s2pci"  # fullscreen.png
+
+# ResponsiveContainer is a Minerva-core Control. Use a string-path preload so
+# the off-tree plugin parser doesn't choke on the class_name reference.
+const _ResponsiveContainer: Script = preload("res://Scripts/UI/Controls/responsive_container.gd")
+
 var _ctx: Dictionary = {}
 
 var _deck: Dictionary = {}
@@ -88,20 +106,32 @@ func _build_ui() -> void:
 
 
 func _build_toolbar() -> Control:
+	# Wrap the toolbar HBox in a ResponsiveContainer so we can hide the verbose
+	# slide-N/N and zoom-% labels at narrow widths without touching the buttons.
+	# Explicit Container type — `:=` can't infer through preloaded Script .new().
+	var responsive: Container = _ResponsiveContainer.new()
+	responsive.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	responsive.custom_minimum_size = Vector2(0, 32)
+	# String-based connect: parser only sees Container, not the subclass signal.
+	responsive.connect("width_class_changed", _on_toolbar_width_class_changed)
+
 	var bar := HBoxContainer.new()
 	bar.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	bar.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	responsive.add_child(bar)
 
 	# ── Tool palette ────────────────────────────────────────────────────
 	for entry in [
-		[_SlideCanvas.Tool.SELECT, "Select"],
-		[_SlideCanvas.Tool.TEXT, "Text"],
-		[_SlideCanvas.Tool.IMAGE, "Image"],
-		[_SlideCanvas.Tool.SHEET, "Spreadsheet"],
+		[_SlideCanvas.Tool.SELECT, "Select", _ICON_UID_SELECT],
+		[_SlideCanvas.Tool.TEXT, "Text", _ICON_UID_TEXT],
+		[_SlideCanvas.Tool.IMAGE, "Image", _ICON_UID_IMAGE],
+		[_SlideCanvas.Tool.SHEET, "Spreadsheet", _ICON_UID_SPREADSHEET],
 	]:
 		var tool_id: int = entry[0]
 		var label: String = entry[1]
+		var icon_uid: String = entry[2]
 		var b := Button.new()
-		b.text = label
+		_apply_icon(b, icon_uid, label)
 		b.toggle_mode = true
 		b.pressed.connect(func() -> void: _on_tool_button_pressed(tool_id))
 		bar.add_child(b)
@@ -111,32 +141,27 @@ func _build_toolbar() -> Control:
 
 	# ── Slide nav ────────────────────────────────────────────────────────
 	_prev_btn = Button.new()
-	_prev_btn.text = "◀"
-	_prev_btn.tooltip_text = "Previous slide"
+	_apply_icon(_prev_btn, _ICON_UID_PREV, "Previous slide")
 	_prev_btn.pressed.connect(_on_prev_slide)
 	bar.add_child(_prev_btn)
 
 	_slide_label = Label.new()
 	_slide_label.text = "0 / 0"
-	_slide_label.custom_minimum_size = Vector2(80, 0)
 	_slide_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	bar.add_child(_slide_label)
 
 	_next_btn = Button.new()
-	_next_btn.text = "▶"
-	_next_btn.tooltip_text = "Next slide"
+	_apply_icon(_next_btn, _ICON_UID_NEXT, "Next slide")
 	_next_btn.pressed.connect(_on_next_slide)
 	bar.add_child(_next_btn)
 
 	_add_slide_btn = Button.new()
-	_add_slide_btn.text = "+ Slide"
-	_add_slide_btn.tooltip_text = "Add a new slide after the current one"
+	_apply_icon(_add_slide_btn, _ICON_UID_ADD, "Add a new slide after the current one")
 	_add_slide_btn.pressed.connect(_on_add_slide)
 	bar.add_child(_add_slide_btn)
 
 	_del_slide_btn = Button.new()
-	_del_slide_btn.text = "− Slide"
-	_del_slide_btn.tooltip_text = "Delete the current slide"
+	_apply_icon(_del_slide_btn, _ICON_UID_REMOVE, "Delete the current slide")
 	_del_slide_btn.pressed.connect(_on_del_slide)
 	bar.add_child(_del_slide_btn)
 
@@ -144,8 +169,7 @@ func _build_toolbar() -> Control:
 
 	# ── Slide-level actions ─────────────────────────────────────────────
 	_bg_btn = Button.new()
-	_bg_btn.text = "Background…"
-	_bg_btn.tooltip_text = "Set the slide background color or image"
+	_apply_icon(_bg_btn, _ICON_UID_BACKGROUND, "Set the slide background color or image")
 	_bg_btn.pressed.connect(_on_bg_pressed)
 	bar.add_child(_bg_btn)
 
@@ -157,24 +181,43 @@ func _build_toolbar() -> Control:
 	# ── Zoom controls ────────────────────────────────────────────────────
 	_zoom_label = Label.new()
 	_zoom_label.text = "100%"
-	_zoom_label.custom_minimum_size = Vector2(48, 0)
 	_zoom_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 	bar.add_child(_zoom_label)
 
 	_reset_zoom_btn = Button.new()
-	_reset_zoom_btn.text = "Reset zoom"
-	_reset_zoom_btn.tooltip_text = "Fit slide to canvas (resets pan + zoom)"
+	_apply_icon(_reset_zoom_btn, _ICON_UID_RESET_ZOOM, "Fit slide to canvas (resets pan + zoom)")
 	_reset_zoom_btn.pressed.connect(_on_reset_zoom_pressed)
 	bar.add_child(_reset_zoom_btn)
 
 	# ── Fullscreen ───────────────────────────────────────────────────────
 	_fullscreen_btn = Button.new()
-	_fullscreen_btn.text = "Fullscreen"
-	_fullscreen_btn.tooltip_text = "Open a near-fullscreen preview of the current slide (Esc to close)"
+	_apply_icon(_fullscreen_btn, _ICON_UID_FULLSCREEN, "Open a near-fullscreen preview of the current slide (Esc to close)")
 	_fullscreen_btn.pressed.connect(_on_fullscreen_pressed)
 	bar.add_child(_fullscreen_btn)
 
-	return bar
+	return responsive
+
+
+## Apply an icon to a button. Sets tooltip_text from the human label so hover
+## still discloses the action. Falls back to text if the icon UID fails to load.
+func _apply_icon(btn: Button, uid: String, tooltip: String) -> void:
+	btn.tooltip_text = tooltip
+	var tex := load(uid) as Texture2D
+	if tex != null:
+		btn.icon = tex
+	else:
+		# Fallback: keep the text so the button is still usable.
+		btn.text = tooltip
+
+
+## ResponsiveContainer signal: hide verbose labels when the panel is narrow so
+## the icon-only toolbar fits without horizontal overflow.
+func _on_toolbar_width_class_changed(new_class: StringName) -> void:
+	var compact: bool = (new_class == _ResponsiveContainer.CLASS_XS or new_class == _ResponsiveContainer.CLASS_SM)
+	if _slide_label != null:
+		_slide_label.visible = not compact
+	if _zoom_label != null:
+		_zoom_label.visible = not compact
 
 
 # ---------------------------------------------------------------------------
@@ -457,7 +500,9 @@ func _on_fullscreen_pressed() -> void:
 	# The Window's root will be our SlideCanvas; we anchor it full-rect.
 	preview.anchor_right = 1.0
 	preview.anchor_bottom = 1.0
-	preview.set_slide(slide)
+	# Defer set_slide until preview's _ready has run — _content_layer is built
+	# there and set_slide → _rebuild_views() crashes on null otherwise.
+	preview.ready.connect(preview.set_slide.bind(slide), CONNECT_ONE_SHOT)
 	win.add_child(preview)
 	# Esc / WM-close → free.
 	win.close_requested.connect(func() -> void:

@@ -546,10 +546,33 @@ func _layout_views() -> void:
 		_apply_tile_view_style(view, t, px)
 
 
+## Font-to-line-height ratio. Standard CSS line-height is 1.2-1.5; we use 1.3
+## as a balance between tight (1.2 = display-y) and loose (1.5 = body prose).
+const _LINE_HEIGHT_FACTOR: float = 1.3
+
+## Inner padding factor — leaves a small gap top+bottom so text doesn't sit
+## flush against the tile edges. 0.95 = 2.5% padding each side.
+const _TEXT_INNER_PADDING_FACTOR: float = 0.95
+
+
 func _apply_tile_view_style(view: Control, tile: Dictionary, px: Rect2) -> void:
 	if str(tile.get("kind", "")) == _SlideModel.TILE_TEXT and view is RichTextLabel:
 		var rtl: RichTextLabel = view as RichTextLabel
-		var font_px: int = clampi(int(round(float(tile.get("font_size", 18.0)))), 8, 160)
+		# Couple font size to tile rect: drag-corner-resize-the-text. The font
+		# fills the tile vertically, divided by visual line count. This makes
+		# tile.h the single source of truth for visual size — no separate
+		# font_size knob to coordinate. Multi-line content (bullet/numbered, or
+		# plain with \n) divides the height per line so a 4-line tile renders
+		# four lines that fit. Authors control text size by dragging the rect.
+		# NOTE: This ignores word-wrap — if a content line is too long for the
+		# rect width and wraps, visible lines exceed line_count and overflow.
+		# Authors should size tiles wide enough to avoid wrapping or break
+		# content with explicit \n.
+		var content: String = str(tile.get("content", ""))
+		var line_count: int = max(1, content.split("\n").size())
+		var rendered_h: float = max(1.0, px.size.y)
+		var per_line_h: float = (rendered_h * _TEXT_INNER_PADDING_FACTOR) / float(line_count)
+		var font_px: int = clampi(int(round(per_line_h / _LINE_HEIGHT_FACTOR)), 8, 200)
 		rtl.add_theme_font_size_override("normal_font_size", font_px)
 		rtl.add_theme_font_size_override("bold_font_size", font_px)
 		rtl.add_theme_font_size_override("italics_font_size", font_px)
