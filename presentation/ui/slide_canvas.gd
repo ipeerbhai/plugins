@@ -24,14 +24,15 @@ signal tile_added(tile_id: String)               # newly-created tile (panel not
 signal tile_deleted(tile_id: String)
 signal content_mutated                           # any change worth marking the doc dirty
 signal tool_changed(tool: int)                   # so the panel toolbar can reflect active tool
+signal slide_rect_changed(rect: Rect2)
 
 const _SlideModel: Script = preload("slide_model.gd")
 const _Host: Script = preload("presentation_tile_annotation_host.gd")
 
 const ASPECT_RATIO: float = 16.0 / 9.0
 const MIN_TILE_NORM: float = 0.02
-const CLICK_PLACE_NORM_W: float = 0.35           # default size when user just clicks (no drag) in a tool
-const CLICK_PLACE_NORM_H: float = 0.20
+const CLICK_PLACE_NORM_W: float = 0.10           # default size when user just clicks (no drag) in a tool
+const CLICK_PLACE_NORM_H: float = 0.045
 
 # Tool modes (public — panel toolbar uses these).
 enum Tool { SELECT, TEXT, IMAGE, SHEET }
@@ -116,6 +117,7 @@ func _ready() -> void:
 	# double-click-to-edit-text are routed through _input/_unhandled_key_input
 	# so they bypass the overlay regardless of its mouse_filter.
 	_host = _Host.new()
+	_host.configure_surface(true, false)
 	_overlay = AnnotationOverlay.new()
 	add_child(_overlay)
 	_overlay.set_host(_host)
@@ -197,12 +199,14 @@ func get_tool() -> int:
 	return _tool
 
 
-## Expose the canvas's AnnotationHost so the panel can forward it to the
-## editor chrome via Presentation_SlideEditorPanel.get_annotation_host(). The
-## editor pane uses the host to mount the annotations dock-pane and surface
-## the standard editor controls (Inject to LLM, Save All, Save, To Note).
+## Expose the canvas's tile-only AnnotationHost for tests and local canvas
+## integration. Editor chrome uses the panel's annotation-only host instead.
 func get_host() -> AnnotationHost:
 	return _host
+
+
+func get_slide_rect() -> Rect2:
+	return _slide_rect
 
 
 func update_tile_view(tile_id: String) -> void:
@@ -228,6 +232,9 @@ func update_tile_view(tile_id: String) -> void:
 	var px: Rect2 = _norm_to_local(t)
 	new_view.position = px.position
 	new_view.size = px.size
+	new_view.pivot_offset = px.size * 0.5
+	new_view.rotation = float(t.get("rotation", 0.0))
+	_apply_tile_view_style(new_view, t, px)
 	queue_redraw()
 
 
@@ -281,6 +288,7 @@ func _recompute_slide_rect() -> void:
 	_layout_inline_edit()
 	if _host != null:
 		_host.set_slide_rect(_slide_rect)
+	slide_rect_changed.emit(_slide_rect)
 	queue_redraw()
 
 
@@ -533,6 +541,20 @@ func _layout_views() -> void:
 		var px := _norm_to_local(t)
 		view.position = px.position
 		view.size = px.size
+		view.pivot_offset = px.size * 0.5
+		view.rotation = float(t.get("rotation", 0.0))
+		_apply_tile_view_style(view, t, px)
+
+
+func _apply_tile_view_style(view: Control, tile: Dictionary, px: Rect2) -> void:
+	if str(tile.get("kind", "")) == _SlideModel.TILE_TEXT and view is RichTextLabel:
+		var rtl: RichTextLabel = view as RichTextLabel
+		var font_px: int = clampi(int(round(float(tile.get("font_size", 18.0)))), 8, 160)
+		rtl.add_theme_font_size_override("normal_font_size", font_px)
+		rtl.add_theme_font_size_override("bold_font_size", font_px)
+		rtl.add_theme_font_size_override("italics_font_size", font_px)
+		rtl.add_theme_font_size_override("bold_italics_font_size", font_px)
+		rtl.add_theme_font_size_override("mono_font_size", font_px)
 
 
 func _norm_to_local(tile: Dictionary) -> Rect2:
@@ -859,6 +881,8 @@ func _open_inline_edit(tile_id: String) -> void:
 	_layout_inline_edit()
 	_inline_edit.grab_focus()
 	_inline_edit.focus_exited.connect(_commit_inline_edit)
+	_inline_edit.text_changed.connect(_on_inline_edit_text_changed)
+	_autosize_text_tile_x()
 
 
 func _commit_inline_edit() -> void:
@@ -896,6 +920,48 @@ func _layout_inline_edit() -> void:
 	var rect_local := _norm_to_local(t_v as Dictionary)
 	_inline_edit.position = _slide_rect.position + rect_local.position
 	_inline_edit.size = rect_local.size
+
+
+func _on_inline_edit_text_changed() -> void:
+	_autosize_text_tile_x()
+
+
+# X-only autosize for the active inline TextEdit. Width grows to fit the widest
+# typed line; never shrinks during a single edit session, never touches height.
+# Y-overflow is intentional — user asked for X-only resize behavior.
+func _autosize_text_tile_x() -> void:
+	if _inline_edit == null or _inline_edit_tile_id == "":
+		return
+	if _slide_rect.size.x <= 0.0:
+		return
+	var t_v: Variant = _SlideModel.find_tile(_slide, _inline_edit_tile_id)
+	if t_v == null:
+		return
+	var t: Dictionary = t_v
+	var font: Font = _inline_edit.get_theme_font("font")
+	if font == null:
+		font = ThemeDB.fallback_font
+	var fsize: int = _inline_edit.get_theme_font_size("font_size")
+	if fsize <= 0:
+		fsize = ThemeDB.fallback_font_size
+	var max_px: float = 0.0
+	for line in _inline_edit.text.split("\n"):
+		var lw: float = font.get_string_size(line, HORIZONTAL_ALIGNMENT_LEFT, -1.0, fsize).x
+		if lw > max_px:
+			max_px = lw
+	var padding_px: float = 24.0  # caret + stylebox borders
+	var needed_nw: float = (max_px + padding_px) / _slide_rect.size.x
+	var current_nw: float = float(t.get("w", CLICK_PLACE_NORM_W))
+	var nx: float = float(t.get("x", 0.0))
+	var nw: float = clampf(max(needed_nw, current_nw), MIN_TILE_NORM, 1.0 - nx)
+	if absf(nw - current_nw) < 0.0005:
+		return
+	t["w"] = nw
+	update_tile_view(_inline_edit_tile_id)
+	_layout_inline_edit()
+	if _host != null:
+		_host.notify_changed()
+	queue_redraw()
 
 
 # ---------------------------------------------------------------------------

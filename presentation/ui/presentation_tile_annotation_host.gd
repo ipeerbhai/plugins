@@ -24,6 +24,8 @@ var _registry: AnnotationRegistry = null
 var _slide: Dictionary = {}         # the active slide dict (mutated in place)
 var _slide_rect: Rect2 = Rect2()    # current slide pixel rect (set by canvas)
 var _selected_id: String = ""
+var _include_tiles: bool = true
+var _include_substrate_annotations: bool = true
 
 # ── Initialization ─────────────────────────────────────────────────────────
 
@@ -37,24 +39,20 @@ func _init() -> void:
 
 # ── Public setters (called by slide_canvas in Round 3) ────────────────────
 
+## Configure which document objects this host exposes. The presentation canvas
+## uses a tile-only host for object manipulation; editor chrome uses an
+## annotation-only host so the annotation Select tool cannot select slide tiles.
+func configure_surface(include_tiles: bool, include_substrate_annotations: bool) -> void:
+	_include_tiles = include_tiles
+	_include_substrate_annotations = include_substrate_annotations
+	_prune_stale_selection()
+	annotations_changed.emit()
+
 ## Set the active slide dict. Clears selection if the selected id is no longer
 ## present in the new slide's tiles or annotations. Emits annotations_changed.
 func set_slide(slide: Dictionary) -> void:
 	_slide = slide
-	# Clear stale selection.
-	if not _selected_id.is_empty():
-		var found: bool = false
-		for tile in (_slide.get("tiles", []) as Array):
-			if (tile as Dictionary).get("id", "") == _selected_id:
-				found = true
-				break
-		if not found:
-			for ann in (_slide.get("annotations", []) as Array):
-				if (ann as Dictionary).get("id", "") == _selected_id:
-					found = true
-					break
-		if not found:
-			_selected_id = ""
+	_prune_stale_selection()
 	annotations_changed.emit()
 
 
@@ -74,11 +72,13 @@ func get_registry() -> AnnotationRegistry:
 
 
 func get_capabilities() -> Dictionary:
+	var kinds: Array = []
+	if _include_substrate_annotations:
+		kinds.append_array(["callout", "2d_arrow", "2d_text"])
+	if _include_tiles:
+		kinds.append_array(["presentation_tile_text", "presentation_tile_image", "presentation_tile_spreadsheet"])
 	return {
-		"kinds": [
-			"callout", "2d_arrow", "2d_text",
-			"presentation_tile_text", "presentation_tile_image", "presentation_tile_spreadsheet",
-		],
+		"kinds": kinds,
 		"tools": ["select"],
 		"anchor_types": ["core/canvas.point"],
 		"lifecycle": {"resolve": false, "reopen": false, "delete": true, "repair": false, "apply": false},
@@ -127,35 +127,38 @@ func get_annotations() -> Array:
 		return result
 	var size_v: Vector2 = _slide_rect.size
 	var origin: Vector2 = _slide_rect.position
-	for tile in (_slide.get("tiles", []) as Array):
-		if not (tile is Dictionary):
-			continue
-		var t: Dictionary = tile
-		var kind_name: String = _kind_for_tile(str(t.get("kind", "")))
-		if kind_name.is_empty():
-			continue
-		# rect_px is in canvas-local pixels (= overlay-local = doc-space for our host).
-		var rect_px := Rect2(
-			origin.x + float(t.get("x", 0.0)) * size_v.x,
-			origin.y + float(t.get("y", 0.0)) * size_v.y,
-			float(t.get("w", 0.0)) * size_v.x,
-			float(t.get("h", 0.0)) * size_v.y,
-		)
-		result.append({
-			"id": str(t.get("id", "")),
-			"kind": kind_name,
-			"kind_payload": {
-				"rect_px": rect_px,
-				"rotation_rad": float(t.get("rotation", 0.0)),
-				"tile_id": str(t.get("id", "")),
-			},
-			"view_context": "presentation",
-		})
+	if _include_tiles:
+		for tile in (_slide.get("tiles", []) as Array):
+			if not (tile is Dictionary):
+				continue
+			var t: Dictionary = tile
+			var kind_name: String = _kind_for_tile(str(t.get("kind", "")))
+			if kind_name.is_empty():
+				continue
+			# rect_px is in canvas-local pixels (= overlay-local = doc-space for our host).
+			var rect_px := Rect2(
+				origin.x + float(t.get("x", 0.0)) * size_v.x,
+				origin.y + float(t.get("y", 0.0)) * size_v.y,
+				float(t.get("w", 0.0)) * size_v.x,
+				float(t.get("h", 0.0)) * size_v.y,
+			)
+			result.append({
+				"id": str(t.get("id", "")),
+				"kind": kind_name,
+				"kind_payload": {
+					"rect_px": rect_px,
+					"rotation_rad": float(t.get("rotation", 0.0)),
+					"tile_id": str(t.get("id", "")),
+					"font_size": float(t.get("font_size", 18.0)),
+				},
+				"view_context": "presentation",
+			})
 	# Append real substrate annotations (callout / 2d_arrow / 2d_text) — persisted
 	# in slide.annotations[].
-	for ann in (_slide.get("annotations", []) as Array):
-		if ann is Dictionary:
-			result.append((ann as Dictionary).duplicate(true))
+	if _include_substrate_annotations:
+		for ann in (_slide.get("annotations", []) as Array):
+			if ann is Dictionary:
+				result.append((ann as Dictionary).duplicate(true))
 	return result
 
 
@@ -166,6 +169,8 @@ func update_annotation(annotation_id: String, new_annotation: Dictionary) -> boo
 		return false
 	var kind_str := str(new_annotation.get("kind", ""))
 	if kind_str.begins_with("presentation_tile_"):
+		if not _include_tiles:
+			return false
 		return _writeback_tile(annotation_id, new_annotation)
 	# Substrate kind — write through to slide.annotations[].
 	var ok: bool = _SlideModel.update_annotation(_slide, annotation_id, new_annotation)
@@ -183,6 +188,8 @@ func add_annotation(annotation: Dictionary) -> String:
 	var kind_str := str(annotation.get("kind", ""))
 	if kind_str.begins_with("presentation_tile_"):
 		# Tile kinds cannot be added via this path.
+		return ""
+	if not _include_substrate_annotations:
 		return ""
 	var id: String = str(annotation.get("id", ""))
 	if id.is_empty():
@@ -204,6 +211,8 @@ func remove_annotation(annotation_id: String) -> bool:
 	for tile in (_slide.get("tiles", []) as Array):
 		if (tile as Dictionary).get("id", "") == annotation_id:
 			return false
+	if not _include_substrate_annotations:
+		return false
 	var ok: bool = _SlideModel.remove_annotation(_slide, annotation_id)
 	if ok:
 		if _selected_id == annotation_id:
@@ -252,6 +261,25 @@ func _kind_for_tile(tile_kind: String) -> String:
 	return ""
 
 
+func _prune_stale_selection() -> void:
+	if _selected_id.is_empty():
+		return
+	var found: bool = false
+	if _include_tiles:
+		for tile in (_slide.get("tiles", []) as Array):
+			if (tile as Dictionary).get("id", "") == _selected_id:
+				found = true
+				break
+	if not found and _include_substrate_annotations:
+		for ann in (_slide.get("annotations", []) as Array):
+			if (ann as Dictionary).get("id", "") == _selected_id:
+				found = true
+				break
+	if not found:
+		_selected_id = ""
+		selection_changed.emit("")
+
+
 ## Write back a transformed tile annotation into the underlying tile dict.
 ## Reads rect_px and rotation_rad from new_annotation.kind_payload, normalizes
 ## by _slide_rect.size, and updates the tile via SlideModel mutators.
@@ -262,6 +290,7 @@ func _writeback_tile(tile_id: String, new_ann: Dictionary) -> bool:
 	var payload: Dictionary = (new_ann.get("kind_payload", {}) as Dictionary)
 	var rect_px: Rect2 = payload.get("rect_px", Rect2())
 	var rotation_rad: float = float(payload.get("rotation_rad", 0.0))
+	var font_size: float = float(payload.get("font_size", 18.0))
 	var size_v: Vector2 = _slide_rect.size
 	var origin: Vector2 = _slide_rect.position
 	# rect_px is canvas-local — subtract slide_rect origin before normalizing.
@@ -278,6 +307,8 @@ func _writeback_tile(tile_id: String, new_ann: Dictionary) -> bool:
 	t["y"] = clampf(norm_y, 0.0, 1.0)
 	t["w"] = clampf(norm_w, 0.0, 1.0)
 	t["h"] = clampf(norm_h, 0.0, 1.0)
+	if str(t.get("kind", "")) == _SlideModel.TILE_TEXT:
+		t["font_size"] = clampf(font_size, 8.0, 160.0)
 	_SlideModel.set_tile_rotation(_slide, tile_id, rotation_rad)
 	annotations_changed.emit()
 	return true

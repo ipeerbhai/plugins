@@ -24,6 +24,7 @@ extends MinervaPluginPanel
 
 const _SlideModel: Script = preload("slide_model.gd")
 const _SlideCanvas: Script = preload("slide_canvas.gd")
+const _Host: Script = preload("presentation_tile_annotation_host.gd")
 
 var _ctx: Dictionary = {}
 
@@ -43,6 +44,7 @@ var _zoom_label: Label = null
 var _reset_zoom_btn: Button = null
 
 var _canvas: Control = null   # Presentation_SlideCanvas
+var _annotation_host: AnnotationHost = null
 var _bg_popup: AcceptDialog = null
 var _bg_color_edit: LineEdit = null
 var _fullscreen_window: Window = null
@@ -78,6 +80,11 @@ func _build_ui() -> void:
 	_canvas.tile_resized.connect(func(_id: String, _x: float, _y: float, _w: float, _h: float) -> void: _emit_modified())
 	_canvas.content_mutated.connect(_emit_modified)
 	_canvas.tool_changed.connect(_on_canvas_tool_changed)
+	_canvas.slide_rect_changed.connect(func(_rect: Rect2) -> void: _sync_annotation_host_rect())
+
+	_annotation_host = _Host.new()
+	_annotation_host.configure_surface(false, true)
+	_annotation_host.selection_changed.connect(_on_annotation_selection_changed)
 
 
 func _build_toolbar() -> Control:
@@ -96,7 +103,7 @@ func _build_toolbar() -> Control:
 		var b := Button.new()
 		b.text = label
 		b.toggle_mode = true
-		b.pressed.connect(func() -> void: _canvas.set_tool(tool_id))
+		b.pressed.connect(func() -> void: _on_tool_button_pressed(tool_id))
 		bar.add_child(b)
 		_tool_btns[tool_id] = b
 
@@ -197,14 +204,11 @@ func _on_panel_unload() -> void:
 		_fullscreen_window = null
 
 
-## Editor-chrome hook (MinervaPluginPanel virtual). Returning a non-null host
-## causes Editor.gd:704 to mount the annotations dock-pane around this panel
-## and surface the standard editor controls. The host is owned by
-## Presentation_SlideCanvas (created in its _ready); we forward.
+## Editor-chrome hook (MinervaPluginPanel virtual). This returns an annotation-only
+## host; the canvas keeps a separate tile-only host for presentation object
+## transforms so the annotation panel cannot select slide tiles.
 func get_annotation_host() -> RefCounted:
-	if _canvas == null or not _canvas.has_method("get_host"):
-		return null
-	return _canvas.get_host()
+	return _annotation_host
 
 
 func _on_panel_save_request() -> Dictionary:
@@ -243,6 +247,9 @@ func _refresh_all() -> void:
 	if _selected_slide_index < slides.size():
 		slide = slides[_selected_slide_index] as Dictionary
 	_canvas.set_slide(slide)
+	if _annotation_host != null:
+		_annotation_host.set_slide(slide)
+		_sync_annotation_host_rect()
 
 	_slide_label.text = "%d / %d" % [_selected_slide_index + 1, slides.size()] if slides.size() > 0 else "0 / 0"
 	_prev_btn.disabled = (_selected_slide_index <= 0)
@@ -258,6 +265,8 @@ func _emit_modified() -> void:
 	emit_signal("content_changed")
 	if _canvas != null:
 		_zoom_label.text = "%d%%" % round(_canvas.get_zoom() * 100.0)
+	if _annotation_host != null:
+		_annotation_host.notify_changed()
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +276,27 @@ func _emit_modified() -> void:
 func _on_canvas_tool_changed(tool: int) -> void:
 	for tool_id in _tool_btns.keys():
 		(_tool_btns[tool_id] as Button).button_pressed = (tool_id == tool)
+
+
+func _on_tool_button_pressed(tool: int) -> void:
+	_clear_annotation_tool()
+	_canvas.set_tool(tool)
+	if tool == _SlideCanvas.Tool.SELECT:
+		_canvas.set_selected_tile_id("")
+	_on_canvas_tool_changed(_canvas.get_tool())
+
+
+func _clear_annotation_tool() -> void:
+	var overlay := find_child("PlatformAnnotationOverlay", false, false)
+	if overlay != null and overlay.has_method("clear_active_tool"):
+		overlay.clear_active_tool()
+	var dock: Node = null
+	var cursor: Node = self
+	while cursor != null and dock == null:
+		dock = cursor.find_child("AnnotationDockPane", true, false)
+		cursor = cursor.get_parent()
+	if dock != null and dock.has_method("clear_active_tool"):
+		dock.clear_active_tool()
 
 
 func _on_prev_slide() -> void:
@@ -451,7 +481,14 @@ func _on_fullscreen_pressed() -> void:
 
 func _on_tile_selected(_tile_id: String) -> void:
 	# Inspector-less; nothing to surface beyond what the canvas already shows.
-	pass
+	if not _tile_id.is_empty() and _annotation_host != null:
+		_annotation_host.set_selected_annotation_id("")
+
+
+func _on_annotation_selection_changed(annotation_id: String) -> void:
+	if annotation_id.is_empty() or _canvas == null:
+		return
+	_canvas.set_selected_tile_id("")
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +500,16 @@ func _current_slide() -> Dictionary:
 	if _selected_slide_index < 0 or _selected_slide_index >= slides.size():
 		return {}
 	return slides[_selected_slide_index] as Dictionary
+
+
+func _sync_annotation_host_rect() -> void:
+	if _annotation_host == null or _canvas == null or not _canvas.has_method("get_slide_rect"):
+		return
+	var canvas_global := _canvas.get_global_transform_with_canvas().origin
+	var panel_global := get_global_transform_with_canvas().origin
+	var canvas_in_panel := canvas_global - panel_global
+	var canvas_rect: Rect2 = _canvas.get_slide_rect()
+	_annotation_host.set_slide_rect(Rect2(canvas_in_panel + canvas_rect.position, canvas_rect.size))
 
 
 # ---------------------------------------------------------------------------

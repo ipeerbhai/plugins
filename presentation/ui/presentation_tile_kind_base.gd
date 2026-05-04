@@ -53,6 +53,7 @@ func transform_annotation(annotation: Dictionary, transform: Transform2D, _opera
 	var payload: Dictionary = (out.get("kind_payload", {}) as Dictionary).duplicate(true)
 	var rect: Rect2 = payload.get("rect_px", Rect2())
 	var rotation: float = float(payload.get("rotation_rad", 0.0))
+	var font_size: float = float(payload.get("font_size", 18.0))
 
 	var center := rect.get_center()
 	var new_center := transform * center
@@ -63,12 +64,16 @@ func transform_annotation(annotation: Dictionary, transform: Transform2D, _opera
 
 	var ds: Vector2 = transform.get_scale()
 	var new_size := Vector2(rect.size.x * ds.x, rect.size.y * ds.y)
+	if _operation == "scale":
+		var font_scale: float = sqrt(maxf(absf(ds.x * ds.y), 0.0001))
+		font_size = clampf(font_size * font_scale, 8.0, 160.0)
 	# Guard against negative/tiny sizes (mirror MIN_SCALE in AnnotationTransformTool).
 	new_size.x = maxf(absf(new_size.x), 1.0)
 	new_size.y = maxf(absf(new_size.y), 1.0)
 
 	payload["rect_px"] = Rect2(new_center - new_size * 0.5, new_size)
 	payload["rotation_rad"] = rotation
+	payload["font_size"] = font_size
 	out["kind_payload"] = payload
 	return out
 
