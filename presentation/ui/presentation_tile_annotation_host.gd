@@ -150,6 +150,7 @@ func get_annotations() -> Array:
 					"rotation_rad": float(t.get("rotation", 0.0)),
 					"tile_id": str(t.get("id", "")),
 					"font_size": float(t.get("font_size", 18.0)),
+					"font_size_explicit": t.has("font_size"),
 				},
 				"view_context": "presentation",
 			})
@@ -307,7 +308,8 @@ func _writeback_tile(tile_id: String, new_ann: Dictionary) -> bool:
 	t["y"] = clampf(norm_y, 0.0, 1.0)
 	t["w"] = clampf(norm_w, 0.0, 1.0)
 	t["h"] = clampf(norm_h, 0.0, 1.0)
-	if str(t.get("kind", "")) == _SlideModel.TILE_TEXT:
+	var should_write_font_size: bool = bool(payload.get("font_size_explicit", t.has("font_size")))
+	if str(t.get("kind", "")) == _SlideModel.TILE_TEXT and should_write_font_size:
 		t["font_size"] = clampf(font_size, 8.0, 160.0)
 	_SlideModel.set_tile_rotation(_slide, tile_id, rotation_rad)
 	annotations_changed.emit()

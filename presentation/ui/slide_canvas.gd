@@ -425,6 +425,8 @@ func _build_text_view(tile: Dictionary) -> Control:
 	rtl.bbcode_enabled = true
 	rtl.fit_content = false
 	rtl.scroll_active = false
+	rtl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	rtl.clip_contents = true
 	rtl.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	# Slide content stays readable regardless of Godot's theme. Default text
 	# color = near-black; users override per-tile via BBCode color tags later.
@@ -574,50 +576,83 @@ const _LINE_HEIGHT_FACTOR: float = 1.3
 ## Inner padding factor — leaves a small gap top+bottom so text doesn't sit
 ## flush against the tile edges. 0.95 = 2.5% padding each side.
 const _TEXT_INNER_PADDING_FACTOR: float = 0.95
+const _TEXT_MIN_FONT_PX: int = 8
+const _TEXT_MAX_FONT_PX: int = 200
 
 
 func _apply_tile_view_style(view: Control, tile: Dictionary, px: Rect2) -> void:
 	if str(tile.get("kind", "")) == _SlideModel.TILE_TEXT and view is RichTextLabel:
 		var rtl: RichTextLabel = view as RichTextLabel
-		var font_px: int = _compute_text_tile_font_px(tile, px)
-		rtl.add_theme_font_size_override("normal_font_size", font_px)
-		rtl.add_theme_font_size_override("bold_font_size", font_px)
-		rtl.add_theme_font_size_override("italics_font_size", font_px)
-		rtl.add_theme_font_size_override("bold_italics_font_size", font_px)
-		rtl.add_theme_font_size_override("mono_font_size", font_px)
+		var font_px: int = _compute_text_tile_font_px(tile, px, rtl)
+		_apply_rich_text_font_size(rtl, font_px)
 
 
 ## Decide font_px for a text tile.
 ##
 ## Two modes:
 ##
-## Fixed mode (opt-in) — if tile.font_size is a positive number, use it directly
-## as the font_px in the slide's render space. tile.h then controls only the
-## bounding box; longer wrapped content can use a bigger box without scaling
-## the font up. This decouples box size from text size for cases where word-
-## wrap pushes visible-line-count beyond the literal `\n`-line count.
+## Fixed-max mode (opt-in) — if tile.font_size is a positive number, use it as
+## the desired maximum font_px in the slide's render space. Longer wrapped
+## content still shrinks to fit the box instead of overflowing.
 ##
-## Coupled mode (default, "Option A") — derive font_px from tile.h ÷ line_count
+## Coupled mode (default, "Option A") — derive max font_px from tile.h ÷ line_count
 ## (drag-corner-resize-the-text WYSIWYG). Tile.h is the single source of truth
 ## for visual size; no separate font_size knob to coordinate. Multi-line content
 ## (bullet/numbered, or plain with \n) divides the height per line so a 4-line
-## tile renders four lines that fit. Authors control text size by dragging the
-## rect. NOTE: this ignores word-wrap — if a content line is too long for the
-## rect width and wraps, visible lines exceed line_count and the surplus
-## overflows the box. Either size tiles wide enough, break content with \n,
-## or switch to fixed mode by setting tile.font_size.
-func _compute_text_tile_font_px(tile: Dictionary, px: Rect2) -> int:
+## tile starts near the old size. A width-aware fit pass then shrinks from that
+## maximum until wrapped RichTextLabel content fits inside the tile height.
+func _compute_text_tile_font_px(tile: Dictionary, px: Rect2, rtl: RichTextLabel) -> int:
+	var desired_px: int = _desired_text_tile_font_px(tile, px)
+	var content: String = str(tile.get("content", ""))
+	if content.strip_edges().is_empty() or px.size.x <= 1.0 or px.size.y <= 1.0:
+		return desired_px
+	if _rich_text_fits(rtl, desired_px, px):
+		return desired_px
+	if _TEXT_MIN_FONT_PX >= desired_px:
+		return desired_px
+	var lo: int = _TEXT_MIN_FONT_PX
+	var hi: int = desired_px
+	var best: int = lo
+	while lo <= hi:
+		var mid: int = int((lo + hi) / 2)
+		if _rich_text_fits(rtl, mid, px):
+			best = mid
+			lo = mid + 1
+		else:
+			hi = mid - 1
+	return clampi(best, _TEXT_MIN_FONT_PX, desired_px)
+
+
+func _desired_text_tile_font_px(tile: Dictionary, px: Rect2) -> int:
 	var requested: Variant = tile.get("font_size", null)
 	if requested != null and (requested is int or requested is float):
 		var requested_px: int = int(round(float(requested)))
 		if requested_px > 0:
-			return clampi(requested_px, 8, 200)
+			return clampi(requested_px, _TEXT_MIN_FONT_PX, _TEXT_MAX_FONT_PX)
 	# Coupled mode (default)
 	var content: String = str(tile.get("content", ""))
 	var line_count: int = max(1, content.split("\n").size())
 	var rendered_h: float = max(1.0, px.size.y)
 	var per_line_h: float = (rendered_h * _TEXT_INNER_PADDING_FACTOR) / float(line_count)
-	return clampi(int(round(per_line_h / _LINE_HEIGHT_FACTOR)), 8, 200)
+	return clampi(int(round(per_line_h / _LINE_HEIGHT_FACTOR)), _TEXT_MIN_FONT_PX, _TEXT_MAX_FONT_PX)
+
+
+func _rich_text_fits(rtl: RichTextLabel, font_px: int, px: Rect2) -> bool:
+	_apply_rich_text_font_size(rtl, font_px)
+	rtl.size = px.size
+	var available_h: float = max(1.0, px.size.y * _TEXT_INNER_PADDING_FACTOR)
+	var content_h: float = float(rtl.get_content_height())
+	if content_h <= 0.0:
+		return true
+	return content_h <= available_h
+
+
+func _apply_rich_text_font_size(rtl: RichTextLabel, font_px: int) -> void:
+	rtl.add_theme_font_size_override("normal_font_size", font_px)
+	rtl.add_theme_font_size_override("bold_font_size", font_px)
+	rtl.add_theme_font_size_override("italics_font_size", font_px)
+	rtl.add_theme_font_size_override("bold_italics_font_size", font_px)
+	rtl.add_theme_font_size_override("mono_font_size", font_px)
 
 
 func _norm_to_local(tile: Dictionary) -> Rect2:
