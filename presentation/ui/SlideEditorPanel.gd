@@ -80,6 +80,13 @@ func _ready() -> void:
 	_refresh_all()
 
 
+## Public read-only accessor for the slide currently shown in the canvas.
+## Used by the MCP get_state tool so external observers (agents, HITL) can
+## answer "what slide is the user on?".
+func get_selected_slide_index() -> int:
+	return _selected_slide_index
+
+
 func _build_ui() -> void:
 	var root := VBoxContainer.new()
 	root.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -765,7 +772,13 @@ func get_deck() -> Dictionary:
 	return _deck
 
 
+## Replace the whole deck (used by MCP _commit_target after edits, and by
+## host on initial load). Preserves the user's current slide selection where
+## possible — MCP mutations would otherwise yank the panel back to slide 0
+## on every edit. If the prior selection points past the new last slide
+## (e.g. a slide was removed), clamp; otherwise leave it alone.
 func set_deck(deck: Dictionary) -> void:
 	_deck = deck
-	_selected_slide_index = 0
+	var slides_count: int = (deck.get("slides", []) as Array).size()
+	_selected_slide_index = clampi(_selected_slide_index, 0, max(0, slides_count - 1))
 	_refresh_all()

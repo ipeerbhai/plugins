@@ -91,7 +91,8 @@ static func make_text_tile(
 	h: float = 0.2,
 	content: String = "",
 	text_mode: String = TEXT_MODE_PLAIN,
-	rotation: float = 0.0
+	rotation: float = 0.0,
+	auto_fit: bool = false
 ) -> Dictionary:
 	var t: Dictionary = {
 		"id": gen_id("tile"),
@@ -102,6 +103,8 @@ static func make_text_tile(
 	}
 	if not is_zero_approx(rotation):
 		t["rotation"] = rotation
+	if auto_fit:
+		t["auto_fit"] = true
 	return t
 
 
@@ -313,6 +316,8 @@ static func validate_tile(tile: Variant) -> Array:
 				errors.append("text_mode: expected one of %s, got %s" % [str(TEXT_MODES_VALID), str(mode)])
 			if not (t.get("content", null) is String):
 				errors.append("content: expected String")
+			if t.has("auto_fit") and not (t["auto_fit"] is bool):
+				errors.append("auto_fit: expected bool, got %s" % str(t["auto_fit"]))
 		TILE_IMAGE:
 			var src: Variant = t.get("src", null)
 			if not (src is String) or (src as String).is_empty():

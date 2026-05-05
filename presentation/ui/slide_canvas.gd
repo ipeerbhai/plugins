@@ -589,11 +589,19 @@ func _apply_tile_view_style(view: Control, tile: Dictionary, px: Rect2) -> void:
 
 ## Decide font_px for a text tile.
 ##
-## Two modes:
+## Three modes (precedence top-down):
 ##
 ## Fixed-max mode (opt-in) — if tile.font_size is a positive number, use it as
 ## the desired maximum font_px in the slide's render space. Longer wrapped
-## content still shrinks to fit the box instead of overflowing.
+## content still shrinks to fit the box instead of overflowing. font_size wins
+## even if auto_fit is also set (per DCR 019df67776c772).
+##
+## Auto-fit mode (opt-in) — if tile.auto_fit==true and no font_size, the
+## desired ceiling is _TEXT_MAX_FONT_PX. The existing fit-shrink binary search
+## then picks the largest size in [8, _TEXT_MAX_FONT_PX] where wrapped content
+## fits inside (tile.w, tile.h). Width is enforced via RichTextLabel's
+## AUTOWRAP_WORD_SMART — wider-than-fit lines wrap and grow content_height,
+## which the height check rejects.
 ##
 ## Coupled mode (default, "Option A") — derive max font_px from tile.h ÷ line_count
 ## (drag-corner-resize-the-text WYSIWYG). Tile.h is the single source of truth
@@ -629,6 +637,9 @@ func _desired_text_tile_font_px(tile: Dictionary, px: Rect2) -> int:
 		var requested_px: int = int(round(float(requested)))
 		if requested_px > 0:
 			return clampi(requested_px, _TEXT_MIN_FONT_PX, _TEXT_MAX_FONT_PX)
+	# Auto-fit: ceiling is the global max; fit-shrink picks the largest that fits w × h.
+	if bool(tile.get("auto_fit", false)):
+		return _TEXT_MAX_FONT_PX
 	# Coupled mode (default)
 	var content: String = str(tile.get("content", ""))
 	var line_count: int = max(1, content.split("\n").size())
