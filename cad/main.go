@@ -206,6 +206,118 @@ func initRegistry() {
 	registry.Register(tools.Validate, tools.HandleValidate)
 	registry.Register(tools.ListEdges, tools.HandleListEdges)
 	registry.Register(tools.Evaluate, tools.HandleEvaluate)
+	// cad.cancel_eval is registered here so it appears in tools/list, but its
+	// handler is intercepted in handleToolsCall before registry dispatch (it
+	// needs access to the server-level inflight map). The registry handler
+	// is a stub that returns method-not-found if the dispatcher path is ever
+	// reached — that should never happen.
+	registry.Register(tools.CancelEval, handleCancelEvalRegistryStub)
+}
+
+// handleCancelEvalRegistryStub is a guard that should never run in practice —
+// handleToolsCall intercepts cad.cancel_eval before registry dispatch. If it
+// does run, returning a clear error makes the misrouting visible.
+func handleCancelEvalRegistryStub(_ context.Context, _ *bridge.Worker, _ json.RawMessage) (json.RawMessage, error) {
+	return nil, fmt.Errorf("cad.cancel_eval reached registry dispatch (should be intercepted in handleToolsCall)")
+}
+
+// ---------------------------------------------------------------------------
+// Inflight cad.evaluate tracking — used by cad.cancel_eval.
+// ---------------------------------------------------------------------------
+
+// inflightMu guards inflight. Reads and writes are short and uncontended;
+// a single mutex is fine.
+var inflightMu sync.Mutex
+
+// inflight maps request_id → cancel func for in-flight cad.evaluate calls.
+// Entry is added in beginEvaluateCancellable and removed in
+// endEvaluateCancellable. cancel_eval looks up by request_id; absent keys are
+// a no-op (the eval already finished or was never registered).
+var inflight = map[string]context.CancelFunc{}
+
+// beginEvaluateCancellable parses request_id from a cad.evaluate args payload
+// (if present) and registers a cancellable context under that key.
+//
+// Returns the derived context and the registered key (empty string if no
+// request_id was supplied — in that case cancellation is unavailable for the
+// request, but the call still proceeds with the parent context).
+func beginEvaluateCancellable(parent context.Context, args json.RawMessage) (context.Context, string, error) {
+	var a struct {
+		RequestID string `json:"request_id"`
+	}
+	// Tolerate missing/non-object args — old callers don't pass request_id.
+	if len(args) > 0 {
+		_ = json.Unmarshal(args, &a)
+	}
+	if a.RequestID == "" {
+		return parent, "", nil
+	}
+
+	ctx, cancel := context.WithCancel(parent)
+	inflightMu.Lock()
+	// If a prior eval somehow left a stale entry under the same request_id,
+	// cancel it before overwriting (defensive — request_ids are usec-keyed
+	// and unique in practice, but a re-entrant panel bug shouldn't leak).
+	if prior, ok := inflight[a.RequestID]; ok {
+		prior()
+	}
+	inflight[a.RequestID] = cancel
+	inflightMu.Unlock()
+	return ctx, a.RequestID, nil
+}
+
+// endEvaluateCancellable removes the inflight entry for key. Safe to call
+// when the key is absent (e.g. cancelled before completion).
+func endEvaluateCancellable(key string) {
+	if key == "" {
+		return
+	}
+	inflightMu.Lock()
+	if cancel, ok := inflight[key]; ok {
+		// Cancel before delete to release any goroutine still awaiting the
+		// derived context. Cancelling an already-cancelled CancelFunc is a no-op.
+		cancel()
+		delete(inflight, key)
+	}
+	inflightMu.Unlock()
+}
+
+// handleCancelEval looks up the inflight entry for the supplied request_id
+// and cancels it. Unknown request_ids return ok=true with cancelled=false so
+// the panel can fire-and-forget.
+func handleCancelEval(id json.RawMessage, args json.RawMessage) rpcResponse {
+	var a struct {
+		RequestID string `json:"request_id"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return errResponse(id, -32602, fmt.Sprintf("cad.cancel_eval: parse args: %v", err))
+	}
+	if a.RequestID == "" {
+		return errResponse(id, -32602, "cad.cancel_eval: request_id is required")
+	}
+
+	cancelled := false
+	inflightMu.Lock()
+	if cancel, ok := inflight[a.RequestID]; ok {
+		cancel()
+		delete(inflight, a.RequestID)
+		cancelled = true
+	}
+	inflightMu.Unlock()
+
+	log.Printf("cad-plugin: cancel_eval request_id=%s cancelled=%v", a.RequestID, cancelled)
+
+	envelope := map[string]interface{}{
+		"ok":         true,
+		"request_id": a.RequestID,
+		"cancelled":  cancelled,
+	}
+	envelopeJSON, _ := json.Marshal(envelope)
+	return okResponse(id, map[string]interface{}{
+		"content": []map[string]interface{}{
+			{"type": "text", "text": string(envelopeJSON)},
+		},
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -258,7 +370,28 @@ func handleToolsCall(id json.RawMessage, params json.RawMessage) rpcResponse {
 
 	log.Printf("cad-plugin: tools/call: %s", p.Name)
 
+	// cad.cancel_eval is a control-plane tool: it never reaches the worker.
+	// Intercept here so we can mutate the inflight map directly.
+	if p.Name == "cad.cancel_eval" {
+		return handleCancelEval(id, p.Arguments)
+	}
+
 	ctx := context.Background()
+	// cad.evaluate may carry request_id for cancellation. If present, derive
+	// a cancellable context and register it; the cancel_eval handler will
+	// trip the cancel func, which propagates into bridge.Worker.Call as a
+	// kind=cancelled error.
+	if p.Name == "cad.evaluate" {
+		cctx, key, perr := beginEvaluateCancellable(ctx, p.Arguments)
+		if perr != nil {
+			return errResponse(id, -32602, fmt.Sprintf("cad.evaluate: %v", perr))
+		}
+		ctx = cctx
+		if key != "" {
+			defer endEvaluateCancellable(key)
+		}
+	}
+
 	result, err, found := registry.Dispatch(ctx, worker, p.Name, p.Arguments)
 	if !found {
 		return errResponse(id, -32601, fmt.Sprintf("method not found: %s", p.Name))

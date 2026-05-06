@@ -23,12 +23,15 @@
           "ui/scripts/orbit_camera.gd"
         ],
         "file_extensions": [".mcad"],
+        "render_mode": "paired_dsl",
+        "layout_hint": "side_by_side",
         "ipc_channels": [
           "cad.serialize",
           "cad.deserialize",
           "cad.collect_export",
           "cad.apply_export",
-          "cad.evaluate"
+          "cad.evaluate",
+          "cad.cancel_eval"
         ],
         "save_mode": "host_owned"
       }
@@ -38,7 +41,8 @@
       "cad.deserialize",
       "cad.collect_export",
       "cad.apply_export",
-      "cad.evaluate"
+      "cad.evaluate",
+      "cad.cancel_eval"
     ]
   },
   "editor_items": [

@@ -75,6 +75,24 @@ var _registered_editor_name: String = ""
 
 var _ctx: Dictionary = {}
 
+# ── Buffer-canonical (paired_dsl) state ─────────────────────────────────────
+# DCR 019dfa66 §T6: when render_mode=paired_dsl, the panel receives DSL text
+# via the substrate's platform-reserved channels (attach_buffer / text_changed
+# / detach_buffer) instead of reading it off disk. The panel debounces rapid
+# text_changed pushes, cancels any in-flight cad.evaluate via cad.cancel_eval,
+# and re-issues evaluate with a fresh request_id.
+
+var _buffer_path: String = ""
+var _buffer_version: int = -1
+var _pending_dsl_text: String = ""
+var _inflight_request_id: String = ""
+
+## Debounce timer for text_changed → evaluate. Created lazily on first
+## text_changed receipt so the panel doesn't pay the Timer cost in the legacy
+## (non-paired_dsl) path.
+var _eval_debounce_timer: Timer = null
+const _EVAL_DEBOUNCE_SEC: float = 0.25
+
 # ── Edge enumeration / overlay state ────────────────────────────────────────
 
 ## Per-pane Cad_GeometryOverlay refs. Map view_id (str) → Control.
@@ -243,6 +261,94 @@ func _on_panel_unload() -> void:
 		AnnotationHostRegistry.deregister(_registered_editor_name)
 		_registered_editor_name = ""
 
+	_cancel_inflight_eval_if_any()
+
+
+# ── Buffer-canonical (paired_dsl) reception ─────────────────────────────────
+# DCR 019dfa66 §T6. The substrate broker pushes platform-reserved channels
+# directly to the panel root via Control.receive(channel, payload). The three
+# channels are non-allowlisted (they bypass ipc_channels) — see PluginScenePanelBroker.
+
+## Receive a platform-reserved channel push from the substrate broker.
+## Channels: attach_buffer / text_changed / detach_buffer.
+func receive(channel: String, payload: Dictionary) -> void:
+	match channel:
+		"attach_buffer":
+			_buffer_path = str(payload.get("path", ""))
+			_buffer_version = int(payload.get("version", 0))
+			var text: String = str(payload.get("text", ""))
+			_pending_dsl_text = text
+			# Mirror into the host so MCP introspection has fresh source.
+			if _annotation_host != null and _annotation_host.has_method("set_document_source"):
+				_annotation_host.set_document_source(_buffer_path, text)
+			# Initial render is immediate (no debounce) so the panel paints
+			# something as soon as the buffer attaches. Empty/whitespace
+			# buffers are skipped — the worker would emit a parse warning,
+			# producing a toast on every fresh-empty .mcad open.
+			if not text.strip_edges().is_empty():
+				_evaluate_with_request_id(text)
+		"text_changed":
+			_buffer_version = int(payload.get("version", 0))
+			var text2: String = str(payload.get("text", ""))
+			_pending_dsl_text = text2
+			if _annotation_host != null and _annotation_host.has_method("set_document_source"):
+				_annotation_host.set_document_source(_buffer_path, text2)
+			_start_eval_debounce()
+		"detach_buffer":
+			_cancel_inflight_eval_if_any()
+			# Stop any pending debounce so we don't fire an evaluate against
+			# the now-empty _pending_dsl_text after the buffer detaches.
+			if _eval_debounce_timer != null:
+				_eval_debounce_timer.stop()
+			_buffer_path = ""
+			_buffer_version = -1
+			_pending_dsl_text = ""
+
+
+## Issue a fresh cad.evaluate with a unique request_id, cancelling any prior
+## in-flight evaluate first so the worker doesn't waste cycles on stale text.
+func _evaluate_with_request_id(text: String) -> void:
+	_cancel_inflight_eval_if_any()
+	var rid: String = "eval_%d" % Time.get_ticks_usec()
+	# fire-and-await — supersession check inside _evaluate_and_render handles
+	# the race where this call completes after a newer one has already landed.
+	_evaluate_and_render(text, rid)
+
+
+## Cancel the current in-flight cad.evaluate (if any) by emitting cad.cancel_eval.
+## The worker sees its context cancellation and returns kind=cancelled.
+func _cancel_inflight_eval_if_any() -> void:
+	if _inflight_request_id == "":
+		return
+	# Emit fire-and-forget — we don't need a reply correlation for the ack.
+	# Empty reply_id signals the IPC helper to drop the response.
+	request.emit("cad.cancel_eval", {"request_id": _inflight_request_id}, "")
+	_inflight_request_id = ""
+
+
+## Lazily create the debounce timer and (re)start it. Each text_changed
+## resets the timer; the timer fires _on_eval_debounce_timeout once the user
+## stops typing for _EVAL_DEBOUNCE_SEC seconds.
+func _start_eval_debounce() -> void:
+	if _eval_debounce_timer == null:
+		_eval_debounce_timer = Timer.new()
+		_eval_debounce_timer.one_shot = true
+		_eval_debounce_timer.wait_time = _EVAL_DEBOUNCE_SEC
+		_eval_debounce_timer.timeout.connect(_on_eval_debounce_timeout)
+		add_child(_eval_debounce_timer)
+	_eval_debounce_timer.stop()
+	_eval_debounce_timer.start()
+
+
+func _on_eval_debounce_timeout() -> void:
+	# Empty/whitespace buffer → cancel any in-flight, but skip dispatching a
+	# fresh evaluate (the worker would parse-error, surfacing a toast on
+	# every keystroke that empties the buffer).
+	if _pending_dsl_text.strip_edges().is_empty():
+		_cancel_inflight_eval_if_any()
+		return
+	_evaluate_with_request_id(_pending_dsl_text)
+
 
 # ── Save/load contract (overrides MinervaPluginPanel virtuals) ──────────────
 
@@ -281,18 +387,36 @@ func _on_panel_load_request(document: Dictionary) -> void:
 ## Round-trip a DSL string through the worker's evaluate method and update the
 ## panel state (meshes, edges, sidebar) with the result. Centralised so a future
 ## bottom-split editor (`019dd0211893`) can call the same path on save/run.
-func _evaluate_and_render(dsl_text: String) -> void:
+##
+## paired_dsl callers pass a request_id so cad.cancel_eval can cancel the
+## in-flight evaluate when a newer text_changed arrives. The post-await
+## supersession check drops stale results so a slow eval that finishes after
+## a newer one has already landed doesn't clobber the panel state.
+func _evaluate_and_render(dsl_text: String, request_id: String = "") -> void:
 	var ipc := get_node_or_null("_MinervaIPC")
 	if ipc == null:
 		push_warning("[CADPanel] _evaluate_and_render: MinervaIPC helper not attached; cannot dispatch cad.evaluate")
 		return
 
 	var reply_id := "cad.evaluate:" + str(Time.get_ticks_usec())
-	request.emit("cad.evaluate", {"source": dsl_text}, reply_id)
+	var args: Dictionary = {"source": dsl_text}
+	if request_id != "":
+		args["request_id"] = request_id
+		_inflight_request_id = request_id
+	request.emit("cad.evaluate", args, reply_id)
 
 	# 30s timeout: build123d cold-start can take ~10s on first invocation; the
 	# default 10s is too tight for first-open of a fresh worker process.
 	var result: Dictionary = await ipc.await_reply(reply_id, 30000)
+
+	# Supersession: if a newer evaluate started while we were awaiting, drop
+	# this result. The newer evaluate set _inflight_request_id to its own id;
+	# our cancel_eval may have already triggered the worker's cancellation,
+	# in which case `result` is a worker error kind=cancelled.
+	if request_id != "" and _inflight_request_id != request_id:
+		return
+	if request_id != "":
+		_inflight_request_id = ""
 
 	if not bool(result.get("success", false)):
 		var err_code: String = str(result.get("error_code", "unknown"))
@@ -319,6 +443,10 @@ func _evaluate_and_render(dsl_text: String) -> void:
 		var err: Dictionary = err_var if err_var is Dictionary else {}
 		var kind: String = str(err.get("kind", "unknown"))
 		var msg: String = str(err.get("message", err_var if err_var is String else ""))
+		# kind=cancelled is the expected outcome of cad.cancel_eval — a newer
+		# evaluate raced past this one. Silent return; no toast.
+		if kind == "cancelled":
+			return
 		push_warning("[CADPanel] cad.evaluate worker error [%s]: %s" % [kind, msg])
 		return
 
