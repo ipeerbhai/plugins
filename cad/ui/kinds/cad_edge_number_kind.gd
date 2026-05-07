@@ -167,7 +167,196 @@ func render(ctx: AnnotationRenderContext, annotation: Dictionary) -> void:
 func bounds(_annotation: Dictionary) -> Rect2:
 	# Live-resolved anchor → bounds are not knowable at annotation-store time.
 	# Substrate consumers fall back to other fields (summary, anchored_to).
+	# Drag-time hit-testing uses the kind's own hit_test override below, which
+	# resolves through the host's perspective camera + layout cache.
 	return Rect2()
+
+
+# ── Drag-to-move (substrate AnnotationTranslateTool) ──────────────────────────
+#
+# The kind opts into drag-and-drop by overriding hit_test (does the cursor sit
+# over a label box?) and transform_annotation (apply a screen-space delta to
+# payload.box_offset). The tool layer dispatches; we don't manage drag state.
+#
+# Coordinate notes: CadAnnotationHost identity-maps doc↔screen, so the `point`
+# substrate hands us is panel-root screen-space — the same frame the layout
+# helper publishes positions in. We resolve the box's current screen position
+# the same way render() does: layout helper for un-placed labels (auto-spread),
+# raw payload.box_offset back-projection for user-placed ones.
+
+func hit_test(annotation: Dictionary, point: Vector2, threshold: float) -> bool:
+	var rect := _resolve_box_rect_screen(annotation)
+	if rect.size == Vector2.ZERO:
+		return false
+	return rect.grow(threshold).has_point(point)
+
+
+## Apply a screen-space transform to the label's text-box position. Sets
+## payload.user_placed=true so the auto-spread layout treats this box as a
+## fixed obstacle (other labels move around it; this one stays put).
+func transform_annotation(
+		annotation: Dictionary,
+		transform: Transform2D,
+		_operation: String = ""
+) -> Dictionary:
+	var ctx := _resolve_perspective_ctx_for_annotation(annotation)
+	if ctx.is_empty():
+		# No perspective camera + anchor available — leave annotation untouched.
+		return annotation.duplicate(true)
+
+	var camera: Camera3D = ctx["camera"]
+	var rect: Rect2 = ctx["viewport_rect"]
+	var anchor_world: Vector3 = ctx["anchor_world"]
+	var current_box_screen: Vector2 = ctx["box_screen"]
+
+	# Apply the screen-space delta. Transform2D from the translate tool is a
+	# pure translation in panel-root space (origin = drag delta).
+	var new_box_screen: Vector2 = transform * current_box_screen
+
+	# Back-project to a world-space leader_end at the same camera depth as the
+	# anchor. Same algorithm as cad_edge_number_tool._compute_default_box_offset
+	# (kept inline rather than imported to avoid an extra preload cycle).
+	var new_box_offset := _back_project_to_world_offset(camera, rect, anchor_world, new_box_screen)
+
+	var out := annotation.duplicate(true)
+	var payload_v: Variant = out.get("payload", {})
+	var payload: Dictionary = payload_v.duplicate(true) if payload_v is Dictionary else {}
+	payload["box_offset"] = [new_box_offset.x, new_box_offset.y, new_box_offset.z]
+	payload["user_placed"] = true
+	out["payload"] = payload
+	return out
+
+
+## Compute the on-screen rect for an annotation's text box, using the same
+## resolution path render() uses. Returns Rect2() (zero size) when the box is
+## not currently rendered (no perspective pane, anchor unresolvable, etc.) —
+## callers should treat that as "not hittable".
+func _resolve_box_rect_screen(annotation: Dictionary) -> Rect2:
+	var ctx := _resolve_perspective_ctx_for_annotation(annotation)
+	if ctx.is_empty():
+		return Rect2()
+	var center: Vector2 = ctx["box_screen"]
+	# Use a conservative footprint covering the kind's actual draw size. The
+	# real box can be larger when payload.text wraps to many lines, but the
+	# title strip alone is enough for grab-handle hit-testing — and the
+	# substrate caller adds its own threshold via grow().
+	var size := Vector2(_BOX_WIDTH, 56.0)
+	return Rect2(center - size * 0.5, size)
+
+
+## Resolve the perspective pane + anchor + current box screen position for an
+## annotation. Returns an empty Dictionary when any prerequisite is missing
+## (no perspective camera, anchor not resolvable, host lacks methods).
+##
+## Returned keys: camera, viewport_rect, anchor_world, anchor_screen, box_screen.
+func _resolve_perspective_ctx_for_annotation(annotation: Dictionary) -> Dictionary:
+	var anchor: Variant = annotation.get("anchor", null)
+	if not (anchor is Dictionary):
+		return {}
+	# We need an AnnotationRenderContext-like host reference, but transform_/hit_
+	# are called without a ctx — the substrate hands us only the annotation
+	# itself. Reach the host via the static EditorRegistry so the kind can
+	# self-resolve. Keeps the kind's interface compatible with the substrate
+	# tool layer (which doesn't pass a ctx to manipulation calls).
+	var host: Object = _find_host_for_annotation(annotation)
+	if host == null:
+		return {}
+	if not host.has_method("get_panes") or not host.has_method("_resolve_edge_anchor"):
+		return {}
+
+	var resolved: Variant = host._resolve_edge_anchor(anchor)
+	if not (resolved is Dictionary):
+		return {}
+	var resolved_d: Dictionary = resolved as Dictionary
+	var anchor_world: Vector3 = resolved_d.get("position", Vector3.ZERO)
+	var edge_id: int = int(resolved_d.get("edge_id", anchor.get("id", -1)))
+
+	var panes: Array = host.get_panes()
+	for pane in panes:
+		if not (pane is Dictionary):
+			continue
+		var camera: Variant = (pane as Dictionary).get("camera", null)
+		if camera == null or not (camera is Camera3D):
+			continue
+		var cam3 := camera as Camera3D
+		if cam3.projection != Camera3D.PROJECTION_PERSPECTIVE:
+			continue
+		var rect: Rect2 = (pane as Dictionary).get("viewport_rect", Rect2())
+		var anchor_screen: Vector2 = cam3.unproject_position(anchor_world) + rect.position
+
+		# Determine current box screen position. user_placed labels: use
+		# payload.box_offset directly (back-projected). Otherwise: ask the
+		# layout helper, which is the source of truth for auto-spread.
+		var payload: Dictionary = annotation.get("payload", {}) as Dictionary
+		var user_placed: bool = bool(payload.get("user_placed", false))
+		var box_screen: Vector2
+		if user_placed:
+			var box_offset := _vec3_from_payload(payload.get("box_offset", [0.0, 0.0, 0.0]))
+			box_screen = cam3.unproject_position(anchor_world + box_offset) + rect.position
+		else:
+			var all_anns: Array = host.get_annotations() if host.has_method("get_annotations") else []
+			var layout: Dictionary = _LayoutHelper.get_layout(host, cam3, rect, all_anns)
+			if layout.has(edge_id):
+				box_screen = layout[edge_id]
+			else:
+				var box_offset2 := _vec3_from_payload(payload.get("box_offset", [0.0, 0.0, 0.0]))
+				box_screen = cam3.unproject_position(anchor_world + box_offset2) + rect.position
+
+		return {
+			"camera": cam3,
+			"viewport_rect": rect,
+			"anchor_world": anchor_world,
+			"anchor_screen": anchor_screen,
+			"box_screen": box_screen,
+		}
+	return {}
+
+
+## Locate the AnnotationHost that owns this annotation. The substrate keeps
+## annotations in a host's _annotations array; we walk the registry to find
+## the one whose list contains this annotation's id. Returns null when the
+## annotation is orphaned (never registered, or already removed).
+static func _find_host_for_annotation(annotation: Dictionary) -> Object:
+	var ann_id: String = str(annotation.get("id", ""))
+	if ann_id == "":
+		return null
+	# AnnotationHostRegistry exposes list_editor_names() + get_host() only;
+	# walk by name. Empty list when no panels are open — caller treats null
+	# host as "drag is not currently possible," same as a freed panel.
+	for editor_name in AnnotationHostRegistry.list_editor_names():
+		var h: AnnotationHost = AnnotationHostRegistry.get_host(str(editor_name))
+		if h == null or not h.has_method("get_annotations"):
+			continue
+		for a in h.get_annotations():
+			if a is Dictionary and str((a as Dictionary).get("id", "")) == ann_id:
+				return h
+	return null
+
+
+## Back-project a screen-space target point to a world-space offset relative
+## to anchor_world, at the anchor's camera depth. Mirrors the algorithm in
+## cad_edge_number_tool._compute_default_box_offset.
+static func _back_project_to_world_offset(
+		camera: Camera3D,
+		viewport_rect: Rect2,
+		anchor_world: Vector3,
+		target_screen_panel: Vector2
+) -> Vector3:
+	var cam_origin: Vector3 = camera.global_transform.origin
+	var look_dir: Vector3 = -camera.global_transform.basis.z.normalized()
+	var depth: float = look_dir.dot(anchor_world - cam_origin)
+	if depth < 0.001:
+		return Vector3.ZERO
+	# Translate panel-root screen back to viewport-local before project_ray_*.
+	var target_local: Vector2 = target_screen_panel - viewport_rect.position
+	var ray_origin: Vector3 = camera.project_ray_origin(target_local)
+	var ray_dir: Vector3 = camera.project_ray_normal(target_local)
+	var dz: float = look_dir.dot(ray_dir)
+	if abs(dz) < 0.001:
+		return Vector3.ZERO
+	var t: float = (depth - look_dir.dot(ray_origin - cam_origin)) / dz
+	var world_target: Vector3 = ray_origin + ray_dir * t
+	return world_target - anchor_world
 
 
 # ── author_ui ────────────────────────────────────────────────────────────────

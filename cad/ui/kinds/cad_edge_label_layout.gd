@@ -86,6 +86,10 @@ static func get_layout(
 	# Build initial positions: project anchor + box_offset. Fan out anchors
 	# whose offset is effectively zero so the spread has working room.
 	var positions: Dictionary = {}
+	# Track which edge_ids are user-placed (drag-pinned). Their position is
+	# canonical and the spread treats them as static obstacles — other labels
+	# move around them but they don't move themselves.
+	var user_placed_ids: Dictionary = {}
 	var pane_center := viewport_rect.position + viewport_rect.size * 0.5
 	# Deterministic but distinct fan-out direction per anchor when many
 	# anchors share the pane center direction (rare, defensive only).
@@ -113,15 +117,18 @@ static func get_layout(
 			continue
 
 		var payload: Dictionary = ann_d.get("payload", {})
+		var user_placed: bool = bool(payload.get("user_placed", false))
 		var box_offset: Vector3 = _vec3_from_payload(payload.get("box_offset", [0.0, 0.0, 0.0]))
 		var leader_end_world: Vector3 = leader_start_world + box_offset
 
 		var anchor_screen: Vector2 = camera.unproject_position(leader_start_world) + viewport_rect.position
 		var box_center: Vector2 = camera.unproject_position(leader_end_world) + viewport_rect.position
 
-		# When the world offset is effectively zero, the unproject collapses
-		# back onto the anchor → fan outward radially so labels start spread.
-		if box_offset.length_squared() < 0.0001:
+		# Auto-spread initial position: when the world offset is effectively zero,
+		# the unproject collapses back onto the anchor → fan outward radially so
+		# labels start spread. User-placed labels skip this nudge entirely; their
+		# stored offset is canonical (the user dragged it there).
+		if not user_placed and box_offset.length_squared() < 0.0001:
 			var dir: Vector2 = anchor_screen - pane_center
 			if dir.length_squared() < 1.0:
 				# Anchor at exact pane center: synthesise a distinct direction
@@ -132,11 +139,15 @@ static func get_layout(
 			fan_index += 1
 
 		positions[edge_id] = box_center
+		if user_placed:
+			user_placed_ids[edge_id] = true
 
 	# Spread overlapping boxes in screen space. Pairwise iteration: for each
 	# overlapping pair, push them apart along the dominant axis of their
-	# centre-to-centre vector. Equal-and-opposite displacement preserves
-	# bulk position. Stops early once no pair overlaps.
+	# centre-to-centre vector. User-placed boxes are static obstacles — when
+	# only one of a pair is user-placed, the OTHER absorbs the entire push;
+	# when both are user-placed we skip the pair (the user explicitly chose
+	# that arrangement, even if the boxes overlap).
 	var ids: Array = positions.keys()
 	for _iter in range(_SPREAD_ITERATIONS):
 		var moved := false
@@ -144,6 +155,10 @@ static func get_layout(
 			for j in range(i + 1, ids.size()):
 				var a_id = ids[i]
 				var b_id = ids[j]
+				var a_placed: bool = user_placed_ids.has(a_id)
+				var b_placed: bool = user_placed_ids.has(b_id)
+				if a_placed and b_placed:
+					continue
 				var a_pos: Vector2 = positions[a_id]
 				var b_pos: Vector2 = positions[b_id]
 				var a_rect := Rect2(a_pos - _BOX_SIZE * 0.5, _BOX_SIZE).grow(_MIN_GAP_PX * 0.5)
@@ -159,13 +174,21 @@ static func get_layout(
 				var overlap: Vector2 = inter.size
 				# Push along the dominant axis only — keeps motion stable and
 				# avoids diagonal drift that can re-collide with a third box.
-				var push: Vector2
+				# Movable side absorbs the full overlap when one side is pinned;
+				# both-movable splits the displacement equally.
+				var full_push: Vector2
 				if abs(diff.x) >= abs(diff.y):
-					push = Vector2((overlap.x + 1.0) * 0.5 * sign(diff.x), 0.0)
+					full_push = Vector2((overlap.x + 1.0) * sign(diff.x), 0.0)
 				else:
-					push = Vector2(0.0, (overlap.y + 1.0) * 0.5 * sign(diff.y))
-				positions[a_id] = a_pos - push
-				positions[b_id] = b_pos + push
+					full_push = Vector2(0.0, (overlap.y + 1.0) * sign(diff.y))
+				if a_placed:
+					positions[b_id] = b_pos + full_push
+				elif b_placed:
+					positions[a_id] = a_pos - full_push
+				else:
+					var half_push: Vector2 = full_push * 0.5
+					positions[a_id] = a_pos - half_push
+					positions[b_id] = b_pos + half_push
 				moved = true
 		if not moved:
 			break
