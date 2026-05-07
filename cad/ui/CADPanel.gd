@@ -106,6 +106,21 @@ var _edge_registry: Array = []
 ## on camera moves).
 var _last_mesh_data: Dictionary = {}
 
+## Last-known evaluation result, surfaced via _on_panel_save_request so
+## minerva_doc_read after a write exposes whether the worker actually
+## accepted the DSL. Shape:
+##   {status: "empty"|"pending"|"ok"|"error"|"cancelled"|"timeout",
+##    error_kind?: String, error_message?: String, shape_name?: String,
+##    request_id?: String, ts?: int}
+##
+## "empty" = panel just opened, no DSL evaluated yet.
+## "pending" = evaluate dispatched, awaiting worker reply.
+## "ok" = worker returned a mesh; panel is rendering it.
+## "error" = worker rejected the DSL (kind/message available).
+## "cancelled" = preempted by a newer evaluate (transient; not user-visible).
+## "timeout" = worker didn't reply within the 30s budget.
+var _last_eval_result: Dictionary = {"status": "empty"}
+
 ## Tree node in the wide sidebar listing all edges. Built in _ready().
 var _edge_tree: Tree = null
 
@@ -357,8 +372,18 @@ func _on_panel_save_request() -> Dictionary:
 	# anonymous or path-bound) returns useful content. _pending_dsl_text is the
 	# panel's authoritative source — kept in sync by attach_buffer / text_changed
 	# (path-bound) and by _on_panel_load_request's `source` branch (anonymous).
+	#
+	# `last_eval` exposes the worker's most recent verdict on the DSL so MCP
+	# callers can verify a doc_write actually rendered. Status values:
+	# empty / pending / ok / error / cancelled / timeout. See _last_eval_result
+	# decl for the full shape.
+	#
 	# TODO(later): include annotations + camera states.
-	return {"version": 1, "source": _pending_dsl_text}
+	return {
+		"version": 1,
+		"source": _pending_dsl_text,
+		"last_eval": _last_eval_result.duplicate(true),
+	}
 
 
 func _on_panel_load_request(document: Dictionary) -> void:
@@ -421,6 +446,13 @@ func _on_panel_load_request(document: Dictionary) -> void:
 func _evaluate_and_render(dsl_text: String, request_id: String = "") -> void:
 	var ipc := get_node_or_null("_MinervaIPC")
 	if ipc == null:
+		_last_eval_result = {
+			"status": "error",
+			"error_kind": "ipc_unavailable",
+			"error_message": "MinervaIPC helper not attached; cannot dispatch cad.evaluate",
+			"request_id": request_id,
+			"ts": Time.get_unix_time_from_system(),
+		}
 		push_warning("[CADPanel] _evaluate_and_render: MinervaIPC helper not attached; cannot dispatch cad.evaluate")
 		return
 
@@ -429,6 +461,13 @@ func _evaluate_and_render(dsl_text: String, request_id: String = "") -> void:
 	if request_id != "":
 		args["request_id"] = request_id
 		_inflight_request_id = request_id
+	# Mark pending BEFORE the await so a same-tick doc_read sees pending, not
+	# stale prior result.
+	_last_eval_result = {
+		"status": "pending",
+		"request_id": request_id,
+		"ts": Time.get_unix_time_from_system(),
+	}
 	request.emit("cad.evaluate", args, reply_id)
 
 	# 30s timeout: build123d cold-start can take ~10s on first invocation; the
@@ -440,6 +479,7 @@ func _evaluate_and_render(dsl_text: String, request_id: String = "") -> void:
 	# our cancel_eval may have already triggered the worker's cancellation,
 	# in which case `result` is a worker error kind=cancelled.
 	if request_id != "" and _inflight_request_id != request_id:
+		# Don't overwrite _last_eval_result — the newer evaluate owns it.
 		return
 	if request_id != "":
 		_inflight_request_id = ""
@@ -447,6 +487,15 @@ func _evaluate_and_render(dsl_text: String, request_id: String = "") -> void:
 	if not bool(result.get("success", false)):
 		var err_code: String = str(result.get("error_code", "unknown"))
 		var err_msg: String = str(result.get("error_message", ""))
+		# IPC-layer timeout surfaces as success=false with a timeout-ish code.
+		var st: String = "timeout" if err_code.findn("timeout") != -1 else "error"
+		_last_eval_result = {
+			"status": st,
+			"error_kind": err_code,
+			"error_message": err_msg,
+			"request_id": request_id,
+			"ts": Time.get_unix_time_from_system(),
+		}
 		push_warning(
 			"[CADPanel] cad.evaluate transport failure: %s — %s"
 			% [err_code, err_msg]
@@ -459,6 +508,13 @@ func _evaluate_and_render(dsl_text: String, request_id: String = "") -> void:
 	# where <worker_payload> is the raw worker dict {ok, result|error}.
 	var worker_payload: Dictionary = result.get("result", {})
 	if not (worker_payload is Dictionary):
+		_last_eval_result = {
+			"status": "error",
+			"error_kind": "missing_worker_payload",
+			"error_message": "cad.evaluate reply had no Dictionary payload",
+			"request_id": request_id,
+			"ts": Time.get_unix_time_from_system(),
+		}
 		push_warning("[CADPanel] cad.evaluate: missing worker payload")
 		return
 
@@ -472,7 +528,20 @@ func _evaluate_and_render(dsl_text: String, request_id: String = "") -> void:
 		# kind=cancelled is the expected outcome of cad.cancel_eval — a newer
 		# evaluate raced past this one. Silent return; no toast.
 		if kind == "cancelled":
+			_last_eval_result = {
+				"status": "cancelled",
+				"error_kind": kind,
+				"request_id": request_id,
+				"ts": Time.get_unix_time_from_system(),
+			}
 			return
+		_last_eval_result = {
+			"status": "error",
+			"error_kind": kind,
+			"error_message": msg,
+			"request_id": request_id,
+			"ts": Time.get_unix_time_from_system(),
+		}
 		push_warning("[CADPanel] cad.evaluate worker error [%s]: %s" % [kind, msg])
 		return
 
@@ -508,6 +577,18 @@ func _evaluate_and_render(dsl_text: String, request_id: String = "") -> void:
 	_render_edge_tree(_edge_registry)
 	# Re-apply mesh visibility (ortho panes hide the shaded mesh; iso shows it).
 	_apply_mesh_visibility()
+
+	# Mark the eval as ok so minerva_doc_read can verify success after a write.
+	# shape_name comes straight from the worker (the named output the DSL
+	# bound — e.g. the last assigned shape variable).
+	_last_eval_result = {
+		"status": "ok",
+		"shape_name": str(eval_result.get("shape_name", "")),
+		"vertex_count": (mesh_data.get("vertices", []) as Array).size() / 3,
+		"edge_count": edges.size(),
+		"request_id": request_id,
+		"ts": Time.get_unix_time_from_system(),
+	}
 
 
 # ── Width-class handling ────────────────────────────────────────────────────
