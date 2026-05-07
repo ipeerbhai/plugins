@@ -215,7 +215,19 @@ func describe_point(_doc_pos: Vector2) -> String:
 ## viewport_rect: if non-zero, crop the image to that region (matching the
 ## hello pattern). If zero, return the full SubViewport image.
 func render_content_to_image(viewport_rect: Rect2) -> Image:
-	var view_id: String = _active_viewport_id
+	return render_view_to_image(_active_viewport_id, viewport_rect)
+
+
+## Per-view variant of render_content_to_image. Lets the snapshot MCP tool
+## request a specific view ("iso"/"top"/"front"/"right") without mutating
+## _active_viewport_id. Same caching rules: returns cached image when fresh
+## for this frame, otherwise schedules a refresh and returns the previous
+## capture (or null on cold start).
+##
+## Caveat: in NARROW layout only the visible SubViewport is actually rendering.
+## Capturing a non-visible view returns the last cached image (possibly stale
+## from before the layout switched) or null.
+func render_view_to_image(view_id: String, viewport_rect: Rect2 = Rect2()) -> Image:
 	var current_frame: int = Engine.get_frames_drawn()
 	var cached_frame: int = int(_capture_cache_frame.get(view_id, -1))
 	var cached_image: Image = _capture_cache.get(view_id, null) as Image
@@ -223,10 +235,7 @@ func render_content_to_image(viewport_rect: Rect2) -> Image:
 	if cached_image != null and cached_frame == current_frame:
 		return _maybe_crop(cached_image, viewport_rect)
 
-	# Cache miss or stale — schedule a refresh for next frame.
 	_schedule_capture(view_id)
-	# Return the previous capture if we have one (stale by ≥1 frame is fine);
-	# null only on cold start.
 	return _maybe_crop(cached_image, viewport_rect) if cached_image != null else null
 
 
@@ -294,6 +303,12 @@ func set_active_viewport(viewport_id: String) -> void:
 		_capture_cache.erase(_active_viewport_id)
 		_capture_cache_frame.erase(_active_viewport_id)
 	_active_viewport_id = viewport_id
+
+
+## Return the currently active viewport id (default "iso"). Used by MCP tools
+## that resolve view="active" without needing direct field access.
+func get_active_viewport() -> String:
+	return _active_viewport_id
 
 
 ## Register the SubViewport that backs a given view_id. CADPanel calls this

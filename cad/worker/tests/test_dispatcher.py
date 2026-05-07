@@ -43,25 +43,17 @@ class TestInitRequest:
 
 
 class TestGeometryStubs:
-    """export and deviation remain scaffold stubs (Round 3 Unit A)."""
+    """deviation remains a scaffold stub (export is real as of Round 4)."""
 
-    @pytest.mark.parametrize("method", [
-        "export",
-        "deviation",
-    ])
-    def test_returns_not_implemented(self, method):
-        resp = handle_request({"id": "r1", "method": method, "params": {}})
+    def test_deviation_returns_not_implemented(self):
+        resp = handle_request({"id": "r1", "method": "deviation", "params": {}})
         assert resp is not None
         assert resp["ok"] is False
         assert resp["error"]["kind"] == "internal"
         assert "not implemented" in resp["error"]["message"].lower()
 
-    @pytest.mark.parametrize("method", [
-        "export",
-        "deviation",
-    ])
-    def test_echoes_id(self, method):
-        resp = handle_request({"id": "xyz", "method": method, "params": {}})
+    def test_deviation_echoes_id(self):
+        resp = handle_request({"id": "xyz", "method": "deviation", "params": {}})
         assert resp["id"] == "xyz"
 
 
@@ -460,6 +452,129 @@ class TestListEdges:
             "params": {"source": _BOX_SOURCE},
         })
         assert resp["id"] == "le-id-99"
+
+
+class TestExport:
+    """Tests for the real export implementation (Round 4)."""
+
+    # build123d is required for actual file output; param-validation tests
+    # don't need it (handle_request rejects bad params before importing).
+
+    _CUBE_SOURCE = "result = cube(10, 10, 10)\n"
+
+    # -- Param validation (no build123d needed) -----------------------------
+
+    def test_missing_source_returns_internal(self):
+        resp = handle_request({"id": "r1", "method": "export",
+                               "params": {"format": "stl", "path": "/tmp/x.stl"}})
+        assert resp["ok"] is False
+        assert resp["error"]["kind"] == "internal"
+        assert "source" in resp["error"]["message"].lower()
+
+    def test_missing_format_returns_internal(self):
+        resp = handle_request({"id": "r1", "method": "export",
+                               "params": {"source": self._CUBE_SOURCE,
+                                          "path": "/tmp/x.stl"}})
+        assert resp["ok"] is False
+        assert resp["error"]["kind"] == "internal"
+        assert "format" in resp["error"]["message"].lower()
+
+    def test_unsupported_format_returns_internal(self):
+        resp = handle_request({"id": "r1", "method": "export",
+                               "params": {"source": self._CUBE_SOURCE,
+                                          "format": "obj",
+                                          "path": "/tmp/x.obj"}})
+        assert resp["ok"] is False
+        assert resp["error"]["kind"] == "internal"
+        assert "unsupported" in resp["error"]["message"].lower()
+
+    def test_empty_path_returns_internal(self):
+        resp = handle_request({"id": "r1", "method": "export",
+                               "params": {"source": self._CUBE_SOURCE,
+                                          "format": "stl",
+                                          "path": ""}})
+        assert resp["ok"] is False
+        assert resp["error"]["kind"] == "internal"
+        assert "path" in resp["error"]["message"].lower()
+
+    def test_id_echoed(self):
+        resp = handle_request({"id": "exp-7", "method": "export",
+                               "params": {"format": "stl"}})
+        assert resp["id"] == "exp-7"
+
+    # -- Real round-trip (skipped without build123d) ------------------------
+
+    def _build123d_available(self) -> bool:
+        try:
+            import build123d  # type: ignore[import]  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    @pytest.mark.parametrize("fmt,suffix", [
+        ("stl", ".stl"),
+        ("step", ".step"),
+        ("stp", ".stp"),
+        ("3mf", ".3mf"),
+    ])
+    def test_real_export_writes_file(self, tmp_path, fmt, suffix):
+        if not self._build123d_available():
+            pytest.skip("build123d not installed")
+        out_path = tmp_path / f"cube{suffix}"
+        resp = handle_request({"id": "r1", "method": "export", "params": {
+            "source": self._CUBE_SOURCE,
+            "format": fmt,
+            "path": str(out_path),
+        }})
+        assert resp["ok"] is True, f"got error: {resp.get('error')}"
+        assert resp["result"]["format"] == fmt
+        assert resp["result"]["path"] == str(out_path)
+        assert resp["result"]["bytes_written"] > 0
+        assert out_path.exists() and out_path.stat().st_size > 0
+
+    def test_real_export_stl_is_binary(self, tmp_path):
+        """build123d defaults to binary STL (80-byte header + uint32 count + …)."""
+        if not self._build123d_available():
+            pytest.skip("build123d not installed")
+        out_path = tmp_path / "cube.stl"
+        resp = handle_request({"id": "r1", "method": "export", "params": {
+            "source": self._CUBE_SOURCE,
+            "format": "stl",
+            "path": str(out_path),
+        }})
+        assert resp["ok"] is True
+        head = out_path.read_bytes()[:80]
+        # ASCII STL begins "solid "; binary STL has an 80-byte arbitrary header
+        # that build123d/OCCT does not start with that token.
+        assert not head.startswith(b"solid "), "expected binary STL, got ASCII"
+
+    def test_translate_error_surfaces_translate_kind(self, tmp_path):
+        if not self._build123d_available():
+            pytest.skip("build123d not installed")
+        # Source with no 3D part — translator runs but last_part() is None.
+        out_path = tmp_path / "empty.stl"
+        resp = handle_request({"id": "r1", "method": "export", "params": {
+            "source": "x = 1\n",
+            "format": "stl",
+            "path": str(out_path),
+        }})
+        assert resp["ok"] is False
+        assert resp["error"]["kind"] == "translate"
+
+    def test_parse_error_surfaces_parse_kind(self, tmp_path):
+        if not self._build123d_available():
+            pytest.skip("build123d not installed")
+        out_path = tmp_path / "broken.stl"
+        # Bare '&' is a lex error; the evaluator wraps as ExportError(__cause__=ParseError).
+        # If the lexer raises LexError instead, the methods layer maps to "translate"
+        # (acceptable — parse-vs-translate split is best-effort, both signal "bad DSL").
+        resp = handle_request({"id": "r1", "method": "export", "params": {
+            "source": "x = 1 & 2\n",
+            "format": "stl",
+            "path": str(out_path),
+        }})
+        assert resp["ok"] is False
+        assert resp["error"]["kind"] in ("parse", "translate")
 
 
 class TestShutdownRequest:

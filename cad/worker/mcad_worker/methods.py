@@ -1,18 +1,21 @@
 """Request handlers for the Go-Python bridge worker.
 
-This module is pure (no I/O) so it can be tested directly without stdio.
+This module is pure (no I/O apart from the explicit `export` method, which
+writes a single user-named file) so it can be tested directly without stdio.
 Callers pass a decoded request dict and receive a response dict.
 
 Per design §8, only `init` and `shutdown` are real in Round 1 (scaffold).
 Round 2 Unit A adds a real `validate` implementation.
 Round 3 Unit A adds real `evaluate` and `list_edges` implementations.
-The two remaining geometry methods (export, deviation) return stub errors;
-they will be filled in by per-tool grandchildren.
+Round 4 adds `export` (STL binary / 3MF / STEP AP214) atop the existing
+``mcad.evaluator.export_source`` helper. The remaining stub is `deviation`.
 """
 
 from __future__ import annotations
 
+import os
 import traceback
+from pathlib import Path
 from typing import Optional, Tuple
 
 WORKER_VERSION = "0.1.0"
@@ -193,6 +196,153 @@ def _list_edges(params: dict) -> dict:
     return {"ok": True, "result": response["result"]["edges"]}
 
 
+_SUPPORTED_EXPORT_FORMATS: frozenset[str] = frozenset({"stl", "step", "stp", "3mf"})
+
+
+def _export(params: dict) -> dict:
+    """Export the last 3D part of *source* to *path* in *format*.
+
+    Params:
+        source: str — full .mcad source text.
+        format: str — "stl" | "step" | "stp" | "3mf" (case-insensitive).
+        path:   str — absolute or ~-prefixed path; relative paths resolve
+                against the user's home directory (delegated to evaluator).
+
+    Returns:
+        {ok: True, result: {path: str, bytes_written: int, format: str}}
+        on success, or {ok: False, error: {kind, message, ...}} on failure.
+
+    Failure kinds:
+        - "internal" — bad params (missing/wrong type).
+        - "parse"    — DSL syntax error (propagated from evaluator).
+        - "translate" — DSL is well-formed but produces no shape, or the
+                         export call rejected the result.
+        - "io"       — disk write failed (permission, missing parent dir
+                       even after mkdir, etc).
+        - "python"   — unhandled exception; includes traceback.
+    """
+    source = params.get("source")
+    if not isinstance(source, str):
+        return {
+            "ok": False,
+            "error": {
+                "kind": "internal",
+                "message": "export requires params.source: str",
+            },
+        }
+
+    fmt_raw = params.get("format")
+    if not isinstance(fmt_raw, str) or fmt_raw.strip() == "":
+        return {
+            "ok": False,
+            "error": {
+                "kind": "internal",
+                "message": "export requires params.format: str",
+            },
+        }
+    fmt = fmt_raw.strip().lower()
+    if fmt not in _SUPPORTED_EXPORT_FORMATS:
+        return {
+            "ok": False,
+            "error": {
+                "kind": "internal",
+                "message": (
+                    f"unsupported export format: {fmt_raw!r} "
+                    f"(supported: {sorted(_SUPPORTED_EXPORT_FORMATS)})"
+                ),
+            },
+        }
+
+    path = params.get("path")
+    if not isinstance(path, str) or path.strip() == "":
+        return {
+            "ok": False,
+            "error": {
+                "kind": "internal",
+                "message": "export requires params.path: non-empty str",
+            },
+        }
+
+    try:
+        from mcad.evaluator import ExportError, export_source
+        from mcad.lexer import LexError
+        from mcad.parser import ParseError
+        from mcad.translator import TranslatorError
+    except ImportError as exc:
+        return {
+            "ok": False,
+            "error": {
+                "kind": "internal",
+                "message": f"mcad package unavailable: {exc}",
+            },
+        }
+
+    try:
+        written_path = export_source(source, format=fmt, path=path)
+    except LexError as exc:
+        # Lex errors aren't wrapped by ExportError (which only catches
+        # ParseError/TranslatorError); surface as parse kind so callers
+        # see a uniform "bad DSL" signal.
+        return {
+            "ok": False,
+            "error": {
+                "kind": "parse",
+                "message": str(exc),
+                "details": {
+                    "line": getattr(exc, "line", 0),
+                    "col": getattr(exc, "col", 0),
+                },
+            },
+        }
+    except ExportError as exc:
+        cause = exc.__cause__
+        if isinstance(cause, ParseError):
+            kind = "parse"
+        elif isinstance(cause, TranslatorError):
+            kind = "translate"
+        else:
+            kind = "translate"
+        return {
+            "ok": False,
+            "error": {"kind": kind, "message": str(exc)},
+        }
+    except OSError as exc:
+        return {
+            "ok": False,
+            "error": {
+                "kind": "io",
+                "message": f"failed to write export: {exc}",
+            },
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": {
+                "kind": "python",
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+            },
+        }
+
+    bytes_written = 0
+    try:
+        bytes_written = os.path.getsize(written_path)
+    except OSError:
+        # File should exist (export_source already wrote it); if stat fails
+        # we still report ok=True with bytes_written=0 rather than spuriously
+        # failing the export call.
+        pass
+
+    return {
+        "ok": True,
+        "result": {
+            "path": str(Path(written_path)),
+            "bytes_written": bytes_written,
+            "format": fmt,
+        },
+    }
+
+
 def _stub_not_implemented(req: dict) -> dict:
     """Return the standard scaffold stub error response."""
     return {
@@ -329,8 +479,13 @@ def handle_request(req: dict) -> dict | None:
         result["id"] = req_id
         return result
 
-    # Two remaining geometry stubs — filled in by per-tool grandchildren.
-    if method in ("export", "deviation"):
+    if method == "export":
+        result = _export(req.get("params") or {})
+        result["id"] = req_id
+        return result
+
+    # Remaining geometry stub — filled in by per-tool grandchildren.
+    if method == "deviation":
         return _stub_not_implemented(req)
 
     # Unknown method.

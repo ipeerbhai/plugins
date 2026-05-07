@@ -1046,4 +1046,69 @@ func _step_selected_edge(delta: int) -> void:
 	_select_edge(ids[next_idx])
 
 
+# ── Chat-injection hooks ────────────────────────────────────────────────────
+# Editor.gd's "inject to chat" CheckButton fires two independent paths for
+# PLUGIN_SCENE editors:
+#   1. _on_panel_inject_toggle_changed(enabled) — fire-and-forget notification
+#      so the panel can ack the toggle (status text, internal state).
+#   2. _on_panel_create_note_request(ctx) — return a payload Dictionary that
+#      becomes a Note attached to the chat. Without this hook, the platform
+#      falls back to a generic main-viewport screenshot crop. Override it so
+#      the LLM gets a CAD-specific image (Cad_AnnotationHost render of the
+#      currently active view) plus a one-line geometry summary in the title.
+# Architecture reference: hint minerva/plugins/plugin_scene_inject_hooks.
+
+## Tracks whether the user has the inject toggle on. Currently unused beyond
+## logging — the visible behavior comes from _on_panel_create_note_request,
+## which is invoked separately by Editor.gd in the same toggle-on path.
+var _inject_enabled: bool = false
+
+
+func _on_panel_inject_toggle_changed(enabled: bool) -> void:
+	_inject_enabled = enabled
+	push_warning("[CADPanel] inject toggle %s" % ("on" if enabled else "off"))
+
+
+## Build a richer Note payload than the platform fallback. Returns a Dictionary
+## whose shape matches Editor.gd:_build_note_from_plugin_payload — "image" kind
+## because vision models can consume it directly, with the geometry summary
+## embedded in the title so non-vision models still get useful context.
+func _on_panel_create_note_request(ctx: Dictionary) -> Variant:
+	# Defensive: only emit a CAD-specific note while the inject toggle is on.
+	# Editor.gd currently fires create_note only on toggle-ON, but if that ever
+	# changes (e.g. periodic re-injection) we'd otherwise leak stale snapshots.
+	if not _inject_enabled:
+		return null
+	if _annotation_host == null or not _annotation_host.has_method("render_view_to_image"):
+		return null  # Let platform fall back to its generic screenshot.
+	var view_id: String = _active_viewport_id
+	var img: Image = _annotation_host.call("render_view_to_image", view_id, Rect2()) as Image
+	if img == null:
+		return null  # Cold-start; platform fallback will try its own capture.
+	var title: String = str(ctx.get("tab_title", "CAD"))
+	var verts: int = 0
+	var faces: int = 0
+	if _annotation_host.has_method("get_mesh_data"):
+		var mesh_v: Variant = _annotation_host.call("get_mesh_data")
+		if mesh_v is Dictionary:
+			var mesh: Dictionary = mesh_v
+			# Tolerate Array | PackedVector3Array | PackedInt32Array — the
+			# evaluator builds plain Arrays today but worker bridges have
+			# returned packed arrays in the past. .size() works on all three;
+			# the unsafe `as Array` cast would null on packed types and crash.
+			var vs: Variant = mesh.get("vertices", [])
+			var fs: Variant = mesh.get("faces", [])
+			if vs != null and vs.has_method("size"):
+				verts = vs.size()
+			if fs != null and fs.has_method("size"):
+				faces = fs.size()
+	var edges: int = _edge_registry.size() if _edge_registry != null else 0
+	var summary: String = " · %s · %d V / %d F / %d E" % [view_id, verts, faces, edges]
+	return {
+		"kind": "image",
+		"title": title + summary,
+		"image": img,
+	}
+
+
 
