@@ -32,6 +32,9 @@ extends AnnotationKind
 ## Authoring tool — loaded lazily so the tool script can itself preload base classes.
 const _CadEdgeNumberToolScript: Script = preload("../tools/cad_edge_number_tool.gd")
 
+## Per-frame screen-space spread layout, shared across render() calls.
+const _LayoutHelper: Script = preload("./cad_edge_label_layout.gd")
+
 # Visual constants — leader+box callout.
 const _BOX_FILL := Color(0.08, 0.09, 0.11, 0.94)
 const _BOX_STROKE := Color(0.55, 0.60, 0.68, 0.90)
@@ -147,7 +150,17 @@ func render(ctx: AnnotationRenderContext, annotation: Dictionary) -> void:
 
 		var rect: Rect2 = (pane as Dictionary).get("viewport_rect", Rect2())
 		var leader_start: Vector2 = camera.unproject_position(leader_start_world) + rect.position
+
+		# Ask the layout helper for a per-frame, per-pane non-overlapping
+		# screen position. Falls back to the legacy box_offset back-projection
+		# when the helper has no entry for this edge_id (e.g. anchor failed
+		# upstream or annotation list is being rebuilt).
 		var leader_end: Vector2 = camera.unproject_position(leader_end_world) + rect.position
+		if host.has_method("get_annotations"):
+			var all_anns: Array = host.get_annotations()
+			var layout: Dictionary = _LayoutHelper.get_layout(host, camera, rect, all_anns)
+			if layout.has(edge_id):
+				leader_end = layout[edge_id]
 		_draw_leader_and_box(ctx, leader_start, leader_end, edge_id, text, is_stale)
 
 
