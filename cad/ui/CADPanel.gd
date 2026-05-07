@@ -386,6 +386,44 @@ func _on_panel_save_request() -> Dictionary:
 	}
 
 
+## Synchronous-apply hook: replaces the current source with `document.source`,
+## cancels any in-flight evaluate, skips the text_changed debounce, awaits the
+## worker's reply, and returns the resulting last_eval to the caller.
+##
+## Used by minerva_doc_write so the agent gets eval status (ok / error /
+## timeout / cancelled) in the tool reply instead of polling. Mirrors
+## _on_panel_load_request's `source` shape on input.
+##
+## Returns {ok: bool, last_eval: Dictionary}. ok mirrors last_eval.status == "ok".
+func _on_panel_apply_sync(document: Dictionary) -> Dictionary:
+	var src: String = str(document.get("source", ""))
+	_pending_dsl_text = src
+	if _annotation_host != null and _annotation_host.has_method("set_document_source"):
+		_annotation_host.set_document_source(_buffer_path, src)
+
+	# Cancel any in-flight + skip debounce. The MCP caller wants a tight
+	# request → response round-trip, not a debounced eval that may collide
+	# with their next call.
+	_cancel_inflight_eval_if_any()
+	if _eval_debounce_timer != null:
+		_eval_debounce_timer.stop()
+
+	if src.strip_edges().is_empty():
+		_last_eval_result = {
+			"status": "empty",
+			"ts": Time.get_unix_time_from_system(),
+		}
+		return {"ok": true, "last_eval": _last_eval_result.duplicate(true)}
+
+	var rid: String = "eval_sync_%d" % Time.get_ticks_usec()
+	await _evaluate_and_render(src, rid)
+	var status: String = str(_last_eval_result.get("status", ""))
+	return {
+		"ok": status == "ok",
+		"last_eval": _last_eval_result.duplicate(true),
+	}
+
+
 func _on_panel_load_request(document: Dictionary) -> void:
 	# Two load shapes are accepted:
 	#  1. {source: "<DSL text>"} — in-memory DSL, used for anonymous editors
