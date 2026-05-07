@@ -164,12 +164,22 @@ func render(ctx: AnnotationRenderContext, annotation: Dictionary) -> void:
 		_draw_leader_and_box(ctx, leader_start, leader_end, edge_id, text, is_stale)
 
 
-func bounds(_annotation: Dictionary) -> Rect2:
-	# Live-resolved anchor → bounds are not knowable at annotation-store time.
-	# Substrate consumers fall back to other fields (summary, anchored_to).
-	# Drag-time hit-testing uses the kind's own hit_test override below, which
-	# resolves through the host's perspective camera + layout cache.
-	return Rect2()
+func bounds(annotation: Dictionary) -> Rect2:
+	# Returns the on-screen rect of the LABEL BOX (not the leader anchor) in
+	# panel-root coordinates. Resolved live via the perspective pane + layout
+	# helper, same path render() uses. Returns Rect2() (zero size at origin)
+	# only when the annotation can't be projected (no perspective pane,
+	# anchor doesn't resolve, host not registered).
+	#
+	# Used by:
+	#   - AnnotationTransformTool to position its 9 gizmo zones (center,
+	#     corners, edges, rotate handles) — without this returning the actual
+	#     box rect the gizmo collapsed to (0,0) and clicks anywhere "outside"
+	#     it dispatched random scale/rotate ratios.
+	#   - Substrate fallback consumers (summary, anchored_to lookup) — those
+	#     accept Rect2() gracefully so the zero-size return for unprojectable
+	#     annotations is still safe.
+	return _resolve_box_rect_screen(annotation)
 
 
 ## Return the v2 cad/edge anchor for an annotation. Older agent-authored edge
@@ -211,11 +221,26 @@ func hit_test(annotation: Dictionary, point: Vector2, threshold: float) -> bool:
 ## Apply a screen-space transform to the label's text-box position. Sets
 ## payload.user_placed=true so the auto-spread layout treats this box as a
 ## fixed obstacle (other labels move around it; this one stays put).
+##
+## Op filter: scale and rotate are no-ops for this kind. The substrate's
+## AnnotationTransformTool dispatches all 9 zone types (translate, scale,
+## axis-scale, rotate) but only translate is meaningful for a fixed-size
+## edge callout — scaling would just stretch the text box, rotating would
+## tilt the text. Returning the annotation unchanged for non-translate ops
+## means the user can grab a scale/rotate handle harmlessly without the
+## label moving in unrecoverable ways.
 func transform_annotation(
 		annotation: Dictionary,
 		transform: Transform2D,
-		_operation: String = ""
+		operation: String = ""
 ) -> Dictionary:
+	# Empty operation == legacy translate path (AnnotationTranslateTool, plus
+	# any caller that doesn't pass an operation tag). Accept those alongside
+	# the explicit "translate" tag emitted by AnnotationTransformTool's
+	# Zone.INSIDE branch.
+	if operation != "" and operation != "translate":
+		return annotation.duplicate(true)
+
 	var ctx := _resolve_perspective_ctx_for_annotation(annotation)
 	if ctx.is_empty():
 		# No perspective camera + anchor available — leave annotation untouched.
