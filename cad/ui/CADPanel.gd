@@ -401,19 +401,42 @@ func _on_panel_apply_sync(document: Dictionary) -> Dictionary:
 	if _annotation_host != null and _annotation_host.has_method("set_document_source"):
 		_annotation_host.set_document_source(_buffer_path, src)
 
-	# Cancel any in-flight + skip debounce. The MCP caller wants a tight
-	# request → response round-trip, not a debounced eval that may collide
-	# with their next call.
-	_cancel_inflight_eval_if_any()
-	if _eval_debounce_timer != null:
-		_eval_debounce_timer.stop()
-
 	if src.strip_edges().is_empty():
 		_last_eval_result = {
 			"status": "empty",
 			"ts": Time.get_unix_time_from_system(),
 		}
 		return {"ok": true, "last_eval": _last_eval_result.duplicate(true)}
+
+	# Race guard: when minerva_create_plugin_editor mounts a fresh paired_dsl
+	# panel and the agent's first minerva_doc_write fires immediately after,
+	# _MinervaIPC may not be queryable yet — the helper is attached as a
+	# child of the panel root during broker.register_panel, but tree-mount
+	# timing inside Editor.create_plugin_scene → instantiate_into can leave
+	# get_node_or_null returning null on the very next request. Wait one
+	# process frame and re-check; if still missing, fall back to the
+	# debounce-driven async eval rather than failing the agent's call.
+	if get_node_or_null("_MinervaIPC") == null:
+		await get_tree().process_frame
+	if get_node_or_null("_MinervaIPC") == null:
+		# Helper still not reachable — let the existing text_changed → debounce
+		# path carry this eval (the buffer.apply_edit upstream of this call has
+		# already fired text_changed, which started the debounce timer). Surface
+		# "pending" so the agent knows to verify via doc_read once the worker
+		# replies. Don't cancel the in-flight or stop the debounce here — those
+		# are exactly the things we want to leave running.
+		_last_eval_result = {
+			"status": "pending",
+			"ts": Time.get_unix_time_from_system(),
+		}
+		return {"ok": true, "last_eval": _last_eval_result.duplicate(true)}
+
+	# Helper is ready — synchronous eval as originally intended. Cancel any
+	# in-flight + skip the debounce so the MCP caller gets a tight request →
+	# response round-trip without a competing debounced eval landing late.
+	_cancel_inflight_eval_if_any()
+	if _eval_debounce_timer != null:
+		_eval_debounce_timer.stop()
 
 	var rid: String = "eval_sync_%d" % Time.get_ticks_usec()
 	await _evaluate_and_render(src, rid)
