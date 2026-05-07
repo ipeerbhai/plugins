@@ -101,7 +101,7 @@ static func get_layout(
 		var ann_d: Dictionary = ann as Dictionary
 		if str(ann_d.get("kind", "")) != "cad_edge_number":
 			continue
-		var anchor: Variant = ann_d.get("anchor", null)
+		var anchor: Variant = _anchor_for_annotation(ann_d)
 		if not (anchor is Dictionary):
 			continue
 		if not host.has_method("_resolve_edge_anchor"):
@@ -112,7 +112,7 @@ static func get_layout(
 		var resolved_d: Dictionary = resolved as Dictionary
 
 		var leader_start_world: Vector3 = resolved_d.get("position", Vector3.ZERO)
-		var edge_id: int = int(resolved_d.get("edge_id", anchor.get("id", -1)))
+		var edge_id: int = int(resolved_d.get("edge_id", (anchor as Dictionary).get("id", -1)))
 		if edge_id < 0:
 			continue
 
@@ -207,3 +207,17 @@ static func _vec3_from_payload(raw: Variant) -> Vector3:
 			float((raw as Array)[2]),
 		)
 	return Vector3.ZERO
+
+
+static func _anchor_for_annotation(annotation: Dictionary) -> Variant:
+	var anchor: Variant = annotation.get("anchor", null)
+	if anchor is Dictionary:
+		return anchor
+	var payload_v: Variant = annotation.get("payload", {})
+	if payload_v is Dictionary and (payload_v as Dictionary).has("edge_id"):
+		return {
+			"plugin": "cad",
+			"type": "edge",
+			"id": int((payload_v as Dictionary).get("edge_id", -1)),
+		}
+	return null

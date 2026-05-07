@@ -71,9 +71,6 @@ func on_activate(host: AnnotationHost) -> void:
 	var anchor: Dictionary = host.get_current_selection_anchor("cad/edge")
 	if anchor.is_empty():
 		return
-	var camera: Camera3D = _find_perspective_camera(host)
-	if camera == null:
-		return
 	# Resolve to edge midpoint so we can compute a screen-relative offset.
 	if not host.has_method("_resolve_edge_anchor"):
 		return
@@ -81,7 +78,10 @@ func on_activate(host: AnnotationHost) -> void:
 	if not (resolved is Dictionary):
 		return
 	var edge_world: Vector3 = (resolved as Dictionary).get("position", Vector3.ZERO)
-	var box_offset: Vector3 = _compute_default_box_offset(camera, edge_world)
+	var camera: Camera3D = _find_perspective_camera(host)
+	var box_offset: Vector3 = (
+		_compute_default_box_offset(camera, edge_world) if camera != null else Vector3.ZERO
+	)
 	var annotation := _build_annotation(int(anchor.get("id", -1)), box_offset)
 	_open_text_dialog(annotation)
 

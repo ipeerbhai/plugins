@@ -112,7 +112,7 @@ func render(ctx: AnnotationRenderContext, annotation: Dictionary) -> void:
 	if not host.has_method("get_panes"):
 		return
 
-	var anchor: Variant = annotation.get("anchor", null)
+	var anchor: Variant = _anchor_for_annotation(annotation)
 	if not (anchor is Dictionary):
 		return
 
@@ -129,11 +129,11 @@ func render(ctx: AnnotationRenderContext, annotation: Dictionary) -> void:
 	var resolved_d: Dictionary = resolved as Dictionary
 
 	var leader_start_world: Vector3 = resolved_d.get("position", Vector3.ZERO)
-	var edge_id: int = int(resolved_d.get("edge_id", anchor.get("id", -1)))
+	var edge_id: int = int(resolved_d.get("edge_id", (anchor as Dictionary).get("id", -1)))
 	var is_stale: bool = bool(resolved_d.get("stale", false))
 
 	var payload: Dictionary = annotation.get("payload", {})
-	var text: String = str(payload.get("text", ""))
+	var text: String = str(payload.get("text", payload.get("label", "")))
 	var box_offset := _vec3_from_payload(payload.get("box_offset", [0.0, 0.0, 0.0]))
 	var leader_end_world: Vector3 = leader_start_world + box_offset
 
@@ -170,6 +170,23 @@ func bounds(_annotation: Dictionary) -> Rect2:
 	# Drag-time hit-testing uses the kind's own hit_test override below, which
 	# resolves through the host's perspective camera + layout cache.
 	return Rect2()
+
+
+## Return the v2 cad/edge anchor for an annotation. Older agent-authored edge
+## labels used payload.edge_id without an anchor; keep that shape renderable so
+## live sessions created before the v2 migration do not silently disappear.
+static func _anchor_for_annotation(annotation: Dictionary) -> Variant:
+	var anchor: Variant = annotation.get("anchor", null)
+	if anchor is Dictionary:
+		return anchor
+	var payload_v: Variant = annotation.get("payload", {})
+	if payload_v is Dictionary and (payload_v as Dictionary).has("edge_id"):
+		return {
+			"plugin": "cad",
+			"type": "edge",
+			"id": int((payload_v as Dictionary).get("edge_id", -1)),
+		}
+	return null
 
 
 # ── Drag-to-move (substrate AnnotationTranslateTool) ──────────────────────────
@@ -250,7 +267,7 @@ func _resolve_box_rect_screen(annotation: Dictionary) -> Rect2:
 ##
 ## Returned keys: camera, viewport_rect, anchor_world, anchor_screen, box_screen.
 func _resolve_perspective_ctx_for_annotation(annotation: Dictionary) -> Dictionary:
-	var anchor: Variant = annotation.get("anchor", null)
+	var anchor: Variant = _anchor_for_annotation(annotation)
 	if not (anchor is Dictionary):
 		return {}
 	# We need an AnnotationRenderContext-like host reference, but transform_/hit_
