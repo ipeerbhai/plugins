@@ -35,6 +35,33 @@ const _CadEdgeNumberToolScript: Script = preload("../tools/cad_edge_number_tool.
 ## Per-frame screen-space spread layout, shared across render() calls.
 const _LayoutHelper: Script = preload("./cad_edge_label_layout.gd")
 
+## Drag-stable start position cache for un-placed labels.
+##
+## Why this exists: AnnotationTransformTool passes the immutable
+## _drag_start_annotation to transform_annotation each frame, but
+## transform.origin is the CUMULATIVE delta from drag-start. So we need
+## start_box_screen to be stable across all transform_annotation calls
+## within a drag — otherwise the cumulative delta is added to a position
+## that has already been mutated by previous frames in the same drag,
+## compounding the motion ("label flies off, cursor lags far behind").
+##
+## The layout helper would normally provide start_box_screen, but it
+## iterates host.get_annotations() which returns the LIVE list — by the
+## second frame of a drag the live annotation has user_placed=true and a
+## moved box_offset, so the helper returns the moved position rather than
+## the original.
+##
+## Fix: cache by [ann_id, start_box_offset, camera_basis, camera_origin,
+## viewport_rect]. Cache key is stable across a drag (start payload is
+## immutable per substrate contract) and invalidates if the camera/viewport
+## changes. Stale entries are tiny — leaving them is harmless.
+##
+## Used ONLY for un-placed labels in _resolve_perspective_ctx_for_annotation.
+## Once a label becomes user_placed=true (after first drag completes), the
+## user_placed branch back-projects payload.box_offset directly and the
+## cache is bypassed.
+static var _drag_start_box_screen_cache: Dictionary = {}
+
 # Visual constants — leader+box callout.
 const _BOX_FILL := Color(0.08, 0.09, 0.11, 0.94)
 const _BOX_STROKE := Color(0.55, 0.60, 0.68, 0.90)
@@ -329,6 +356,10 @@ func _resolve_perspective_ctx_for_annotation(annotation: Dictionary) -> Dictiona
 		# Determine current box screen position. user_placed labels: use
 		# payload.box_offset directly (back-projected). Otherwise: ask the
 		# layout helper, which is the source of truth for auto-spread.
+		# Un-placed branch additionally caches the result keyed by start
+		# state + camera so subsequent transform_annotation calls within a
+		# drag see the same start_box_screen (see _drag_start_box_screen_cache
+		# header for the substrate contract that makes this necessary).
 		var payload: Dictionary = annotation.get("payload", {}) as Dictionary
 		var user_placed: bool = bool(payload.get("user_placed", false))
 		var box_screen: Vector2
@@ -336,13 +367,27 @@ func _resolve_perspective_ctx_for_annotation(annotation: Dictionary) -> Dictiona
 			var box_offset := _vec3_from_payload(payload.get("box_offset", [0.0, 0.0, 0.0]))
 			box_screen = cam3.unproject_position(anchor_world + box_offset) + rect.position
 		else:
-			var all_anns: Array = host.get_annotations() if host.has_method("get_annotations") else []
-			var layout: Dictionary = _LayoutHelper.get_layout(host, cam3, rect, all_anns)
-			if layout.has(edge_id):
-				box_screen = layout[edge_id]
+			var ann_id_str: String = str(annotation.get("id", ""))
+			var start_offset_arr: Array = payload.get("box_offset", [0.0, 0.0, 0.0])
+			var cache_key: Array = [
+				ann_id_str,
+				start_offset_arr,
+				cam3.global_transform.basis,
+				cam3.global_transform.origin,
+				rect,
+			]
+			if ann_id_str != "" and _drag_start_box_screen_cache.has(cache_key):
+				box_screen = _drag_start_box_screen_cache[cache_key]
 			else:
-				var box_offset2 := _vec3_from_payload(payload.get("box_offset", [0.0, 0.0, 0.0]))
-				box_screen = cam3.unproject_position(anchor_world + box_offset2) + rect.position
+				var all_anns: Array = host.get_annotations() if host.has_method("get_annotations") else []
+				var layout: Dictionary = _LayoutHelper.get_layout(host, cam3, rect, all_anns)
+				if layout.has(edge_id):
+					box_screen = layout[edge_id]
+				else:
+					var box_offset2 := _vec3_from_payload(start_offset_arr)
+					box_screen = cam3.unproject_position(anchor_world + box_offset2) + rect.position
+				if ann_id_str != "":
+					_drag_start_box_screen_cache[cache_key] = box_screen
 
 		return {
 			"camera": cam3,
