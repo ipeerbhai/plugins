@@ -353,11 +353,36 @@ func _on_eval_debounce_timeout() -> void:
 # ── Save/load contract (overrides MinervaPluginPanel virtuals) ──────────────
 
 func _on_panel_save_request() -> Dictionary:
+	# Include the current DSL source so doc_read on an open editor (whether
+	# anonymous or path-bound) returns useful content. _pending_dsl_text is the
+	# panel's authoritative source — kept in sync by attach_buffer / text_changed
+	# (path-bound) and by _on_panel_load_request's `source` branch (anonymous).
 	# TODO(later): include annotations + camera states.
-	return {"version": 1}
+	return {"version": 1, "source": _pending_dsl_text}
 
 
 func _on_panel_load_request(document: Dictionary) -> void:
+	# Two load shapes are accepted:
+	#  1. {source: "<DSL text>"} — in-memory DSL, used for anonymous editors
+	#     created via minerva_create_plugin_editor + minerva_doc_write. No disk
+	#     read; the panel just evaluates the supplied text.
+	#  2. {file_path: "<absolute path>"} — disk-backed .mcad file (the host
+	#     dispatches this when an .mcad is opened via File → Open).
+	#
+	# When BOTH are present, `source` wins (caller is forcing a new in-memory
+	# version on top of a path-bound editor; tab will dirty until Save-As).
+	if document.has("source"):
+		var src: String = str(document.get("source", ""))
+		_pending_dsl_text = src
+		# No file path yet for anonymous editors; pass empty so MCP introspection
+		# knows the source is unbacked. set_document_source still wires up the
+		# panel's source-of-truth for annotations etc.
+		if _annotation_host != null and _annotation_host.has_method("set_document_source"):
+			_annotation_host.set_document_source(_buffer_path, src)
+		if not src.strip_edges().is_empty():
+			_evaluate_with_request_id(src)
+		return
+
 	# Round 3: live `.mcad` → CAD panel pipeline. The host loads the file path
 	# from the editor; we read the DSL text off disk and round-trip it through
 	# the worker's `evaluate` method. The reply carries {shape_name, mesh, edges}
@@ -381,6 +406,7 @@ func _on_panel_load_request(document: Dictionary) -> void:
 	if _annotation_host != null and _annotation_host.has_method("set_document_source"):
 		_annotation_host.set_document_source(file_path, dsl_text)
 
+	_pending_dsl_text = dsl_text
 	_evaluate_and_render(dsl_text)
 
 
