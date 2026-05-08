@@ -1167,7 +1167,15 @@ class Translator:
             raise TranslatorError(f"Unknown command: {node.name}")
 
     def _cmd_fillet(self, node: Command) -> None:
-        """``fillet shape, edge_num, r=radius``"""
+        """``fillet shape, edge_num, r=radius`` or ``fillet shape, [n1, n2, ...], r=radius``.
+
+        The list form resolves all edge numbers against the CURRENT (pre-fillet)
+        registry and applies build123d's iterable fillet in a single OCCT
+        operation. This is the only correct way to fillet multiple edges in
+        one DSL run — sequential single-edge ``fillet`` statements do NOT
+        compose, because each fillet rebuilds OCCT's topology and reassigns
+        edge IDs.
+        """
         if len(node.args) < 2:
             raise TranslatorError(
                 "fillet requires at least 2 arguments (shape, edge_num)"
@@ -1187,13 +1195,14 @@ class Translator:
         if shape is None:
             raise TranslatorError(f"Undefined variable: {shape_name}")
 
-        edge_num = int(self._eval_expr(edge_num_node))
+        targets = self._resolve_edge_targets(
+            shape, shape_name, edge_num_node, "fillet"
+        )
         radius = self._eval_expr(radius_node)
 
-        target_edge = self._find_edge_by_number(shape, shape_name, edge_num)
-
-        # Apply fillet -- updates the shape in-place in the env
-        result = bd_fillet(target_edge, radius=radius)
+        # build123d.fillet accepts a single Edge or an iterable of Edges. Pass
+        # the iterable form even for a one-element list — OCCT will handle it.
+        result = bd_fillet(targets, radius=radius)
         self._bind_value(shape_name, result)
         # Topology changed; refresh registry with a fresh 1..N enumeration.
         # Extruded shapes keep their richer plane-based registry — generic
@@ -1202,7 +1211,11 @@ class Translator:
         self._refresh_registry_after_topology_change(shape_name, result)
 
     def _cmd_chamfer(self, node: Command) -> None:
-        """``chamfer shape, edge_num, d=distance``"""
+        """``chamfer shape, edge_num, d=distance`` or ``chamfer shape, [n1, n2, ...], d=distance``.
+
+        See _cmd_fillet for the list-form rationale. Sequential single-edge
+        chamfer calls don't compose either.
+        """
         if len(node.args) < 2:
             raise TranslatorError(
                 "chamfer requires at least 2 arguments (shape, edge_num)"
@@ -1222,16 +1235,52 @@ class Translator:
         if shape is None:
             raise TranslatorError(f"Undefined variable: {shape_name}")
 
-        edge_num = int(self._eval_expr(edge_num_node))
+        targets = self._resolve_edge_targets(
+            shape, shape_name, edge_num_node, "chamfer"
+        )
         distance = self._eval_expr(distance_node)
 
-        target_edge = self._find_edge_by_number(shape, shape_name, edge_num)
-
-        result = bd_chamfer(target_edge, length=distance)
+        result = bd_chamfer(targets, length=distance)
         self._bind_value(shape_name, result)
         # Topology changed; refresh registry with a fresh 1..N enumeration.
         # See _cmd_fillet for why extruded registries are preserved.
         self._refresh_registry_after_topology_change(shape_name, result)
+
+    def _resolve_edge_targets(
+        self, shape: Any, shape_name: str, edge_num_node: Any, op_label: str
+    ) -> list:
+        """Evaluate *edge_num_node* into a list of OCCT edge objects.
+
+        Accepts either a single int (legacy form) or a list literal of ints
+        (batch form). For the batch form, every id is resolved against the
+        CURRENT registry — no intermediate fillet/chamfer happens between
+        resolutions, so the IDs are stable.
+
+        Empty list → TranslatorError. Non-int / non-list-of-int → TranslatorError.
+        """
+        value = self._eval_expr(edge_num_node)
+
+        if isinstance(value, (list, tuple)):
+            if len(value) == 0:
+                raise TranslatorError(
+                    f"{op_label} edge list is empty — pass at least one edge id"
+                )
+            edges: list = []
+            for item in value:
+                if isinstance(item, bool) or not isinstance(item, (int, float)):
+                    raise TranslatorError(
+                        f"{op_label} edge list must contain integers; "
+                        f"got {type(item).__name__}"
+                    )
+                edges.append(self._find_edge_by_number(shape, shape_name, int(item)))
+            return edges
+
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TranslatorError(
+                f"{op_label} edge_num must be an integer or list of integers; "
+                f"got {type(value).__name__}"
+            )
+        return [self._find_edge_by_number(shape, shape_name, int(value))]
 
     def _cmd_shell(self, node: Command) -> None:
         """``shell shape, 1.5`` or ``shell shape, t=1.5``.

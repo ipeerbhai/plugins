@@ -1295,6 +1295,115 @@ class TestFilletChamferOnCube:
         assert len(registry) > 0
 
 
+class TestBatchFilletChamfer:
+    """Task: list-form fillet/chamfer applies all edges in one OCCT op so
+    sequential single-edge operations don't shuffle IDs underneath the agent.
+    """
+
+    def test_fillet_list_form_one_edge_succeeds(self):
+        # List form with a single id should produce the same result as the
+        # legacy scalar form — covers the [1] degenerate case.
+        source = (
+            "part = cube(10, center=true)\n"
+            "fillet part, [1], r=1\n"
+        )
+        t = _translate(source)
+        part = t.env["part"]
+        assert part.volume > 0
+
+    def test_fillet_list_form_four_edges_succeeds(self):
+        # Motivating case: fillet 4 edges in one op. A plain cube has 12
+        # edges total — pick 4 of them. The whole point of the batch form
+        # is that all 4 IDs resolve against the same pre-fillet registry,
+        # so we can count on 1, 4, 7, 10 all being valid.
+        source = (
+            "part = cube(25, 25, 12)\n"
+            "fillet part, [1, 4, 7, 10], r=2\n"
+        )
+        t = _translate(source)
+        part = t.env["part"]
+        assert part.volume > 0
+        # Volume should drop relative to the unfilleted cube by material
+        # removed at the rounded corners. Sanity: less than 25*25*12 = 7500.
+        assert part.volume < 25 * 25 * 12
+
+    def test_chamfer_list_form_succeeds(self):
+        source = (
+            "part = cube(10, center=true)\n"
+            "chamfer part, [1, 2], d=0.5\n"
+        )
+        t = _translate(source)
+        part = t.env["part"]
+        assert part.volume > 0
+
+    def test_fillet_list_form_empty_raises(self):
+        source = (
+            "part = cube(10, center=true)\n"
+            "fillet part, [], r=1\n"
+        )
+        with pytest.raises(TranslatorError, match="empty"):
+            _translate(source)
+
+    def test_fillet_list_form_non_int_raises(self):
+        source = (
+            "part = cube(10, center=true)\n"
+            "fillet part, [1, \"two\"], r=1\n"
+        )
+        with pytest.raises(TranslatorError, match="integers"):
+            _translate(source)
+
+    def test_fillet_list_form_unknown_id_raises(self):
+        # 999 is well past the cube's edge count; must surface as a clean error
+        # rather than a silent miss.
+        source = (
+            "part = cube(10, center=true)\n"
+            "fillet part, [1, 999], r=1\n"
+        )
+        with pytest.raises(TranslatorError):
+            _translate(source)
+
+    def test_batch_fillet_completes_when_serial_would_lose_ids(self):
+        """The user-visible bug: a serial sequence of single-edge fillets
+        re-numbers the registry between calls, so later IDs reference edges
+        that didn't exist when the agent picked them. The batch form
+        resolves all IDs from the pre-fillet registry in one shot.
+
+        Test setup mirrors the user's reproducer: fillet four edges of a
+        flat-ish box. The serial path is expected to either fail
+        mid-sequence (out-of-range) or land on the wrong edges; the batch
+        path always completes cleanly.
+        """
+        batch_source = (
+            "part = cube(25, 25, 12)\n"
+            "fillet part, [1, 4, 7, 10], r=2\n"
+        )
+        t_batch = _translate(batch_source)
+        batch_part = t_batch.env["part"]
+        assert batch_part.volume > 0
+        assert batch_part.volume < 25 * 25 * 12
+
+        # Sanity: a serial fillet sequence using the SAME starting IDs is
+        # not guaranteed to succeed (edge 10 may not exist after fillets
+        # 1, 4, 7 reshape the topology). We don't assert success or
+        # failure — we just assert that the batch path is robust where the
+        # serial path is fragile.
+        serial_source = (
+            "part = cube(25, 25, 12)\n"
+            "fillet part, 1, r=2\n"
+            "fillet part, 4, r=2\n"
+            "fillet part, 7, r=2\n"
+            "fillet part, 10, r=2\n"
+        )
+        try:
+            _translate(serial_source)
+        except (TranslatorError, ValueError):
+            # Expected on this geometry: at least one ID drops out of range
+            # (TranslatorError) OR build123d rejects an unexpected fillet
+            # geometry (ValueError) after intermediate topology changes.
+            # Batch form is the fix in both failure modes.
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Regression: edge IDs must survive boolean subtract (bug 019d99fa4520)
 # ---------------------------------------------------------------------------
