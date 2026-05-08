@@ -114,6 +114,14 @@ func handle_pointer_input(event: InputEvent) -> bool:
 # Camera placement
 # -------------------------------------------------------------------------
 
+## Z-up convention everywhere. Matches build123d / OCCT / FreeCAD / SolidWorks
+## native authoring frame so cylinder-axis-along-Z primitives display "top up"
+## without any mesh rotation. The MCAD T-beam example (sketch on XY, extrude
+## along Z) ends up with its length vertical in this view — that's the build123d
+## sketch convention being explicit, not a bug.
+const _Z_UP: Vector3 = Vector3(0, 0, 1)
+
+
 func _apply_transform() -> void:
 	if _view_preset != "Perspective":
 		_apply_orthographic_transform()
@@ -123,45 +131,54 @@ func _apply_transform() -> void:
 	var yaw_rad   := deg_to_rad(_yaw)
 	var pitch_rad := deg_to_rad(_pitch)
 
-	# Spherical to Cartesian (Y-up)
+	# Spherical → Cartesian, Z-up. pitch=0 → camera lies in the XY plane;
+	# pitch=+90 → directly above (+Z); pitch=-90 → directly below (-Z).
+	# yaw rotates around Z. yaw=0 puts the camera along +X.
 	var offset := Vector3(
+		_distance * cos(pitch_rad) * cos(yaw_rad),
 		_distance * cos(pitch_rad) * sin(yaw_rad),
-		_distance * sin(pitch_rad),
-		_distance * cos(pitch_rad) * cos(yaw_rad)
+		_distance * sin(pitch_rad)
 	)
 
 	position = _target + offset
-	look_at(_target, Vector3.UP)
+	look_at(_target, _Z_UP)
 
 
 func _apply_orthographic_transform() -> void:
 	projection = Camera3D.PROJECTION_ORTHOGONAL
 	size = max(_distance * ORTHO_SIZE_FACTOR, 20.0)
 
-	var direction := Vector3(0, 0, 1)
-	var up := Vector3.UP
+	# Defaults — overwritten by the match below.
+	var direction := Vector3(1, 0, 0)
+	var up := _Z_UP
 
 	match _view_preset:
 		"Top":
-			# Camera sits above the origin looking down (-Y). Up = +Z so the
-			# horizontal axis reads left/right as expected in a plan view.
-			direction = Vector3(0, 1, 0)
-			up = Vector3(0, 0, 1)
-		"Bottom":
-			direction = Vector3(0, -1, 0)
-			up = Vector3(0, 0, 1)
-		"Front":
+			# Plan view: look down -Z onto the XY plane. X right, Y up on screen.
 			direction = Vector3(0, 0, 1)
-			up = Vector3.UP
-		"Back":
+			up = Vector3(0, 1, 0)
+		"Bottom":
+			# Look up from below; same screen-up as Top so the X axis stays
+			# stable in 2D plan views (Bottom appears mirrored vs Top, which
+			# is the standard third-angle projection convention).
 			direction = Vector3(0, 0, -1)
-			up = Vector3.UP
+			up = Vector3(0, 1, 0)
+		"Front":
+			# Elevation: look at the +Y face (camera at -Y, looking +Y). X
+			# right, Z up on screen. (Build123d / third-angle convention puts
+			# Front at -Y looking toward +Y; flip if first-angle is preferred.)
+			direction = Vector3(0, -1, 0)
+			up = _Z_UP
+		"Back":
+			direction = Vector3(0, 1, 0)
+			up = _Z_UP
 		"Right":
+			# Side elevation: camera at +X, looking -X. Y right, Z up.
 			direction = Vector3(1, 0, 0)
-			up = Vector3.UP
+			up = _Z_UP
 		"Left":
 			direction = Vector3(-1, 0, 0)
-			up = Vector3.UP
+			up = _Z_UP
 
 	position = _target + direction * _distance
 	look_at(_target, up)
@@ -235,14 +252,17 @@ func _make_grid_mesh() -> ImmediateMesh:
 	var half  := 250
 	var step  := 25
 
+	# Floor lies in the XY plane (Z=0) — Z-up convention. In Y-up Godot the
+	# floor would be XZ; flipping here so the grid matches the build123d
+	# authoring frame and shows up as the "ground" in the side-elevation views.
 	mesh.surface_begin(Mesh.PRIMITIVE_LINES)
 	for i in range(-half, half + step, step):
-		# Lines parallel to Z
-		mesh.surface_add_vertex(Vector3(i, 0, -half))
-		mesh.surface_add_vertex(Vector3(i, 0,  half))
+		# Lines parallel to Y
+		mesh.surface_add_vertex(Vector3(i, -half, 0))
+		mesh.surface_add_vertex(Vector3(i,  half, 0))
 		# Lines parallel to X
-		mesh.surface_add_vertex(Vector3(-half, 0, i))
-		mesh.surface_add_vertex(Vector3( half, 0, i))
+		mesh.surface_add_vertex(Vector3(-half, i, 0))
+		mesh.surface_add_vertex(Vector3( half, i, 0))
 	mesh.surface_end()
 
 	return mesh
