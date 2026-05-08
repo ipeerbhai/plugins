@@ -84,9 +84,18 @@ def export_source(source: str, *, format: str, path: str) -> str:
     if export_format not in {"step", "stp", "stl", "3mf"}:
         raise ExportError(f"Unsupported export format: {format}")
 
-    requested_path = Path(path)
-    if str(requested_path).strip() == "":
+    if path.strip() == "":
         raise ExportError("Export request must include non-empty string field 'path'")
+
+    # Path resolution rules (must match the §8 skill prompt contract):
+    #   - absolute (``/foo``, ``C:\foo``) → used as-is
+    #   - ``~``-prefixed → expanded to the user's home directory
+    #   - bare relative (``test.stl``, ``temp/test.stl``) → resolved against home
+    # Without this, ``~/temp/test.stl`` is treated as a literal directory named
+    # ``~`` under the worker's CWD — file lands somewhere the user can't find.
+    requested_path = Path(path).expanduser()
+    if not requested_path.is_absolute():
+        requested_path = Path.home() / requested_path
     if requested_path.suffix == "":
         requested_path = requested_path.with_suffix("." + export_format)
 

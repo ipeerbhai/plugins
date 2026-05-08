@@ -548,6 +548,49 @@ class TestExport:
         # that build123d/OCCT does not start with that token.
         assert not head.startswith(b"solid "), "expected binary STL, got ASCII"
 
+    def test_tilde_path_is_expanded_to_home(self, tmp_path, monkeypatch):
+        """Regression: ``~``-prefixed paths must expand to the user's home,
+        not be treated as a literal directory under the worker's CWD.
+
+        Symptom of the bug: file lands at ``<worker CWD>/~/temp/test.stl``
+        (literal ~ directory) instead of ``$HOME/temp/test.stl``. Run with
+        a sandboxed HOME so we don't litter the real home directory.
+        """
+        if not self._build123d_available():
+            pytest.skip("build123d not installed")
+        sandbox_home = tmp_path / "sandbox_home"
+        sandbox_home.mkdir()
+        monkeypatch.setenv("HOME", str(sandbox_home))
+
+        resp = handle_request({"id": "r1", "method": "export", "params": {
+            "source": self._CUBE_SOURCE,
+            "format": "stl",
+            "path": "~/temp/test.stl",
+        }})
+        assert resp["ok"] is True, f"got error: {resp.get('error')}"
+        # Resolved path must point inside the sandboxed home, not contain ~.
+        resolved = resp["result"]["path"]
+        assert "~" not in resolved, f"tilde leaked through: {resolved}"
+        assert resolved == str(sandbox_home / "temp" / "test.stl")
+        assert (sandbox_home / "temp" / "test.stl").exists()
+
+    def test_bare_relative_path_resolves_to_home(self, tmp_path, monkeypatch):
+        """Regression: bare relative paths like ``out.stl`` must resolve
+        against the user's home, not the worker's CWD."""
+        if not self._build123d_available():
+            pytest.skip("build123d not installed")
+        sandbox_home = tmp_path / "sandbox_home"
+        sandbox_home.mkdir()
+        monkeypatch.setenv("HOME", str(sandbox_home))
+
+        resp = handle_request({"id": "r1", "method": "export", "params": {
+            "source": self._CUBE_SOURCE,
+            "format": "stl",
+            "path": "bare_relative.stl",
+        }})
+        assert resp["ok"] is True, f"got error: {resp.get('error')}"
+        assert (sandbox_home / "bare_relative.stl").exists()
+
     def test_translate_error_surfaces_translate_kind(self, tmp_path):
         if not self._build123d_available():
             pytest.skip("build123d not installed")
