@@ -131,8 +131,8 @@ func _process(_delta: float) -> void:
 	var xform := _camera.global_transform
 	var current_size := size
 	var camera_moved := xform != _last_camera_xform
-	var resized := current_size != _last_size
-	if camera_moved or resized:
+	var size_changed := current_size != _last_size
+	if camera_moved or size_changed:
 		_last_camera_xform = xform
 		_last_size = current_size
 		_projection_dirty = true

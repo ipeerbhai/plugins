@@ -645,7 +645,8 @@ func _evaluate_and_render(dsl_text: String, request_id: String = "") -> void:
 	_last_eval_result = {
 		"status": "ok",
 		"shape_name": str(eval_result.get("shape_name", "")),
-		"vertex_count": (mesh_data.get("vertices", []) as Array).size() / 3,
+		# Vertices arrive as a flat float array; 3 entries per vertex.
+		"vertex_count": int(float((mesh_data.get("vertices", []) as Array).size()) / 3.0),
 		"edge_count": edges.size(),
 		"request_id": request_id,
 		"ts": Time.get_unix_time_from_system(),
