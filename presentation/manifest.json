@@ -44,7 +44,7 @@
   ],
   "capabilities": ["host_owned_save"],
   "permissions": {
-    "host_capabilities": [],
+    "host_capabilities": ["host.documents.list_open"],
     "network": {
       "mode": "none"
     },
