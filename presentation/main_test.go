@@ -532,6 +532,190 @@ func TestToolRemoveSlide_RefusesLastSlide(t *testing.T) {
 	}
 }
 
+func TestToolAddSpreadsheetTile_DefaultsToEmptyGrid(t *testing.T) {
+	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"s1","tiles":[]}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path": deckPath, "slide_index": 0,
+		"x": 0.0, "y": 0.0, "w": 0.5, "h": 0.5,
+		"rows": 2, "cols": 3,
+	})
+	out := toolAddSpreadsheetTile(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	tile := readDeckFile(t, deckPath)["slides"].([]interface{})[0].(map[string]interface{})["tiles"].([]interface{})[0].(map[string]interface{})
+	if tile["kind"] != "spreadsheet" {
+		t.Errorf("expected kind=spreadsheet, got %v", tile["kind"])
+	}
+	cells := tile["cells"].([]interface{})
+	if len(cells) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(cells))
+	}
+	row0 := cells[0].([]interface{})
+	if len(row0) != 3 {
+		t.Fatalf("expected 3 cols, got %d", len(row0))
+	}
+	c00 := row0[0].(map[string]interface{})
+	if c00["value"] != "" || int(c00["type"].(float64)) != 0 {
+		t.Errorf("expected empty cell, got %v", c00)
+	}
+}
+
+func TestToolAddSpreadsheetTile_AcceptsCallerCells(t *testing.T) {
+	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"s1","tiles":[]}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path": deckPath, "slide_index": 0,
+		"x": 0.0, "y": 0.0, "w": 0.5, "h": 0.5,
+		"rows": 1, "cols": 2,
+		"cells": [][]interface{}{
+			{"hello", 42},
+		},
+	})
+	out := toolAddSpreadsheetTile(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	tile := readDeckFile(t, deckPath)["slides"].([]interface{})[0].(map[string]interface{})["tiles"].([]interface{})[0].(map[string]interface{})
+	row0 := tile["cells"].([]interface{})[0].([]interface{})
+	c0 := row0[0].(map[string]interface{})
+	c1 := row0[1].(map[string]interface{})
+	if c0["value"] != "hello" || int(c0["type"].(float64)) != 1 {
+		t.Errorf("auto-typed string: got %v", c0)
+	}
+	if c1["value"] != float64(42) || int(c1["type"].(float64)) != 2 {
+		t.Errorf("auto-typed number: got %v", c1)
+	}
+}
+
+func TestToolAddSpreadsheetTile_RowMismatch(t *testing.T) {
+	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"s1","tiles":[]}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path": deckPath, "slide_index": 0,
+		"x": 0.0, "y": 0.0, "w": 0.5, "h": 0.5,
+		"rows": 2, "cols": 2,
+		"cells": [][]interface{}{{"a", "b"}}, // 1 row, but rows=2
+	})
+	out := toolAddSpreadsheetTile(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected failure on row count mismatch, got %+v", out)
+	}
+}
+
+func TestToolModifySpreadsheetCells_PatchesAndSkips(t *testing.T) {
+	body := `{"version":1,"slides":[{"id":"s1","tiles":[
+		{"id":"t1","kind":"spreadsheet","rows":2,"cols":2,"cells":[
+			[{"value":"a","type":1},{"value":"b","type":1}],
+			[{"value":"c","type":1},{"value":"d","type":1}]
+		]}
+	]}]}`
+	deckPath := writeDeckFile(t, body)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path": deckPath, "slide_index": 0, "tile_id": "t1",
+		"cells": []map[string]interface{}{
+			{"row": 0, "col": 0, "value": "X", "type": 1},
+			{"row": 5, "col": 5, "value": "OOB"}, // out of bounds
+			{"row": 1, "col": 1, "bold": true},
+		},
+	})
+	out := toolModifySpreadsheetCells(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	if up, _ := out["cells_updated"].(int); up != 2 {
+		t.Errorf("expected cells_updated=2, got %v", out["cells_updated"])
+	}
+	skipped, _ := out["skipped"].([]interface{})
+	if len(skipped) != 1 {
+		t.Errorf("expected 1 skipped, got %v", out["skipped"])
+	}
+	cells := readDeckFile(t, deckPath)["slides"].([]interface{})[0].(map[string]interface{})["tiles"].([]interface{})[0].(map[string]interface{})["cells"].([]interface{})
+	c00 := cells[0].([]interface{})[0].(map[string]interface{})
+	if c00["value"] != "X" {
+		t.Errorf("expected (0,0).value=X, got %v", c00["value"])
+	}
+	c11 := cells[1].([]interface{})[1].(map[string]interface{})
+	if c11["bold"] != true {
+		t.Errorf("expected (1,1).bold=true, got %v", c11)
+	}
+}
+
+func TestToolResizeSpreadsheet_GrowAndShrink(t *testing.T) {
+	body := `{"version":1,"slides":[{"id":"s1","tiles":[
+		{"id":"t1","kind":"spreadsheet","rows":2,"cols":2,"cells":[
+			[{"value":"a","type":1},{"value":"b","type":1}],
+			[{"value":"c","type":1},{"value":"d","type":1}]
+		]}
+	]}]}`
+	deckPath := writeDeckFile(t, body)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	// grow to 3x3
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path": deckPath, "slide_index": 0, "tile_id": "t1",
+		"rows": 3, "cols": 3,
+	})
+	out := toolResizeSpreadsheet(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("grow: expected success, got %+v", out)
+	}
+	tile := readDeckFile(t, deckPath)["slides"].([]interface{})[0].(map[string]interface{})["tiles"].([]interface{})[0].(map[string]interface{})
+	if int(tile["rows"].(float64)) != 3 || int(tile["cols"].(float64)) != 3 {
+		t.Errorf("expected 3x3, got %vx%v", tile["rows"], tile["cols"])
+	}
+	cells := tile["cells"].([]interface{})
+	if cells[0].([]interface{})[0].(map[string]interface{})["value"] != "a" {
+		t.Errorf("preserve: expected (0,0)=a, got %v", cells[0])
+	}
+	if cells[2].([]interface{})[2].(map[string]interface{})["value"] != "" {
+		t.Errorf("new cell should be empty, got %v", cells[2])
+	}
+
+	// shrink to 1x1
+	rawArgs, _ = json.Marshal(map[string]interface{}{
+		"path": deckPath, "slide_index": 0, "tile_id": "t1",
+		"rows": 1, "cols": 1,
+	})
+	out = toolResizeSpreadsheet(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("shrink: expected success, got %+v", out)
+	}
+	tile = readDeckFile(t, deckPath)["slides"].([]interface{})[0].(map[string]interface{})["tiles"].([]interface{})[0].(map[string]interface{})
+	if int(tile["rows"].(float64)) != 1 || int(tile["cols"].(float64)) != 1 {
+		t.Errorf("expected 1x1, got %vx%v", tile["rows"], tile["cols"])
+	}
+}
+
+func TestToolResizeSpreadsheet_RejectsNonSpreadsheet(t *testing.T) {
+	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"s1","tiles":[{"id":"t1","kind":"text"}]}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path": deckPath, "slide_index": 0, "tile_id": "t1",
+		"rows": 2, "cols": 2,
+	})
+	out := toolResizeSpreadsheet(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected failure on non-spreadsheet tile, got %+v", out)
+	}
+	if code, _ := out["error_code"].(string); code != "kind_mismatch" {
+		t.Errorf("expected kind_mismatch, got %q", code)
+	}
+}
+
 func TestToolAddTextTile_HappyPath(t *testing.T) {
 	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"s1","tiles":[]}]}`)
 	var stdout bytes.Buffer

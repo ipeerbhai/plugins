@@ -311,6 +311,54 @@ var toolList = []map[string]interface{}{
 		},
 	},
 	{
+		"name":        "minerva_presentation_add_spreadsheet_tile",
+		"description": "Add a spreadsheet tile to a slide. rows × cols grid. cells is an optional 2D array matching rows × cols (each cell may be a dict {value, type?, formatting...}, a bare scalar, or null). Cell types: 0=empty, 1=text, 2=number, 3=date, 4=formula. header_row/header_col are optional flags.",
+		"inputSchema": map[string]interface{}{
+			"type": "object",
+			"properties": withProps(targetSchema, map[string]interface{}{
+				"slide_index": map[string]interface{}{"type": "integer"},
+				"x":           map[string]interface{}{"type": "number"},
+				"y":           map[string]interface{}{"type": "number"},
+				"w":           map[string]interface{}{"type": "number"},
+				"h":           map[string]interface{}{"type": "number"},
+				"rows":        map[string]interface{}{"type": "integer"},
+				"cols":        map[string]interface{}{"type": "integer"},
+				"cells":       map[string]interface{}{"type": "array"},
+				"header_row":  map[string]interface{}{"type": "boolean"},
+				"header_col":  map[string]interface{}{"type": "boolean"},
+				"rotation":    map[string]interface{}{"type": "number"},
+			}),
+			"required": []string{"slide_index", "x", "y", "w", "h", "rows", "cols"},
+		},
+	},
+	{
+		"name":        "minerva_presentation_modify_spreadsheet_cells",
+		"description": "Patch individual cells on a spreadsheet tile. cells is a sparse list of [{row, col, value, type?, ...}] — only the named fields change. Out-of-bounds entries are skipped (counted in skipped[]).",
+		"inputSchema": map[string]interface{}{
+			"type": "object",
+			"properties": withProps(targetSchema, map[string]interface{}{
+				"slide_index": map[string]interface{}{"type": "integer"},
+				"tile_id":     map[string]interface{}{"type": "string"},
+				"cells":       map[string]interface{}{"type": "array"},
+			}),
+			"required": []string{"slide_index", "tile_id", "cells"},
+		},
+	},
+	{
+		"name":        "minerva_presentation_resize_spreadsheet",
+		"description": "Resize a spreadsheet tile's grid. Existing cells preserved when growing; truncated when shrinking. New cells are CELL_EMPTY. Pixel rect (w/h) unchanged.",
+		"inputSchema": map[string]interface{}{
+			"type": "object",
+			"properties": withProps(targetSchema, map[string]interface{}{
+				"slide_index": map[string]interface{}{"type": "integer"},
+				"tile_id":     map[string]interface{}{"type": "string"},
+				"rows":        map[string]interface{}{"type": "integer"},
+				"cols":        map[string]interface{}{"type": "integer"},
+			}),
+			"required": []string{"slide_index", "tile_id", "rows", "cols"},
+		},
+	},
+	{
 		"name":        "minerva_presentation_add_text_tile",
 		"description": "Add a text tile to a slide. Coords x/y/w/h are 0..1 normalized. text_mode is plain (BBCode supported), bullet, or numbered. Optional font_size (8..200, fixed mode), auto_fit (largest font that fits), rotation.",
 		"inputSchema": map[string]interface{}{
@@ -394,6 +442,12 @@ func dispatchTool(client *hostClient, msg *rpcRequest) {
 		respondTool(client.enc, msg.ID, toolRemoveTile(client, p.Arguments))
 	case "minerva_presentation_add_text_tile":
 		respondTool(client.enc, msg.ID, toolAddTextTile(client, p.Arguments))
+	case "minerva_presentation_add_spreadsheet_tile":
+		respondTool(client.enc, msg.ID, toolAddSpreadsheetTile(client, p.Arguments))
+	case "minerva_presentation_modify_spreadsheet_cells":
+		respondTool(client.enc, msg.ID, toolModifySpreadsheetCells(client, p.Arguments))
+	case "minerva_presentation_resize_spreadsheet":
+		respondTool(client.enc, msg.ID, toolResizeSpreadsheet(client, p.Arguments))
 	default:
 		send(client.enc, errResponse(msg.ID, -32601, "tools/call: unknown tool: "+p.Name))
 	}
@@ -1020,6 +1074,101 @@ func validateCoords(args map[string]interface{}) *toolFault {
 	return nil
 }
 
+// ---------------------------------------------------------------------------
+// Spreadsheet helpers — cell type constants + normalization
+// ---------------------------------------------------------------------------
+
+const (
+	tileKindSpreadsheet = "spreadsheet"
+	cellEmpty           = 0
+	cellText            = 1
+	cellNumber          = 2
+	cellDate            = 3
+	cellFormula         = 4
+)
+
+var validCellTypes = []int{cellEmpty, cellText, cellNumber, cellDate, cellFormula}
+
+func cellTypeIsValid(t int) bool {
+	for _, v := range validCellTypes {
+		if v == t {
+			return true
+		}
+	}
+	return false
+}
+
+func emptyCell() map[string]interface{} {
+	return map[string]interface{}{"value": "", "type": cellEmpty}
+}
+
+func emptyCellGrid(rows, cols int) []interface{} {
+	grid := make([]interface{}, rows)
+	for r := 0; r < rows; r++ {
+		row := make([]interface{}, cols)
+		for c := 0; c < cols; c++ {
+			row[c] = emptyCell()
+		}
+		grid[r] = row
+	}
+	return grid
+}
+
+func autoCellType(value interface{}) int {
+	switch v := value.(type) {
+	case nil:
+		return cellEmpty
+	case float64, int:
+		return cellNumber
+	case string:
+		if v == "" {
+			return cellEmpty
+		}
+		if strings.HasPrefix(v, "=") {
+			return cellFormula
+		}
+		return cellText
+	}
+	return cellText
+}
+
+// normalizeCell mirrors MCPPresentationTools._normalize_cell. Returns
+// (cell, fault). On bad type it returns a structured fault.
+func normalizeCell(v interface{}) (map[string]interface{}, *toolFault) {
+	if v == nil {
+		return emptyCell(), nil
+	}
+	if d, ok := v.(map[string]interface{}); ok {
+		// Shallow copy.
+		out := make(map[string]interface{}, len(d))
+		for k, vv := range d {
+			out[k] = vv
+		}
+		if _, has := out["value"]; !has {
+			out["value"] = ""
+		}
+		if t, has := out["type"]; has {
+			ti := 0
+			switch x := t.(type) {
+			case float64:
+				ti = int(x)
+			case int:
+				ti = x
+			default:
+				return nil, &toolFault{Code: "schema_validation_failed", Msg: fmt.Sprintf("bad type %v (valid: 0..4)", t)}
+			}
+			if !cellTypeIsValid(ti) {
+				return nil, &toolFault{Code: "schema_validation_failed", Msg: fmt.Sprintf("bad type %d (valid: 0..4)", ti)}
+			}
+			out["type"] = ti
+		} else {
+			out["type"] = autoCellType(out["value"])
+		}
+		return out, nil
+	}
+	return map[string]interface{}{"value": v, "type": autoCellType(v)}, nil
+}
+
 // findTileInSlide returns (tile, idx, found) for the given tile id.
 func findTileInSlide(slide map[string]interface{}, tileID string) (map[string]interface{}, int, bool) {
 	tiles, _ := slide["tiles"].([]interface{})
@@ -1299,6 +1448,245 @@ func toolAddTextTile(client *hostClient, rawArgs json.RawMessage) map[string]int
 		tiles = append(tiles, tile)
 		slide["tiles"] = tiles
 		return map[string]interface{}{"tile_id": tile["id"]}, nil
+	})
+}
+
+
+// ---------------------------------------------------------------------------
+// Write tools — spreadsheet ops (T6 R5)
+// ---------------------------------------------------------------------------
+
+func toolAddSpreadsheetTile(client *hostClient, rawArgs json.RawMessage) map[string]interface{} {
+	args, fault := parseTargetArgs(rawArgs)
+	if fault != nil {
+		return failResult(fault)
+	}
+	sIdx, ok := intArg(args, "slide_index", -1)
+	if !ok {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "slide_index is required"})
+	}
+	if fault := validateCoords(args); fault != nil {
+		return failResult(fault)
+	}
+	rows, _ := intArg(args, "rows", 0)
+	cols, _ := intArg(args, "cols", 0)
+	if rows < 1 || cols < 1 {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "rows and cols must both be >= 1"})
+	}
+
+	var cells []interface{}
+	if v, has := args["cells"]; has {
+		callerCells, ok := v.([]interface{})
+		if !ok {
+			return failResult(&toolFault{Code: "schema_validation_failed", Msg: "cells must be a 2D array"})
+		}
+		if len(callerCells) != rows {
+			return failResult(&toolFault{Code: "schema_validation_failed", Msg: fmt.Sprintf("cells row count %d != rows=%d", len(callerCells), rows)})
+		}
+		cells = make([]interface{}, rows)
+		for r := 0; r < rows; r++ {
+			rowIn, ok := callerCells[r].([]interface{})
+			if !ok {
+				return failResult(&toolFault{Code: "schema_validation_failed", Msg: fmt.Sprintf("cells[%d] is not an Array", r)})
+			}
+			if len(rowIn) != cols {
+				return failResult(&toolFault{Code: "schema_validation_failed", Msg: fmt.Sprintf("cells[%d] col count %d != cols=%d", r, len(rowIn), cols)})
+			}
+			rowOut := make([]interface{}, cols)
+			for c := 0; c < cols; c++ {
+				normalized, fault := normalizeCell(rowIn[c])
+				if fault != nil {
+					return failResult(&toolFault{Code: fault.Code, Msg: fmt.Sprintf("cells[%d][%d]: %s", r, c, fault.Msg)})
+				}
+				rowOut[c] = normalized
+			}
+			cells[r] = rowOut
+		}
+	} else {
+		cells = emptyCellGrid(rows, cols)
+	}
+
+	headerRow, _ := args["header_row"].(bool)
+	headerCol, _ := args["header_col"].(bool)
+	rotation := 0.0
+	if v, ok := args["rotation"].(float64); ok {
+		rotation = v
+	}
+
+	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
+		slide, fault := slideAt(deck, sIdx)
+		if fault != nil {
+			return nil, fault
+		}
+		tile := map[string]interface{}{
+			"id":         genID("tile"),
+			"kind":       tileKindSpreadsheet,
+			"x":          args["x"],
+			"y":          args["y"],
+			"w":          args["w"],
+			"h":          args["h"],
+			"rows":       rows,
+			"cols":       cols,
+			"cells":      cells,
+			"header_row": headerRow,
+			"header_col": headerCol,
+		}
+		if rotation != 0.0 {
+			tile["rotation"] = rotation
+		}
+		tiles, _ := slide["tiles"].([]interface{})
+		tiles = append(tiles, tile)
+		slide["tiles"] = tiles
+		return map[string]interface{}{
+			"slide_index": sIdx,
+			"tile_id":     tile["id"],
+		}, nil
+	})
+}
+
+func toolModifySpreadsheetCells(client *hostClient, rawArgs json.RawMessage) map[string]interface{} {
+	args, fault := parseTargetArgs(rawArgs)
+	if fault != nil {
+		return failResult(fault)
+	}
+	tileID, _ := args["tile_id"].(string)
+	tileID = strings.TrimSpace(tileID)
+	if tileID == "" {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "tile_id is required"})
+	}
+	sIdx, ok := intArg(args, "slide_index", -1)
+	if !ok {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "slide_index is required"})
+	}
+	patches, ok := args["cells"].([]interface{})
+	if !ok {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "cells must be an array"})
+	}
+
+	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
+		slide, fault := slideAt(deck, sIdx)
+		if fault != nil {
+			return nil, fault
+		}
+		tile, _, found := findTileInSlide(slide, tileID)
+		if !found {
+			return nil, &toolFault{Code: "tile_not_found", Msg: fmt.Sprintf("tile_id not found on slide %d: %s", sIdx, tileID)}
+		}
+		if k, _ := tile["kind"].(string); k != tileKindSpreadsheet {
+			return nil, &toolFault{Code: "kind_mismatch", Msg: "modify_spreadsheet_cells only applies to spreadsheet tiles"}
+		}
+		rows, _ := intArg(tile, "rows", 0)
+		cols, _ := intArg(tile, "cols", 0)
+		cells, _ := tile["cells"].([]interface{})
+
+		updated := 0
+		skipped := []interface{}{}
+		for _, pv := range patches {
+			p, ok := pv.(map[string]interface{})
+			if !ok {
+				skipped = append(skipped, map[string]interface{}{"reason": "patch is not a Dictionary"})
+				continue
+			}
+			r, _ := intArg(p, "row", -1)
+			c, _ := intArg(p, "col", -1)
+			if r < 0 || r >= rows || c < 0 || c >= cols {
+				skipped = append(skipped, map[string]interface{}{"row": r, "col": c, "reason": "out of bounds"})
+				continue
+			}
+			rowArr, _ := cells[r].([]interface{})
+			cell, _ := rowArr[c].(map[string]interface{})
+			if cell == nil {
+				cell = emptyCell()
+				rowArr[c] = cell
+			}
+			badType := false
+			for k, v := range p {
+				if k == "row" || k == "col" {
+					continue
+				}
+				if k == "type" {
+					ti, _ := intArg(p, k, -1)
+					if !cellTypeIsValid(ti) {
+						skipped = append(skipped, map[string]interface{}{"row": r, "col": c, "reason": fmt.Sprintf("bad type %v", v)})
+						badType = true
+						break
+					}
+					cell["type"] = ti
+				} else {
+					cell[k] = v
+				}
+			}
+			if !badType {
+				updated++
+			}
+		}
+		return map[string]interface{}{
+			"slide_index":   sIdx,
+			"tile_id":       tileID,
+			"cells_updated": updated,
+			"skipped":       skipped,
+		}, nil
+	})
+}
+
+func toolResizeSpreadsheet(client *hostClient, rawArgs json.RawMessage) map[string]interface{} {
+	args, fault := parseTargetArgs(rawArgs)
+	if fault != nil {
+		return failResult(fault)
+	}
+	tileID, _ := args["tile_id"].(string)
+	tileID = strings.TrimSpace(tileID)
+	if tileID == "" {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "tile_id is required"})
+	}
+	sIdx, ok := intArg(args, "slide_index", -1)
+	if !ok {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "slide_index is required"})
+	}
+	newRows, okR := intArg(args, "rows", 0)
+	newCols, okC := intArg(args, "cols", 0)
+	if !okR || !okC || newRows < 1 || newCols < 1 {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "rows and cols must both be >= 1"})
+	}
+
+	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
+		slide, fault := slideAt(deck, sIdx)
+		if fault != nil {
+			return nil, fault
+		}
+		tile, _, found := findTileInSlide(slide, tileID)
+		if !found {
+			return nil, &toolFault{Code: "tile_not_found", Msg: fmt.Sprintf("tile_id not found on slide %d: %s", sIdx, tileID)}
+		}
+		if k, _ := tile["kind"].(string); k != tileKindSpreadsheet {
+			return nil, &toolFault{Code: "kind_mismatch", Msg: "resize_spreadsheet only applies to spreadsheet tiles"}
+		}
+		oldRows, _ := intArg(tile, "rows", 0)
+		oldCols, _ := intArg(tile, "cols", 0)
+		oldCells, _ := tile["cells"].([]interface{})
+
+		newCells := make([]interface{}, newRows)
+		for r := 0; r < newRows; r++ {
+			row := make([]interface{}, newCols)
+			for c := 0; c < newCols; c++ {
+				if r < oldRows && c < oldCols {
+					oldRow, _ := oldCells[r].([]interface{})
+					row[c] = oldRow[c]
+				} else {
+					row[c] = emptyCell()
+				}
+			}
+			newCells[r] = row
+		}
+		tile["rows"] = newRows
+		tile["cols"] = newCols
+		tile["cells"] = newCells
+		return map[string]interface{}{
+			"slide_index": sIdx,
+			"tile_id":     tileID,
+			"old_rows":    oldRows, "old_cols": oldCols,
+			"new_rows": newRows, "new_cols": newCols,
+		}, nil
 	})
 }
 
