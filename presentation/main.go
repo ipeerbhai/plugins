@@ -299,6 +299,19 @@ var toolList = []map[string]interface{}{
 		},
 	},
 	{
+		"name":        "minerva_presentation_create_deck",
+		"description": "Create a new .mdeck slide deck file on disk with one blank slide. Returns the path written. The .mdeck extension is appended if missing. Optional title (first slide), aspect (16:9, 4:3, 1:1).",
+		"inputSchema": map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"path":   map[string]interface{}{"type": "string", "description": "Filesystem path to write."},
+				"title":  map[string]interface{}{"type": "string", "description": "Optional title for the first slide."},
+				"aspect": map[string]interface{}{"type": "string", "description": "16:9 (default), 4:3, or 1:1."},
+			},
+			"required": []string{"path"},
+		},
+	},
+	{
 		"name":        "minerva_presentation_remove_tile",
 		"description": "Remove a tile from a slide by tile_id. Also scrubs reveal-order references to the removed tile.",
 		"inputSchema": map[string]interface{}{
@@ -448,6 +461,8 @@ func dispatchTool(client *hostClient, msg *rpcRequest) {
 		respondTool(client.enc, msg.ID, toolModifySpreadsheetCells(client, p.Arguments))
 	case "minerva_presentation_resize_spreadsheet":
 		respondTool(client.enc, msg.ID, toolResizeSpreadsheet(client, p.Arguments))
+	case "minerva_presentation_create_deck":
+		respondTool(client.enc, msg.ID, toolCreateDeck(client, p.Arguments))
 	default:
 		send(client.enc, errResponse(msg.ID, -32601, "tools/call: unknown tool: "+p.Name))
 	}
@@ -1688,6 +1703,60 @@ func toolResizeSpreadsheet(client *hostClient, rawArgs json.RawMessage) map[stri
 			"new_rows": newRows, "new_cols": newCols,
 		}, nil
 	})
+}
+
+
+// ---------------------------------------------------------------------------
+// Deck creation (T6 R6) — pure file IO, no host roundtrip
+// ---------------------------------------------------------------------------
+
+const fileExt = ".mdeck"
+const schemaVersion = 1
+
+func makeDeck(aspect string) map[string]interface{} {
+	return map[string]interface{}{
+		"version": schemaVersion,
+		"aspect":  aspect,
+		"slides":  []interface{}{makeSlide("")},
+	}
+}
+
+func toolCreateDeck(_ *hostClient, rawArgs json.RawMessage) map[string]interface{} {
+	args := map[string]interface{}{}
+	if len(rawArgs) > 0 && string(rawArgs) != "null" {
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return failResult(&toolFault{Code: "schema_validation_failed", Msg: err.Error()})
+		}
+	}
+	path, _ := args["path"].(string)
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "path is required"})
+	}
+	if !strings.HasSuffix(path, fileExt) {
+		path += fileExt
+	}
+	aspect := "16:9"
+	if v, ok := args["aspect"].(string); ok && v != "" {
+		aspect = v
+	}
+	if !aspectIsValid(aspect) {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: fmt.Sprintf("aspect must be one of %v", validAspects)})
+	}
+	deck := makeDeck(aspect)
+	if title, ok := args["title"].(string); ok && title != "" {
+		slides := deck["slides"].([]interface{})
+		(slides[0].(map[string]interface{}))["title"] = title
+	}
+	if fault := saveDeckToPath(path, deck); fault != nil {
+		return failResult(fault)
+	}
+	return map[string]interface{}{
+		"success":     true,
+		"path":        path,
+		"slide_count": 1,
+		"deck_id":     fmt.Sprintf("v%d/%s", schemaVersion, aspect),
+	}
 }
 
 

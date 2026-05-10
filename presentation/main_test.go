@@ -532,6 +532,65 @@ func TestToolRemoveSlide_RefusesLastSlide(t *testing.T) {
 	}
 }
 
+func TestToolCreateDeck_HappyPath(t *testing.T) {
+	tmp := t.TempDir()
+	deckPath := tmp + "/foo.mdeck"
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path": deckPath, "title": "Hello",
+	})
+	out := toolCreateDeck(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	if p, _ := out["path"].(string); p != deckPath {
+		t.Errorf("expected path %q, got %v", deckPath, out["path"])
+	}
+	if cnt, _ := out["slide_count"].(int); cnt != 1 {
+		t.Errorf("expected slide_count=1, got %v", out["slide_count"])
+	}
+	d := readDeckFile(t, deckPath)
+	if int(d["version"].(float64)) != 1 {
+		t.Errorf("expected version=1, got %v", d["version"])
+	}
+	if d["aspect"] != "16:9" {
+		t.Errorf("expected aspect=16:9, got %v", d["aspect"])
+	}
+	slide := d["slides"].([]interface{})[0].(map[string]interface{})
+	if slide["title"] != "Hello" {
+		t.Errorf("expected title=Hello, got %v", slide["title"])
+	}
+}
+
+func TestToolCreateDeck_AppendsExtension(t *testing.T) {
+	tmp := t.TempDir()
+	rawArgs, _ := json.Marshal(map[string]interface{}{"path": tmp + "/no_ext"})
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+	out := toolCreateDeck(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	if p, _ := out["path"].(string); !strings.HasSuffix(p, ".mdeck") {
+		t.Errorf("expected .mdeck suffix, got %q", p)
+	}
+}
+
+func TestToolCreateDeck_RejectsBadAspect(t *testing.T) {
+	tmp := t.TempDir()
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path": tmp + "/d.mdeck", "aspect": "21:9",
+	})
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+	out := toolCreateDeck(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected failure, got %+v", out)
+	}
+}
+
 func TestToolAddSpreadsheetTile_DefaultsToEmptyGrid(t *testing.T) {
 	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"s1","tiles":[]}]}`)
 	var stdout bytes.Buffer
