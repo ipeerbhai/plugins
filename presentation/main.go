@@ -298,6 +298,38 @@ var toolList = []map[string]interface{}{
 			"required": []string{"slide_index"},
 		},
 	},
+	{
+		"name":        "minerva_presentation_remove_tile",
+		"description": "Remove a tile from a slide by tile_id. Also scrubs reveal-order references to the removed tile.",
+		"inputSchema": map[string]interface{}{
+			"type": "object",
+			"properties": withProps(targetSchema, map[string]interface{}{
+				"slide_index": map[string]interface{}{"type": "integer"},
+				"tile_id":     map[string]interface{}{"type": "string"},
+			}),
+			"required": []string{"slide_index", "tile_id"},
+		},
+	},
+	{
+		"name":        "minerva_presentation_add_text_tile",
+		"description": "Add a text tile to a slide. Coords x/y/w/h are 0..1 normalized. text_mode is plain (BBCode supported), bullet, or numbered. Optional font_size (8..200, fixed mode), auto_fit (largest font that fits), rotation.",
+		"inputSchema": map[string]interface{}{
+			"type": "object",
+			"properties": withProps(targetSchema, map[string]interface{}{
+				"slide_index": map[string]interface{}{"type": "integer"},
+				"x":           map[string]interface{}{"type": "number"},
+				"y":           map[string]interface{}{"type": "number"},
+				"w":           map[string]interface{}{"type": "number"},
+				"h":           map[string]interface{}{"type": "number"},
+				"content":     map[string]interface{}{"type": "string"},
+				"text_mode":   map[string]interface{}{"type": "string", "description": "plain | bullet | numbered. Defaults to plain."},
+				"font_size":   map[string]interface{}{"type": "integer", "description": "Optional fixed font size in pixels (8..200)."},
+				"auto_fit":    map[string]interface{}{"type": "boolean", "description": "When true and no font_size, picks largest font that fits."},
+				"rotation":    map[string]interface{}{"type": "number", "description": "Optional rotation in radians."},
+			}),
+			"required": []string{"slide_index", "x", "y", "w", "h", "content"},
+		},
+	},
 }
 
 // withProps composes two schema-property maps without mutating either.
@@ -358,6 +390,10 @@ func dispatchTool(client *hostClient, msg *rpcRequest) {
 		respondTool(client.enc, msg.ID, toolMoveSlide(client, p.Arguments))
 	case "minerva_presentation_remove_slide":
 		respondTool(client.enc, msg.ID, toolRemoveSlide(client, p.Arguments))
+	case "minerva_presentation_remove_tile":
+		respondTool(client.enc, msg.ID, toolRemoveTile(client, p.Arguments))
+	case "minerva_presentation_add_text_tile":
+		respondTool(client.enc, msg.ID, toolAddTextTile(client, p.Arguments))
 	default:
 		send(client.enc, errResponse(msg.ID, -32601, "tools/call: unknown tool: "+p.Name))
 	}
@@ -934,6 +970,73 @@ func aspectIsValid(a string) bool {
 
 
 // ---------------------------------------------------------------------------
+// Tile helpers — text mode validation, coord validation, tile lookup
+// ---------------------------------------------------------------------------
+
+const (
+	tileKindText        = "text"
+	textModePlain       = "plain"
+	textModeBullet      = "bullet"
+	textModeNumbered    = "numbered"
+)
+
+var validTextModes = []string{textModePlain, textModeBullet, textModeNumbered}
+
+func textModeIsValid(m string) bool {
+	for _, v := range validTextModes {
+		if v == m {
+			return true
+		}
+	}
+	return false
+}
+
+// validateCoords mirrors MCPPresentationTools._validate_coords: x/y/w/h must
+// be present, numeric, in [0,1], and (x+w)/(y+h) must not exceed 1.
+func validateCoords(args map[string]interface{}) *toolFault {
+	for _, k := range []string{"x", "y", "w", "h"} {
+		v, ok := args[k]
+		if !ok || v == nil {
+			return &toolFault{Code: "schema_validation_failed", Msg: fmt.Sprintf("%s is required", k)}
+		}
+		f, ok := v.(float64)
+		if !ok {
+			return &toolFault{Code: "schema_validation_failed", Msg: fmt.Sprintf("%s must be a number", k)}
+		}
+		if f < 0.0 || f > 1.0 {
+			return &toolFault{Code: "schema_validation_failed", Msg: fmt.Sprintf("%s must be in [0, 1], got %v", k, f)}
+		}
+	}
+	x, _ := args["x"].(float64)
+	y, _ := args["y"].(float64)
+	w, _ := args["w"].(float64)
+	h, _ := args["h"].(float64)
+	if x+w > 1.0001 {
+		return &toolFault{Code: "schema_validation_failed", Msg: fmt.Sprintf("x+w must not exceed 1, got %v", x+w)}
+	}
+	if y+h > 1.0001 {
+		return &toolFault{Code: "schema_validation_failed", Msg: fmt.Sprintf("y+h must not exceed 1, got %v", y+h)}
+	}
+	return nil
+}
+
+// findTileInSlide returns (tile, idx, found) for the given tile id.
+func findTileInSlide(slide map[string]interface{}, tileID string) (map[string]interface{}, int, bool) {
+	tiles, _ := slide["tiles"].([]interface{})
+	for i, t := range tiles {
+		td, ok := t.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if id, _ := td["id"].(string); id == tileID {
+			return td, i, true
+		}
+	}
+	return nil, -1, false
+}
+
+
+// ---------------------------------------------------------------------------
 // Write tools — slide-level mutators (T6 R3)
 // ---------------------------------------------------------------------------
 
@@ -1076,6 +1179,126 @@ func toolRemoveSlide(client *hostClient, rawArgs json.RawMessage) map[string]int
 			"slide_id":         removedID,
 			"remaining_slides": len(slides),
 		}, nil
+	})
+}
+
+
+// ---------------------------------------------------------------------------
+// Write tools — tile-level mutators (T6 R4)
+// ---------------------------------------------------------------------------
+
+func toolRemoveTile(client *hostClient, rawArgs json.RawMessage) map[string]interface{} {
+	args, fault := parseTargetArgs(rawArgs)
+	if fault != nil {
+		return failResult(fault)
+	}
+	tileID, _ := args["tile_id"].(string)
+	tileID = strings.TrimSpace(tileID)
+	if tileID == "" {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "tile_id is required"})
+	}
+	sIdx, ok := intArg(args, "slide_index", -1)
+	if !ok {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "slide_index is required"})
+	}
+	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
+		slide, fault := slideAt(deck, sIdx)
+		if fault != nil {
+			return nil, fault
+		}
+		_, idx, found := findTileInSlide(slide, tileID)
+		if !found {
+			return nil, &toolFault{Code: "tile_not_found", Msg: fmt.Sprintf("tile_id not found on slide %d: %s", sIdx, tileID)}
+		}
+		tiles, _ := slide["tiles"].([]interface{})
+		tiles = append(tiles[:idx], tiles[idx+1:]...)
+		slide["tiles"] = tiles
+		// Scrub reveal-order entries that referenced this tile id.
+		if rev, ok := slide["reveal"].([]interface{}); ok {
+			out := rev[:0]
+			for _, r := range rev {
+				if s, _ := r.(string); s != tileID {
+					out = append(out, r)
+				}
+			}
+			slide["reveal"] = out
+		}
+		return map[string]interface{}{
+			"slide_index": sIdx,
+			"tile_id":     tileID,
+			"removed_at":  idx,
+		}, nil
+	})
+}
+
+func toolAddTextTile(client *hostClient, rawArgs json.RawMessage) map[string]interface{} {
+	args, fault := parseTargetArgs(rawArgs)
+	if fault != nil {
+		return failResult(fault)
+	}
+	sIdx, ok := intArg(args, "slide_index", -1)
+	if !ok {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "slide_index is required"})
+	}
+	if fault := validateCoords(args); fault != nil {
+		return failResult(fault)
+	}
+	content, _ := args["content"].(string)
+	textMode := textModePlain
+	if v, ok := args["text_mode"].(string); ok && v != "" {
+		textMode = v
+	}
+	if !textModeIsValid(textMode) {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: fmt.Sprintf("text_mode must be one of %v", validTextModes)})
+	}
+	// Optional fields validated up front so we fail fast before disk I/O.
+	var fontSize int
+	if v, has := args["font_size"]; has && v != nil {
+		fs, _ := intArg(args, "font_size", 0)
+		if fs != 0 {
+			if fs < 8 || fs > 200 {
+				return failResult(&toolFault{Code: "schema_validation_failed", Msg: fmt.Sprintf("font_size must be in [8, 200], got %d", fs)})
+			}
+			fontSize = fs
+		}
+	}
+	autoFit := false
+	if v, ok := args["auto_fit"].(bool); ok {
+		autoFit = v
+	}
+	rotation := 0.0
+	if v, ok := args["rotation"].(float64); ok {
+		rotation = v
+	}
+
+	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
+		slide, fault := slideAt(deck, sIdx)
+		if fault != nil {
+			return nil, fault
+		}
+		tile := map[string]interface{}{
+			"id":        genID("tile"),
+			"kind":      tileKindText,
+			"x":         args["x"],
+			"y":         args["y"],
+			"w":         args["w"],
+			"h":         args["h"],
+			"text_mode": textMode,
+			"content":   content,
+		}
+		if fontSize != 0 {
+			tile["font_size"] = fontSize
+		}
+		if autoFit {
+			tile["auto_fit"] = true
+		}
+		if rotation != 0.0 {
+			tile["rotation"] = rotation
+		}
+		tiles, _ := slide["tiles"].([]interface{})
+		tiles = append(tiles, tile)
+		slide["tiles"] = tiles
+		return map[string]interface{}{"tile_id": tile["id"]}, nil
 	})
 }
 

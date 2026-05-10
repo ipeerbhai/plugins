@@ -532,6 +532,139 @@ func TestToolRemoveSlide_RefusesLastSlide(t *testing.T) {
 	}
 }
 
+func TestToolAddTextTile_HappyPath(t *testing.T) {
+	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"s1","tiles":[]}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path": deckPath, "slide_index": 0,
+		"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.3,
+		"content": "hello world", "text_mode": "bullet", "font_size": 24,
+	})
+	out := toolAddTextTile(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	if id, _ := out["tile_id"].(string); !strings.HasPrefix(id, "tile_") {
+		t.Errorf("expected tile_ prefix, got %q", id)
+	}
+	tiles := readDeckFile(t, deckPath)["slides"].([]interface{})[0].(map[string]interface{})["tiles"].([]interface{})
+	if len(tiles) != 1 {
+		t.Fatalf("expected 1 tile, got %d", len(tiles))
+	}
+	tile := tiles[0].(map[string]interface{})
+	if tile["kind"] != "text" {
+		t.Errorf("expected kind=text, got %v", tile["kind"])
+	}
+	if tile["text_mode"] != "bullet" {
+		t.Errorf("expected text_mode=bullet, got %v", tile["text_mode"])
+	}
+	if tile["content"] != "hello world" {
+		t.Errorf("expected content=hello world, got %v", tile["content"])
+	}
+	// font_size round-trips through JSON as float64; check numerically.
+	if fs, _ := tile["font_size"].(float64); fs != 24 {
+		t.Errorf("expected font_size=24, got %v", tile["font_size"])
+	}
+}
+
+func TestToolAddTextTile_RejectsBadCoords(t *testing.T) {
+	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"s1","tiles":[]}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path": deckPath, "slide_index": 0,
+		"x": 0.5, "y": 0.5, "w": 0.8, "h": 0.3, "content": "x",
+	})
+	out := toolAddTextTile(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected coord overflow failure, got %+v", out)
+	}
+	if code, _ := out["error_code"].(string); code != "schema_validation_failed" {
+		t.Errorf("expected schema_validation_failed, got %q", code)
+	}
+}
+
+func TestToolAddTextTile_RejectsBadTextMode(t *testing.T) {
+	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"s1","tiles":[]}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path": deckPath, "slide_index": 0,
+		"x": 0.0, "y": 0.0, "w": 0.5, "h": 0.5,
+		"content": "x", "text_mode": "fancy",
+	})
+	out := toolAddTextTile(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected text_mode failure, got %+v", out)
+	}
+	if code, _ := out["error_code"].(string); code != "schema_validation_failed" {
+		t.Errorf("expected schema_validation_failed, got %q", code)
+	}
+}
+
+func TestToolAddTextTile_RejectsBadFontSize(t *testing.T) {
+	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"s1","tiles":[]}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path": deckPath, "slide_index": 0,
+		"x": 0.0, "y": 0.0, "w": 0.5, "h": 0.5,
+		"content": "x", "font_size": 500,
+	})
+	out := toolAddTextTile(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected font_size failure, got %+v", out)
+	}
+}
+
+func TestToolRemoveTile_HappyAndScrubs(t *testing.T) {
+	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"s1","tiles":[{"id":"t_a"},{"id":"t_b"}],"reveal":["t_a","t_b"]}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path": deckPath, "slide_index": 0, "tile_id": "t_a",
+	})
+	out := toolRemoveTile(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	if removed, _ := out["removed_at"].(int); removed != 0 {
+		t.Errorf("expected removed_at=0, got %v", out["removed_at"])
+	}
+	slide := readDeckFile(t, deckPath)["slides"].([]interface{})[0].(map[string]interface{})
+	tiles := slide["tiles"].([]interface{})
+	if len(tiles) != 1 || tiles[0].(map[string]interface{})["id"] != "t_b" {
+		t.Errorf("expected only t_b remaining, got %v", tiles)
+	}
+	reveal := slide["reveal"].([]interface{})
+	if len(reveal) != 1 || reveal[0] != "t_b" {
+		t.Errorf("expected reveal=[t_b], got %v", reveal)
+	}
+}
+
+func TestToolRemoveTile_NotFound(t *testing.T) {
+	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"s1","tiles":[{"id":"t_a"}]}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path": deckPath, "slide_index": 0, "tile_id": "missing",
+	})
+	out := toolRemoveTile(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected failure, got %+v", out)
+	}
+	if code, _ := out["error_code"].(string); code != "tile_not_found" {
+		t.Errorf("expected tile_not_found, got %q", code)
+	}
+}
+
 func TestToolRemoveSlide_HappyPath(t *testing.T) {
 	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"a"},{"id":"b"},{"id":"c"}]}`)
 	var stdout bytes.Buffer
