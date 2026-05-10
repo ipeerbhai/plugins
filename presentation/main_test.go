@@ -335,3 +335,224 @@ func TestToolListOpenDecks_HandlesEmptyDocuments(t *testing.T) {
 		t.Errorf("expected count=0, got %d", count)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Write-tool tests — path mode exercises mutateDeck end-to-end on disk.
+// ---------------------------------------------------------------------------
+
+func writeDeckFile(t *testing.T, body string) string {
+	t.Helper()
+	tmp := t.TempDir()
+	p := tmp + "/deck.mdeck"
+	if err := os.WriteFile(p, []byte(body), 0644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	return p
+}
+
+func readDeckFile(t *testing.T, path string) map[string]interface{} {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("readback: %v", err)
+	}
+	var d map[string]interface{}
+	if err := json.Unmarshal(body, &d); err != nil {
+		t.Fatalf("readback parse: %v", err)
+	}
+	return d
+}
+
+func TestToolAddSlide_AppendsByDefault(t *testing.T) {
+	deckPath := writeDeckFile(t, `{"version":1,"aspect":"16:9","slides":[{"id":"s1"}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{"path": deckPath, "title": "two"})
+	out := toolAddSlide(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	if idx, _ := out["slide_index"].(int); idx != 1 {
+		t.Errorf("expected slide_index=1, got %v", out["slide_index"])
+	}
+	d := readDeckFile(t, deckPath)
+	slides := d["slides"].([]interface{})
+	if len(slides) != 2 {
+		t.Fatalf("expected 2 slides, got %d", len(slides))
+	}
+	s1 := slides[1].(map[string]interface{})
+	if s1["title"] != "two" {
+		t.Errorf("expected title=two, got %v", s1["title"])
+	}
+}
+
+func TestToolAddSlide_InsertAtPosition(t *testing.T) {
+	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"s0"},{"id":"s1"}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{"path": deckPath, "position": 1, "title": "middle"})
+	out := toolAddSlide(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	d := readDeckFile(t, deckPath)
+	slides := d["slides"].([]interface{})
+	if len(slides) != 3 {
+		t.Fatalf("expected 3 slides, got %d", len(slides))
+	}
+	if slides[0].(map[string]interface{})["id"] != "s0" {
+		t.Errorf("first slide should still be s0")
+	}
+	if slides[1].(map[string]interface{})["title"] != "middle" {
+		t.Errorf("middle slide title mismatch: %v", slides[1])
+	}
+	if slides[2].(map[string]interface{})["id"] != "s1" {
+		t.Errorf("third slide should be original s1")
+	}
+}
+
+func TestToolSetSlideTitle_SetAndClear(t *testing.T) {
+	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"s1","title":"old"}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	// Set
+	rawArgs, _ := json.Marshal(map[string]interface{}{"path": deckPath, "slide_index": 0, "title": "new"})
+	out := toolSetSlideTitle(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("set: expected success, got %+v", out)
+	}
+	if title := readDeckFile(t, deckPath)["slides"].([]interface{})[0].(map[string]interface{})["title"]; title != "new" {
+		t.Errorf("expected title=new, got %v", title)
+	}
+
+	// Clear
+	rawArgs, _ = json.Marshal(map[string]interface{}{"path": deckPath, "slide_index": 0, "title": ""})
+	out = toolSetSlideTitle(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("clear: expected success, got %+v", out)
+	}
+	if _, has := readDeckFile(t, deckPath)["slides"].([]interface{})[0].(map[string]interface{})["title"]; has {
+		t.Errorf("title should have been erased")
+	}
+}
+
+func TestToolSetSlideTitle_RequiresTitleArg(t *testing.T) {
+	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"s1"}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{"path": deckPath, "slide_index": 0})
+	out := toolSetSlideTitle(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected failure when title omitted, got %+v", out)
+	}
+	if code, _ := out["error_code"].(string); code != "schema_validation_failed" {
+		t.Errorf("expected schema_validation_failed, got %q", code)
+	}
+}
+
+func TestToolSetAspect_AcceptsValidRejectsInvalid(t *testing.T) {
+	deckPath := writeDeckFile(t, `{"version":1,"aspect":"16:9","slides":[{"id":"s1"}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{"path": deckPath, "aspect": "4:3"})
+	out := toolSetAspect(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("valid aspect: expected success, got %+v", out)
+	}
+	if a := readDeckFile(t, deckPath)["aspect"]; a != "4:3" {
+		t.Errorf("expected aspect=4:3, got %v", a)
+	}
+
+	rawArgs, _ = json.Marshal(map[string]interface{}{"path": deckPath, "aspect": "21:9"})
+	out = toolSetAspect(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("invalid aspect: expected failure, got %+v", out)
+	}
+	if code, _ := out["error_code"].(string); code != "schema_validation_failed" {
+		t.Errorf("expected schema_validation_failed, got %q", code)
+	}
+}
+
+func TestToolMoveSlide_HappyAndNoOpAndRange(t *testing.T) {
+	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"a"},{"id":"b"},{"id":"c"}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	// happy: move first to last
+	rawArgs, _ := json.Marshal(map[string]interface{}{"path": deckPath, "from_index": 0, "to_index": 2})
+	out := toolMoveSlide(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("move: expected success, got %+v", out)
+	}
+	slides := readDeckFile(t, deckPath)["slides"].([]interface{})
+	got := []string{
+		slides[0].(map[string]interface{})["id"].(string),
+		slides[1].(map[string]interface{})["id"].(string),
+		slides[2].(map[string]interface{})["id"].(string),
+	}
+	if got[0] != "b" || got[1] != "c" || got[2] != "a" {
+		t.Errorf("expected order [b,c,a], got %v", got)
+	}
+
+	// no-op
+	rawArgs, _ = json.Marshal(map[string]interface{}{"path": deckPath, "from_index": 1, "to_index": 1})
+	out = toolMoveSlide(client, rawArgs)
+	if noOp, _ := out["no_op"].(bool); !noOp {
+		t.Errorf("expected no_op=true, got %+v", out)
+	}
+
+	// out of range
+	rawArgs, _ = json.Marshal(map[string]interface{}{"path": deckPath, "from_index": 99, "to_index": 0})
+	out = toolMoveSlide(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("out of range: expected failure, got %+v", out)
+	}
+	if code, _ := out["error_code"].(string); code != "out_of_range" {
+		t.Errorf("expected out_of_range, got %q", code)
+	}
+}
+
+func TestToolRemoveSlide_RefusesLastSlide(t *testing.T) {
+	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"only"}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{"path": deckPath, "slide_index": 0})
+	out := toolRemoveSlide(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected failure removing only slide, got %+v", out)
+	}
+	if code, _ := out["error_code"].(string); code != "deck_empty_forbidden" {
+		t.Errorf("expected deck_empty_forbidden, got %q", code)
+	}
+}
+
+func TestToolRemoveSlide_HappyPath(t *testing.T) {
+	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"a"},{"id":"b"},{"id":"c"}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{"path": deckPath, "slide_index": 1})
+	out := toolRemoveSlide(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	if id, _ := out["slide_id"].(string); id != "b" {
+		t.Errorf("expected removed id=b, got %q", id)
+	}
+	if rem, _ := out["remaining_slides"].(int); rem != 2 {
+		t.Errorf("expected remaining_slides=2, got %v", out["remaining_slides"])
+	}
+	slides := readDeckFile(t, deckPath)["slides"].([]interface{})
+	if len(slides) != 2 {
+		t.Fatalf("expected 2 slides on disk, got %d", len(slides))
+	}
+	if slides[0].(map[string]interface{})["id"] != "a" || slides[1].(map[string]interface{})["id"] != "c" {
+		t.Errorf("expected order [a,c], got %v", slides)
+	}
+}

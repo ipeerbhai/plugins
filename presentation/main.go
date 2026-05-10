@@ -27,6 +27,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 )
 
 const (
@@ -240,6 +241,63 @@ var toolList = []map[string]interface{}{
 			"required": []string{"slide_index", "tile_index"},
 		},
 	},
+	{
+		"name":        "minerva_presentation_add_slide",
+		"description": "Append (default) or insert a blank slide. Returns the new slide_index and slide_id. Optional `position` (0..slide_count, default = append) and `title`.",
+		"inputSchema": map[string]interface{}{
+			"type": "object",
+			"properties": withProps(targetSchema, map[string]interface{}{
+				"position": map[string]interface{}{"type": "integer"},
+				"title":    map[string]interface{}{"type": "string"},
+			}),
+		},
+	},
+	{
+		"name":        "minerva_presentation_set_slide_title",
+		"description": "Set or clear a slide's title. Pass title=\"\" to clear. Requires slide_index and tab_name|path.",
+		"inputSchema": map[string]interface{}{
+			"type": "object",
+			"properties": withProps(targetSchema, map[string]interface{}{
+				"slide_index": map[string]interface{}{"type": "integer"},
+				"title":       map[string]interface{}{"type": "string"},
+			}),
+			"required": []string{"slide_index", "title"},
+		},
+	},
+	{
+		"name":        "minerva_presentation_set_aspect",
+		"description": "Change the deck's aspect ratio. One of '16:9' (default), '4:3', '1:1'. Existing tile coords stay normalized [0,1].",
+		"inputSchema": map[string]interface{}{
+			"type": "object",
+			"properties": withProps(targetSchema, map[string]interface{}{
+				"aspect": map[string]interface{}{"type": "string"},
+			}),
+			"required": []string{"aspect"},
+		},
+	},
+	{
+		"name":        "minerva_presentation_move_slide",
+		"description": "Move a slide from one index to another. No-op if from_index == to_index.",
+		"inputSchema": map[string]interface{}{
+			"type": "object",
+			"properties": withProps(targetSchema, map[string]interface{}{
+				"from_index": map[string]interface{}{"type": "integer"},
+				"to_index":   map[string]interface{}{"type": "integer"},
+			}),
+			"required": []string{"from_index", "to_index"},
+		},
+	},
+	{
+		"name":        "minerva_presentation_remove_slide",
+		"description": "Remove a slide by index. Refuses if it would leave the deck with zero slides.",
+		"inputSchema": map[string]interface{}{
+			"type": "object",
+			"properties": withProps(targetSchema, map[string]interface{}{
+				"slide_index": map[string]interface{}{"type": "integer"},
+			}),
+			"required": []string{"slide_index"},
+		},
+	},
 }
 
 // withProps composes two schema-property maps without mutating either.
@@ -290,6 +348,16 @@ func dispatchTool(client *hostClient, msg *rpcRequest) {
 		respondTool(client.enc, msg.ID, toolGetSlide(client, p.Arguments))
 	case "minerva_presentation_get_tile":
 		respondTool(client.enc, msg.ID, toolGetTile(client, p.Arguments))
+	case "minerva_presentation_add_slide":
+		respondTool(client.enc, msg.ID, toolAddSlide(client, p.Arguments))
+	case "minerva_presentation_set_slide_title":
+		respondTool(client.enc, msg.ID, toolSetSlideTitle(client, p.Arguments))
+	case "minerva_presentation_set_aspect":
+		respondTool(client.enc, msg.ID, toolSetAspect(client, p.Arguments))
+	case "minerva_presentation_move_slide":
+		respondTool(client.enc, msg.ID, toolMoveSlide(client, p.Arguments))
+	case "minerva_presentation_remove_slide":
+		respondTool(client.enc, msg.ID, toolRemoveSlide(client, p.Arguments))
 	default:
 		send(client.enc, errResponse(msg.ID, -32601, "tools/call: unknown tool: "+p.Name))
 	}
@@ -724,6 +792,291 @@ func strOr(m map[string]interface{}, key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+
+// ---------------------------------------------------------------------------
+// Deck writer — shared mutate-and-save pipeline (T6 R3)
+// ---------------------------------------------------------------------------
+//
+// mutateDeck is the single tested round-trip every write tool goes through:
+//   1. loadDeck (tab via host.documents.get_state | path via os.ReadFile)
+//   2. caller's mutation closure mutates the deck Dict in place
+//   3. saveDeck (tab via host.documents.set_state | path via os.WriteFile)
+//
+// The closure can return additional result fields to merge into the response;
+// returning a *toolFault aborts before save. This keeps every write tool's
+// body to ~10-15 lines and centralizes the addressing + persistence logic.
+
+func mutateDeck(
+	client *hostClient,
+	args map[string]interface{},
+	mutate func(deck map[string]interface{}) (map[string]interface{}, *toolFault),
+) map[string]interface{} {
+	deck, fault := loadDeck(client, args)
+	if fault != nil {
+		return failResult(fault)
+	}
+	extra, fault := mutate(deck)
+	if fault != nil {
+		return failResult(fault)
+	}
+	if fault := saveDeck(client, args, deck); fault != nil {
+		return failResult(fault)
+	}
+	out := map[string]interface{}{"success": true}
+	for k, v := range extra {
+		out[k] = v
+	}
+	return out
+}
+
+
+func saveDeck(client *hostClient, args map[string]interface{}, deck map[string]interface{}) *toolFault {
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		return saveDeckToTab(client, tabName, deck)
+	}
+	if path, _ := args["path"].(string); path != "" {
+		return saveDeckToPath(path, deck)
+	}
+	return &toolFault{Code: "schema_validation_failed", Msg: "no target supplied"}
+}
+
+
+func saveDeckToTab(client *hostClient, tabName string, deck map[string]interface{}) *toolFault {
+	raw, capErr := client.callCapability("host.documents.set_state", map[string]interface{}{
+		"editor_name": tabName,
+		"panel_state": deck,
+	})
+	if capErr != nil {
+		return &toolFault{Code: fmt.Sprintf("rpc_error_%d", capErr.Code), Msg: capErr.Message}
+	}
+	var resp struct {
+		Success      bool   `json:"success"`
+		ErrorCode    string `json:"error_code,omitempty"`
+		ErrorMessage string `json:"error_message,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return &toolFault{Code: "parse_error", Msg: "parse host.documents.set_state response: " + err.Error()}
+	}
+	if !resp.Success {
+		return &toolFault{Code: resp.ErrorCode, Msg: resp.ErrorMessage}
+	}
+	return nil
+}
+
+
+func saveDeckToPath(path string, deck map[string]interface{}) *toolFault {
+	body, err := json.MarshalIndent(deck, "", "  ")
+	if err != nil {
+		return &toolFault{Code: "marshal_error", Msg: err.Error()}
+	}
+	if err := os.WriteFile(path, body, 0644); err != nil {
+		return &toolFault{Code: "io_error", Msg: err.Error()}
+	}
+	return nil
+}
+
+
+// ---------------------------------------------------------------------------
+// ID generation + slide construction — mirror MCPPresentationTools._gen_id
+// ---------------------------------------------------------------------------
+
+var idSeed int = -1
+
+func genID(prefix string) string {
+	// Match the pattern used by core: <prefix>_<6 random hex>. Initial seed
+	// from time + crypto rand is overkill; for plugin-side IDs we use a
+	// simple counter + os PID hash to keep IDs stable within a run.
+	if idSeed < 0 {
+		idSeed = (os.Getpid()*1000 + int(timeNowUnix())%1000) & 0xffffff
+	}
+	idSeed++
+	return fmt.Sprintf("%s_%06x", prefix, idSeed&0xffffff)
+}
+
+
+func makeSlide(title string) map[string]interface{} {
+	s := map[string]interface{}{
+		"id":         genID("slide"),
+		"background": map[string]interface{}{"kind": "color", "value": "#ffffff"},
+		"tiles":      []interface{}{},
+		"reveal":     []interface{}{},
+	}
+	if title != "" {
+		s["title"] = title
+	}
+	return s
+}
+
+
+// timeNowUnix is a small indirection so tests can keep idSeed deterministic
+// without spawning real time. genID's seed is salted by os.Getpid() anyway.
+func timeNowUnix() int64 {
+	return time.Now().Unix()
+}
+
+
+// ---------------------------------------------------------------------------
+// Aspect validation — must match MCPPresentationTools.ASPECTS_VALID
+// ---------------------------------------------------------------------------
+
+var validAspects = []string{"16:9", "4:3", "1:1"}
+
+func aspectIsValid(a string) bool {
+	for _, v := range validAspects {
+		if v == a {
+			return true
+		}
+	}
+	return false
+}
+
+
+// ---------------------------------------------------------------------------
+// Write tools — slide-level mutators (T6 R3)
+// ---------------------------------------------------------------------------
+
+func toolAddSlide(client *hostClient, rawArgs json.RawMessage) map[string]interface{} {
+	args, fault := parseTargetArgs(rawArgs)
+	if fault != nil {
+		return failResult(fault)
+	}
+	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
+		slides, _ := deck["slides"].([]interface{})
+		insertAt := len(slides)
+		if p, ok := intArg(args, "position", -1); ok {
+			if p < 0 {
+				p = 0
+			}
+			if p > len(slides) {
+				p = len(slides)
+			}
+			insertAt = p
+		}
+		title, _ := args["title"].(string)
+		newSlide := makeSlide(title)
+		// Insert at position: append to grow, then shift right of insertAt.
+		slides = append(slides, nil)
+		copy(slides[insertAt+1:], slides[insertAt:])
+		slides[insertAt] = newSlide
+		deck["slides"] = slides
+		return map[string]interface{}{
+			"slide_index": insertAt,
+			"slide_id":    newSlide["id"],
+		}, nil
+	})
+}
+
+func toolSetSlideTitle(client *hostClient, rawArgs json.RawMessage) map[string]interface{} {
+	args, fault := parseTargetArgs(rawArgs)
+	if fault != nil {
+		return failResult(fault)
+	}
+	if _, ok := args["title"]; !ok {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "title is required (use \"\" to clear)"})
+	}
+	idx, ok := intArg(args, "slide_index", -1)
+	if !ok {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "slide_index is required"})
+	}
+	title, _ := args["title"].(string)
+	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
+		slide, fault := slideAt(deck, idx)
+		if fault != nil {
+			return nil, fault
+		}
+		if title == "" {
+			delete(slide, "title")
+		} else {
+			slide["title"] = title
+		}
+		return map[string]interface{}{
+			"slide_index": idx,
+			"title":       title,
+		}, nil
+	})
+}
+
+func toolSetAspect(client *hostClient, rawArgs json.RawMessage) map[string]interface{} {
+	args, fault := parseTargetArgs(rawArgs)
+	if fault != nil {
+		return failResult(fault)
+	}
+	aspect, _ := args["aspect"].(string)
+	if aspect == "" {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "aspect is required"})
+	}
+	if !aspectIsValid(aspect) {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: fmt.Sprintf("aspect must be one of %v", validAspects)})
+	}
+	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
+		deck["aspect"] = aspect
+		return map[string]interface{}{"aspect": aspect}, nil
+	})
+}
+
+func toolMoveSlide(client *hostClient, rawArgs json.RawMessage) map[string]interface{} {
+	args, fault := parseTargetArgs(rawArgs)
+	if fault != nil {
+		return failResult(fault)
+	}
+	from, okFrom := intArg(args, "from_index", -1)
+	to, okTo := intArg(args, "to_index", -1)
+	if !okFrom || !okTo {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "from_index and to_index are required"})
+	}
+	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
+		slides, _ := deck["slides"].([]interface{})
+		n := len(slides)
+		if from < 0 || from >= n {
+			return nil, &toolFault{Code: "out_of_range", Msg: fmt.Sprintf("from_index out of range: %d (deck has %d slides)", from, n)}
+		}
+		if to < 0 || to >= n {
+			return nil, &toolFault{Code: "out_of_range", Msg: fmt.Sprintf("to_index out of range: %d (deck has %d slides)", to, n)}
+		}
+		if from == to {
+			return map[string]interface{}{"from_index": from, "to_index": to, "no_op": true}, nil
+		}
+		s := slides[from]
+		slides = append(slides[:from], slides[from+1:]...)
+		slides = append(slides[:to], append([]interface{}{s}, slides[to:]...)...)
+		deck["slides"] = slides
+		return map[string]interface{}{"from_index": from, "to_index": to}, nil
+	})
+}
+
+func toolRemoveSlide(client *hostClient, rawArgs json.RawMessage) map[string]interface{} {
+	args, fault := parseTargetArgs(rawArgs)
+	if fault != nil {
+		return failResult(fault)
+	}
+	idx, ok := intArg(args, "slide_index", -1)
+	if !ok {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "slide_index is required"})
+	}
+	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
+		slides, _ := deck["slides"].([]interface{})
+		n := len(slides)
+		if idx < 0 || idx >= n {
+			return nil, &toolFault{Code: "out_of_range", Msg: fmt.Sprintf("slide_index out of range: %d (deck has %d slides)", idx, n)}
+		}
+		if n <= 1 {
+			return nil, &toolFault{Code: "deck_empty_forbidden", Msg: "Cannot remove the only slide (would leave deck empty)"}
+		}
+		removed, _ := slides[idx].(map[string]interface{})
+		removedID := ""
+		if removed != nil {
+			removedID, _ = removed["id"].(string)
+		}
+		slides = append(slides[:idx], slides[idx+1:]...)
+		deck["slides"] = slides
+		return map[string]interface{}{
+			"slide_index":      idx,
+			"slide_id":         removedID,
+			"remaining_slides": len(slides),
+		}, nil
+	})
 }
 
 
