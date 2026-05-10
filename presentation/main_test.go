@@ -532,6 +532,76 @@ func TestToolRemoveSlide_RefusesLastSlide(t *testing.T) {
 	}
 }
 
+func TestToolSetSlideBackground_Color(t *testing.T) {
+	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"s1"}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path": deckPath, "slide_index": 0, "color": "A07A4A",
+	})
+	out := toolSetSlideBackground(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	bg := readDeckFile(t, deckPath)["slides"].([]interface{})[0].(map[string]interface{})["background"].(map[string]interface{})
+	if bg["kind"] != "color" {
+		t.Errorf("expected kind=color, got %v", bg["kind"])
+	}
+	if bg["value"] != "#A07A4A" {
+		t.Errorf("expected hash-prefixed hex, got %v", bg["value"])
+	}
+}
+
+func TestToolSetSlideBackground_ImagePath(t *testing.T) {
+	tmp := t.TempDir()
+	imgPath := tmp + "/bg.png"
+	if err := os.WriteFile(imgPath, []byte{0x89, 'P', 'N', 'G', 0xff, 0xfe}, 0644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"s1"}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path": deckPath, "slide_index": 0, "image_path": imgPath,
+	})
+	out := toolSetSlideBackground(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	bg := readDeckFile(t, deckPath)["slides"].([]interface{})[0].(map[string]interface{})["background"].(map[string]interface{})
+	if bg["kind"] != "image" {
+		t.Errorf("expected kind=image, got %v", bg["kind"])
+	}
+	if v, _ := bg["value"].(string); v == "" {
+		t.Errorf("expected non-empty base64, got %v", bg["value"])
+	}
+}
+
+func TestToolSetSlideBackground_RequiresExactlyOneSource(t *testing.T) {
+	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"s1"}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	// none
+	rawArgs, _ := json.Marshal(map[string]interface{}{"path": deckPath, "slide_index": 0})
+	out := toolSetSlideBackground(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected failure when no source, got %+v", out)
+	}
+
+	// two
+	rawArgs, _ = json.Marshal(map[string]interface{}{
+		"path": deckPath, "slide_index": 0,
+		"color": "#fff", "image_base64": "abc",
+	})
+	out = toolSetSlideBackground(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected failure when two sources, got %+v", out)
+	}
+}
+
 func TestToolCreateDeck_HappyPath(t *testing.T) {
 	tmp := t.TempDir()
 	deckPath := tmp + "/foo.mdeck"

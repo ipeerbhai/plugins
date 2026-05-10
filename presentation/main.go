@@ -22,6 +22,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -299,6 +300,20 @@ var toolList = []map[string]interface{}{
 		},
 	},
 	{
+		"name":        "minerva_presentation_set_slide_background",
+		"description": "Set a slide's background. Provide exactly one of color (hex like #A07A4A), image_path (PNG/JPEG file embedded as base64), or image_base64 (bare base64).",
+		"inputSchema": map[string]interface{}{
+			"type": "object",
+			"properties": withProps(targetSchema, map[string]interface{}{
+				"slide_index": map[string]interface{}{"type": "integer"},
+				"color":       map[string]interface{}{"type": "string", "description": "Hex color (with or without leading #)."},
+				"image_path":  map[string]interface{}{"type": "string", "description": "Path to a PNG/JPEG file."},
+				"image_base64": map[string]interface{}{"type": "string", "description": "Bare base64 PNG/JPEG (no data: prefix)."},
+			}),
+			"required": []string{"slide_index"},
+		},
+	},
+	{
 		"name":        "minerva_presentation_create_deck",
 		"description": "Create a new .mdeck slide deck file on disk with one blank slide. Returns the path written. The .mdeck extension is appended if missing. Optional title (first slide), aspect (16:9, 4:3, 1:1).",
 		"inputSchema": map[string]interface{}{
@@ -463,6 +478,8 @@ func dispatchTool(client *hostClient, msg *rpcRequest) {
 		respondTool(client.enc, msg.ID, toolResizeSpreadsheet(client, p.Arguments))
 	case "minerva_presentation_create_deck":
 		respondTool(client.enc, msg.ID, toolCreateDeck(client, p.Arguments))
+	case "minerva_presentation_set_slide_background":
+		respondTool(client.enc, msg.ID, toolSetSlideBackground(client, p.Arguments))
 	default:
 		send(client.enc, errResponse(msg.ID, -32601, "tools/call: unknown tool: "+p.Name))
 	}
@@ -1702,6 +1719,91 @@ func toolResizeSpreadsheet(client *hostClient, rawArgs json.RawMessage) map[stri
 			"old_rows":    oldRows, "old_cols": oldCols,
 			"new_rows": newRows, "new_cols": newCols,
 		}, nil
+	})
+}
+
+
+// ---------------------------------------------------------------------------
+// Background helpers (T6 R7) — color normalization, image base64 reading
+// ---------------------------------------------------------------------------
+
+const (
+	bgKindColor = "color"
+	bgKindImage = "image"
+)
+
+func normalizeHex(hex string) string {
+	s := strings.TrimSpace(hex)
+	if s == "" {
+		return "#ffffff"
+	}
+	if !strings.HasPrefix(s, "#") {
+		s = "#" + s
+	}
+	return s
+}
+
+func readFileAsBase64(path string) (string, *toolFault) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return "", &toolFault{Code: "io_error", Msg: fmt.Sprintf("File not found or unreadable: %s (%v)", path, err)}
+	}
+	if len(body) == 0 {
+		return "", &toolFault{Code: "io_error", Msg: fmt.Sprintf("Empty file: %s", path)}
+	}
+	return base64.StdEncoding.EncodeToString(body), nil
+}
+
+func toolSetSlideBackground(client *hostClient, rawArgs json.RawMessage) map[string]interface{} {
+	args, fault := parseTargetArgs(rawArgs)
+	if fault != nil {
+		return failResult(fault)
+	}
+	sIdx, ok := intArg(args, "slide_index", -1)
+	if !ok {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "slide_index is required"})
+	}
+	color, _ := args["color"].(string)
+	imagePath, _ := args["image_path"].(string)
+	imageBase64, _ := args["image_base64"].(string)
+	hasColor := color != ""
+	hasPath := imagePath != ""
+	hasB64 := imageBase64 != ""
+	sourcesSet := 0
+	if hasColor {
+		sourcesSet++
+	}
+	if hasPath {
+		sourcesSet++
+	}
+	if hasB64 {
+		sourcesSet++
+	}
+	if sourcesSet != 1 {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "Provide exactly one of: color, image_path, image_base64"})
+	}
+
+	var bg map[string]interface{}
+	switch {
+	case hasColor:
+		bg = map[string]interface{}{"kind": bgKindColor, "value": normalizeHex(color)}
+	case hasPath:
+		b64, fault := readFileAsBase64(imagePath)
+		if fault != nil {
+			return failResult(fault)
+		}
+		bg = map[string]interface{}{"kind": bgKindImage, "value": b64}
+	default:
+		bg = map[string]interface{}{"kind": bgKindImage, "value": imageBase64}
+	}
+
+	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
+		slide, fault := slideAt(deck, sIdx)
+		if fault != nil {
+			return nil, fault
+		}
+		slide["background"] = bg
+		return map[string]interface{}{"slide_index": sIdx}, nil
 	})
 }
 
