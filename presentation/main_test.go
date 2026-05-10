@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"os"
 	"strings"
 	"testing"
 )
@@ -180,6 +181,143 @@ func TestToolListOpenDecks_PropagatesCapabilityError(t *testing.T) {
 	}
 	if code, _ := out["error_code"].(string); code != "capability_not_granted" {
 		t.Errorf("expected capability_not_granted, got %s", code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T6 R2 — read tool migration: validators + disk loader
+// ---------------------------------------------------------------------------
+
+func TestParseTargetArgs_RequiresOneTarget(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string // empty == should succeed
+	}{
+		{"neither", `{}`, "Provide either"},
+		{"both", `{"tab_name":"x","path":"/tmp/y.mdeck"}`, "mutually exclusive"},
+		{"tab only", `{"tab_name":"deck.mdeck"}`, ""},
+		{"path only", `{"path":"/tmp/y.mdeck"}`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, fault := parseTargetArgs([]byte(tc.raw))
+			if tc.want == "" {
+				if fault != nil {
+					t.Fatalf("expected nil fault, got %+v", fault)
+				}
+				return
+			}
+			if fault == nil {
+				t.Fatalf("expected fault containing %q, got nil", tc.want)
+			}
+			if !strings.Contains(fault.Msg, tc.want) {
+				t.Errorf("expected msg containing %q, got %q", tc.want, fault.Msg)
+			}
+		})
+	}
+}
+
+func TestLoadDeckFromPath_HappyAndError(t *testing.T) {
+	// Happy path: write a tiny valid deck to a temp file, then load.
+	tmp := t.TempDir()
+	deckPath := tmp + "/probe.mdeck"
+	body := `{"version":1,"aspect":"16:9","slides":[{"id":"s1","title":"hi","tiles":[]}]}`
+	if err := os.WriteFile(deckPath, []byte(body), 0644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	deck, fault := loadDeckFromPath(deckPath)
+	if fault != nil {
+		t.Fatalf("happy: %+v", fault)
+	}
+	if aspect, _ := deck["aspect"].(string); aspect != "16:9" {
+		t.Errorf("aspect mismatch: %v", deck["aspect"])
+	}
+
+	// Error: missing file → io_error.
+	_, fault = loadDeckFromPath(tmp + "/no_such.mdeck")
+	if fault == nil || fault.Code != "io_error" {
+		t.Fatalf("missing file: expected io_error fault, got %+v", fault)
+	}
+
+	// Error: malformed JSON → parse_error.
+	bad := tmp + "/bad.mdeck"
+	if err := os.WriteFile(bad, []byte("not json {{{"), 0644); err != nil {
+		t.Fatalf("bad setup: %v", err)
+	}
+	_, fault = loadDeckFromPath(bad)
+	if fault == nil || fault.Code != "parse_error" {
+		t.Fatalf("bad json: expected parse_error fault, got %+v", fault)
+	}
+}
+
+func TestToolListSlides_FromPath(t *testing.T) {
+	tmp := t.TempDir()
+	deckPath := tmp + "/list.mdeck"
+	body := `{"version":1,"aspect":"4:3","slides":[
+		{"id":"s_a","title":"first","tiles":[{"id":"t1"}]},
+		{"id":"s_b","tiles":[]}
+	]}`
+	if err := os.WriteFile(deckPath, []byte(body), 0644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	// hostClient unused for path mode but must be non-nil.
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{"path": deckPath})
+	out := toolListSlides(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	if aspect, _ := out["aspect"].(string); aspect != "4:3" {
+		t.Errorf("aspect propagation: got %v", out["aspect"])
+	}
+	slides, ok := out["slides"].([]map[string]interface{})
+	if !ok {
+		t.Fatalf("expected slides slice, got %T", out["slides"])
+	}
+	if len(slides) != 2 {
+		t.Fatalf("expected 2 slides, got %d", len(slides))
+	}
+	if slides[0]["title"] != "first" {
+		t.Errorf("first slide title: got %v", slides[0]["title"])
+	}
+	if _, has := slides[1]["title"]; has {
+		t.Errorf("second slide should NOT have title (none in source): got %v", slides[1])
+	}
+}
+
+func TestToolGetSlide_OutOfRange(t *testing.T) {
+	tmp := t.TempDir()
+	deckPath := tmp + "/oor.mdeck"
+	if err := os.WriteFile(deckPath, []byte(`{"slides":[]}`), 0644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{"path": deckPath, "slide_index": 0})
+	out := toolGetSlide(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected failure on empty deck, got %+v", out)
+	}
+	if code, _ := out["error_code"].(string); code != "out_of_range" {
+		t.Errorf("expected out_of_range code, got %q", code)
+	}
+}
+
+func TestToolListAnnotationKinds_NoArgs(t *testing.T) {
+	out := toolListAnnotationKinds(nil)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	kinds, ok := out["kinds"].([]map[string]interface{})
+	if !ok {
+		t.Fatalf("expected kinds slice")
+	}
+	if len(kinds) < 3 {
+		t.Errorf("expected at least 3 kinds, got %d", len(kinds))
 	}
 }
 

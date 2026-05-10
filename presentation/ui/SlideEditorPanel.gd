@@ -782,3 +782,62 @@ func set_deck(deck: Dictionary) -> void:
 	var slides_count: int = (deck.get("slides", []) as Array).size()
 	_selected_slide_index = clampi(_selected_slide_index, 0, max(0, slides_count - 1))
 	_refresh_all()
+
+
+# ---------------------------------------------------------------------------
+# host_owned_save panel-state IPC responder (broker T6 R0)
+# ---------------------------------------------------------------------------
+#
+# Minerva's PluginScenePanelBroker can request our state (so host capability
+# host.documents.get_state works for plugin-scene editors that don't carry a
+# canonical DocumentBuffer) and apply state back to us (host.documents.
+# set_state). The contract is: receive("host_owned_save.get_request"|
+# "set_request", payload), respond by emitting our `request` signal with
+# channel="host_owned_save.response" and the matching request_id.
+
+func receive(channel: String, payload: Dictionary) -> void:
+	match channel:
+		"host_owned_save.get_request":
+			_handle_host_owned_save_get(payload)
+		"host_owned_save.set_request":
+			_handle_host_owned_save_set(payload)
+		_:
+			# Other channels handled by base class or ignored. Keep the
+			# default behaviour rather than swallowing unknowns silently.
+			pass
+
+
+func _handle_host_owned_save_get(payload: Dictionary) -> void:
+	var request_id: String = str(payload.get("request_id", ""))
+	if request_id.is_empty():
+		push_warning("[Presentation_SlideEditorPanel] host_owned_save.get_request missing request_id")
+		return
+	request.emit("host_owned_save.response", {
+		"request_id": request_id,
+		"success": true,
+		"state": _deck.duplicate(true),
+	}, "")
+
+
+func _handle_host_owned_save_set(payload: Dictionary) -> void:
+	var request_id: String = str(payload.get("request_id", ""))
+	if request_id.is_empty():
+		push_warning("[Presentation_SlideEditorPanel] host_owned_save.set_request missing request_id")
+		return
+	var state_v: Variant = payload.get("state", null)
+	if not (state_v is Dictionary):
+		request.emit("host_owned_save.response", {
+			"request_id": request_id,
+			"success": false,
+			"error_code": "schema_validation_failed",
+			"error_message": "state must be a Dictionary",
+		}, "")
+		return
+	set_deck((state_v as Dictionary).duplicate(true))
+	# Mark the tab dirty so host saves on next checkpoint — same contract as
+	# the legacy MCP mutator path (panel.emit_signal("content_changed")).
+	emit_signal("content_changed")
+	request.emit("host_owned_save.response", {
+		"request_id": request_id,
+		"success": true,
+	}, "")
