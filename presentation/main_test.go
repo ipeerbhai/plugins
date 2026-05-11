@@ -648,6 +648,25 @@ func TestToolCreateDeck_AppendsExtension(t *testing.T) {
 	}
 }
 
+func TestToolCreateDeck_CreatesMissingParentDir(t *testing.T) {
+	// Regression guard: GDScript _write_deck_to_disk called make_dir_recursive
+	// before writing. Plugin must do the same — otherwise toolCreateDeck
+	// to a path under a non-existent dir would fail with io_error.
+	tmp := t.TempDir()
+	nestedPath := tmp + "/a/b/c/deck.mdeck"
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{"path": nestedPath})
+	out := toolCreateDeck(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success when parent dir is missing, got %+v", out)
+	}
+	if _, err := os.Stat(nestedPath); err != nil {
+		t.Errorf("deck file should exist at %s, got err: %v", nestedPath, err)
+	}
+}
+
 func TestToolCreateDeck_RejectsBadAspect(t *testing.T) {
 	tmp := t.TempDir()
 	rawArgs, _ := json.Marshal(map[string]interface{}{
@@ -780,6 +799,51 @@ func TestToolModifySpreadsheetCells_PatchesAndSkips(t *testing.T) {
 	}
 }
 
+func TestToolModifySpreadsheetCells_BadTypeKeepsOtherFields(t *testing.T) {
+	// Regression guard: GDScript _modify_spreadsheet_cells continues past a
+	// bad `type` key — other keys in the same patch still apply, and the
+	// cell still counts as updated. Go map iteration is non-deterministic,
+	// so the fix must continue (not break) the inner key loop.
+	body := `{"version":1,"slides":[{"id":"s1","tiles":[
+		{"id":"t1","kind":"spreadsheet","rows":1,"cols":1,"cells":[
+			[{"value":"old","type":1}]
+		]}
+	]}]}`
+	deckPath := writeDeckFile(t, body)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path": deckPath, "slide_index": 0, "tile_id": "t1",
+		"cells": []map[string]interface{}{
+			{"row": 0, "col": 0, "value": "new", "type": 99, "bold": true},
+		},
+	})
+	out := toolModifySpreadsheetCells(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	// Match GDScript: cell counts as updated even though type was bad.
+	if up, _ := out["cells_updated"].(int); up != 1 {
+		t.Errorf("expected cells_updated=1, got %v", out["cells_updated"])
+	}
+	skipped, _ := out["skipped"].([]interface{})
+	if len(skipped) != 1 {
+		t.Errorf("expected 1 skipped (the bad type), got %v", out["skipped"])
+	}
+	cell := readDeckFile(t, deckPath)["slides"].([]interface{})[0].(map[string]interface{})["tiles"].([]interface{})[0].(map[string]interface{})["cells"].([]interface{})[0].([]interface{})[0].(map[string]interface{})
+	// value and bold should have applied; type should NOT have changed from 1.
+	if cell["value"] != "new" {
+		t.Errorf("expected value=new (applied despite bad type), got %v", cell["value"])
+	}
+	if cell["bold"] != true {
+		t.Errorf("expected bold=true (applied despite bad type), got %v", cell["bold"])
+	}
+	if int(cell["type"].(float64)) != 1 {
+		t.Errorf("expected type=1 (unchanged), got %v", cell["type"])
+	}
+}
+
 func TestToolResizeSpreadsheet_GrowAndShrink(t *testing.T) {
 	body := `{"version":1,"slides":[{"id":"s1","tiles":[
 		{"id":"t1","kind":"spreadsheet","rows":2,"cols":2,"cells":[
@@ -882,18 +946,20 @@ func TestToolAddTextTile_HappyPath(t *testing.T) {
 	}
 }
 
-func TestToolAddTextTile_RejectsBadCoords(t *testing.T) {
+func TestToolAddTextTile_RejectsOutOfRangeCoord(t *testing.T) {
 	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"s1","tiles":[]}]}`)
 	var stdout bytes.Buffer
 	client := newMockClient(strings.NewReader(""), &stdout)
 
+	// x outside [0,1] — what the GDScript original also rejects.
+	// (Note: x+w > 1 is intentionally permitted — see validateCoords.)
 	rawArgs, _ := json.Marshal(map[string]interface{}{
 		"path": deckPath, "slide_index": 0,
-		"x": 0.5, "y": 0.5, "w": 0.8, "h": 0.3, "content": "x",
+		"x": 1.5, "y": 0.5, "w": 0.3, "h": 0.3, "content": "x",
 	})
 	out := toolAddTextTile(client, rawArgs)
 	if success, _ := out["success"].(bool); success {
-		t.Fatalf("expected coord overflow failure, got %+v", out)
+		t.Fatalf("expected out-of-range coord failure, got %+v", out)
 	}
 	if code, _ := out["error_code"].(string); code != "schema_validation_failed" {
 		t.Errorf("expected schema_validation_failed, got %q", code)

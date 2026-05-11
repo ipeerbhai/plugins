@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -993,6 +994,13 @@ func saveDeckToPath(path string, deck map[string]interface{}) *toolFault {
 	if err != nil {
 		return &toolFault{Code: "marshal_error", Msg: err.Error()}
 	}
+	// Match GDScript _write_deck_to_disk which called DirAccess.make_dir_recursive_absolute
+	// before writing — create_deck must work when the parent dir doesn't yet exist.
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return &toolFault{Code: "io_error", Msg: err.Error()}
+		}
+	}
 	if err := os.WriteFile(path, body, 0644); err != nil {
 		return &toolFault{Code: "io_error", Msg: err.Error()}
 	}
@@ -1078,7 +1086,9 @@ func textModeIsValid(m string) bool {
 }
 
 // validateCoords mirrors MCPPresentationTools._validate_coords: x/y/w/h must
-// be present, numeric, in [0,1], and (x+w)/(y+h) must not exceed 1.
+// be present, numeric, and each in [0,1]. (The original deliberately does not
+// constrain x+w / y+h — tile rect overflow is a renderer concern, not a model
+// concern, and legacy decks rely on this leniency.)
 func validateCoords(args map[string]interface{}) *toolFault {
 	for _, k := range []string{"x", "y", "w", "h"} {
 		v, ok := args[k]
@@ -1092,16 +1102,6 @@ func validateCoords(args map[string]interface{}) *toolFault {
 		if f < 0.0 || f > 1.0 {
 			return &toolFault{Code: "schema_validation_failed", Msg: fmt.Sprintf("%s must be in [0, 1], got %v", k, f)}
 		}
-	}
-	x, _ := args["x"].(float64)
-	y, _ := args["y"].(float64)
-	w, _ := args["w"].(float64)
-	h, _ := args["h"].(float64)
-	if x+w > 1.0001 {
-		return &toolFault{Code: "schema_validation_failed", Msg: fmt.Sprintf("x+w must not exceed 1, got %v", x+w)}
-	}
-	if y+h > 1.0001 {
-		return &toolFault{Code: "schema_validation_failed", Msg: fmt.Sprintf("y+h must not exceed 1, got %v", y+h)}
 	}
 	return nil
 }
@@ -1631,7 +1631,9 @@ func toolModifySpreadsheetCells(client *hostClient, rawArgs json.RawMessage) map
 				cell = emptyCell()
 				rowArr[c] = cell
 			}
-			badType := false
+			// Match GDScript: a bad `type` is noted in skipped[] but does NOT
+			// abort the rest of the patch keys, and the cell still counts as
+			// updated for the other fields that landed.
 			for k, v := range p {
 				if k == "row" || k == "col" {
 					continue
@@ -1640,17 +1642,14 @@ func toolModifySpreadsheetCells(client *hostClient, rawArgs json.RawMessage) map
 					ti, _ := intArg(p, k, -1)
 					if !cellTypeIsValid(ti) {
 						skipped = append(skipped, map[string]interface{}{"row": r, "col": c, "reason": fmt.Sprintf("bad type %v", v)})
-						badType = true
-						break
+						continue
 					}
 					cell["type"] = ti
 				} else {
 					cell[k] = v
 				}
 			}
-			if !badType {
-				updated++
-			}
+			updated++
 		}
 		return map[string]interface{}{
 			"slide_index":   sIdx,
