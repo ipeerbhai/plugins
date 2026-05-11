@@ -555,7 +555,9 @@ func TestToolSetSlideBackground_Color(t *testing.T) {
 func TestToolSetSlideBackground_ImagePath(t *testing.T) {
 	tmp := t.TempDir()
 	imgPath := tmp + "/bg.png"
-	if err := os.WriteFile(imgPath, []byte{0x89, 'P', 'N', 'G', 0xff, 0xfe}, 0644); err != nil {
+	// PNG magic prefix so the sniffer picks "image/png".
+	pngBytes := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 0xff, 0xfe}
+	if err := os.WriteFile(imgPath, pngBytes, 0644); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"s1"}]}`)
@@ -573,8 +575,75 @@ func TestToolSetSlideBackground_ImagePath(t *testing.T) {
 	if bg["kind"] != "image" {
 		t.Errorf("expected kind=image, got %v", bg["kind"])
 	}
-	if v, _ := bg["value"].(string); v == "" {
-		t.Errorf("expected non-empty base64, got %v", bg["value"])
+	// Phase-5 R3 adoption: bg.value is a blob envelope, not bare base64.
+	env, ok := bg["value"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected bg.value to be a Dictionary (blob envelope), got %T: %v", bg["value"], bg["value"])
+	}
+	if flag, _ := env["__blob__"].(bool); !flag {
+		t.Errorf("expected envelope __blob__=true, got %v", env["__blob__"])
+	}
+	if ct, _ := env["content_type"].(string); ct != "image/png" {
+		t.Errorf("expected content_type=image/png (sniffed), got %q", ct)
+	}
+	if b, _ := env["bytes"].(string); b == "" {
+		t.Errorf("expected non-empty base64 bytes, got %v", env["bytes"])
+	}
+}
+
+
+// TestToolSetSlideBackground_ImageBase64 verifies the image_base64 input path
+// also produces a blob envelope (phase-5 R3 plugin-side adoption).
+func TestToolSetSlideBackground_ImageBase64(t *testing.T) {
+	deckPath := writeDeckFile(t, `{"version":1,"slides":[{"id":"s1"}]}`)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+	// base64 of {0xFF, 0xD8, 0xFF, 0xE0, 'A', 'B'} — JPEG magic prefix.
+	jpegB64 := base64.StdEncoding.EncodeToString([]byte{0xFF, 0xD8, 0xFF, 0xE0, 'A', 'B'})
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path": deckPath, "slide_index": 0, "image_base64": jpegB64,
+	})
+	out := toolSetSlideBackground(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	bg := readDeckFile(t, deckPath)["slides"].([]interface{})[0].(map[string]interface{})["background"].(map[string]interface{})
+	env, ok := bg["value"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected envelope shape, got %T", bg["value"])
+	}
+	if ct, _ := env["content_type"].(string); ct != "image/jpeg" {
+		t.Errorf("expected content_type=image/jpeg (sniffed), got %q", ct)
+	}
+	if b, _ := env["bytes"].(string); b != jpegB64 {
+		t.Errorf("expected bytes to round-trip base64, got %q", b)
+	}
+}
+
+
+// TestSniffImageContentType exercises the magic-byte sniffer used by the
+// background envelope writer. Mirrors slide_model.gd's sniff coverage.
+func TestSniffImageContentType(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []byte
+		want string
+	}{
+		{"png", []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}, "image/png"},
+		{"jpeg", []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10}, "image/jpeg"},
+		{"gif", []byte{0x47, 0x49, 0x46, 0x38, 0x39, 0x61}, "image/gif"},
+		{"webp", []byte{0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50}, "image/webp"},
+		{"empty falls back to png", []byte{}, "image/png"},
+		{"garbage falls back to png", []byte{0x00, 0x00, 0x00, 0x00}, "image/png"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sniffImageContentType(tc.in)
+			if got != tc.want {
+				t.Errorf("sniff(%q): got %q, want %q", tc.name, got, tc.want)
+			}
+		})
 	}
 }
 

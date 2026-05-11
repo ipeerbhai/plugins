@@ -2502,6 +2502,72 @@ func readFileAsBase64(path string) (string, *toolFault) {
 	return base64.StdEncoding.EncodeToString(body), nil
 }
 
+// sniffImageContentType inspects magic bytes to identify the image format.
+// Matches the GDScript-side sniff_image_content_type() in slide_model.gd —
+// any change here must be mirrored there (the broker strip walker doesn't
+// care about content_type accuracy, but host.documents.get_blob consumers do).
+func sniffImageContentType(b []byte) string {
+	if len(b) >= 8 && b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47 {
+		return "image/png"
+	}
+	if len(b) >= 3 && b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF {
+		return "image/jpeg"
+	}
+	if len(b) >= 6 && b[0] == 0x47 && b[1] == 0x49 && b[2] == 0x46 {
+		return "image/gif"
+	}
+	if len(b) >= 12 && b[0] == 0x52 && b[1] == 0x49 && b[2] == 0x46 && b[3] == 0x46 &&
+		b[8] == 0x57 && b[9] == 0x45 && b[10] == 0x42 && b[11] == 0x50 {
+		return "image/webp"
+	}
+	return "image/png"
+}
+
+// sniffContentTypeFromBase64 decodes the head of a base64 string and sniffs
+// magic bytes. Used so the bg envelope records an accurate content_type when
+// the only input was raw base64 (image_base64 arg). Decodes at most ~24 bytes
+// for the sniff (12 base64 chars decode to 9 bytes; we use 16 for slack).
+func sniffContentTypeFromBase64(b64 string) string {
+	prefix := b64
+	if len(prefix) > 24 {
+		prefix = prefix[:24]
+	}
+	raw, err := base64.StdEncoding.DecodeString(prefix)
+	if err != nil {
+		// Re-try with a padding-safe length (base64 needs multiples of 4).
+		safe := (len(b64) / 4) * 4
+		if safe == 0 {
+			return "image/png"
+		}
+		if safe > 24 {
+			safe = 24
+		}
+		raw, err = base64.StdEncoding.DecodeString(b64[:safe])
+		if err != nil {
+			return "image/png"
+		}
+	}
+	return sniffImageContentType(raw)
+}
+
+// makeImageBgEnvelope wraps image bytes in the blob envelope shape required by
+// phase-5 R3 plugin-side adoption. The broker's strip walker recognises this
+// shape and swaps the bytes for a __blob_handle__ on capability responses —
+// keeping list_slides bounded on image-heavy decks.
+//
+// Shape matches slide_model.gd's make_blob_envelope() exactly:
+//
+//	{"__blob__": true, "content_type": "image/png", "bytes": "<base64>"}
+//
+// Any divergence breaks the broker's type gate at PluginScenePanelBroker.gd:1452.
+func makeImageBgEnvelope(b64, contentType string) map[string]interface{} {
+	return map[string]interface{}{
+		"__blob__":     true,
+		"content_type": contentType,
+		"bytes":        b64,
+	}
+}
+
 func toolSetSlideBackground(client *hostClient, rawArgs json.RawMessage) map[string]interface{} {
 	args, fault := parseTargetArgs(rawArgs)
 	if fault != nil {
@@ -2542,9 +2608,13 @@ func toolSetSlideBackground(client *hostClient, rawArgs json.RawMessage) map[str
 		if fault != nil {
 			return failResult(fault)
 		}
-		bg = map[string]interface{}{"kind": bgKindImage, "value": b64}
+		// Sniff content_type from the on-disk bytes (we have them already).
+		raw, _ := os.ReadFile(imagePath)
+		ct := sniffImageContentType(raw)
+		bg = map[string]interface{}{"kind": bgKindImage, "value": makeImageBgEnvelope(b64, ct)}
 	default:
-		bg = map[string]interface{}{"kind": bgKindImage, "value": imageBase64}
+		ct := sniffContentTypeFromBase64(imageBase64)
+		bg = map[string]interface{}{"kind": bgKindImage, "value": makeImageBgEnvelope(imageBase64, ct)}
 	}
 
 	// tab_name mode: single replace op on the slide's background field.

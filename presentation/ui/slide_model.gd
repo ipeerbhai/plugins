@@ -409,9 +409,14 @@ static func validate_background(bg: Variant) -> Array:
 	if kind == BG_IMAGE:
 		# Image backgrounds carry their bytes in a blob envelope so the broker
 		# strip walker can swap them for handles on capability responses.
-		var env_errors: Array = validate_blob_envelope(value)
-		for e in env_errors:
-			errors.append("value.%s" % e)
+		# A bare String here is the legacy raw-base64 shape — hint that the
+		# deck needs migration (scripts/migrate_mdeck_to_blob_contract.gd).
+		if value is String:
+			errors.append("value: legacy raw-base64 detected; run scripts/migrate_mdeck_to_blob_contract.gd to upgrade this deck to the blob-envelope shape")
+		else:
+			var env_errors: Array = validate_blob_envelope(value)
+			for e in env_errors:
+				errors.append("value.%s" % e)
 	else:
 		# Color backgrounds remain plain hex Strings ("#rrggbb").
 		if not (value is String):
@@ -462,10 +467,15 @@ static func validate_tile(tile: Variant) -> Array:
 				errors.append("auto_fit: expected bool, got %s" % str(t["auto_fit"]))
 		TILE_IMAGE:
 			var src: Variant = t.get("src", null)
-			# Post-phase-5 R3: src is a blob envelope, not a bare String.
-			var env_errors: Array = validate_blob_envelope(src)
-			for e in env_errors:
-				errors.append("src.%s" % e)
+			# Post-phase-5 R3: src is a blob envelope, not a bare String. A
+			# bare String here is the legacy raw-base64 shape — hint that the
+			# deck needs migration rather than silently failing on schema.
+			if src is String:
+				errors.append("src: legacy raw-base64 detected; run scripts/migrate_mdeck_to_blob_contract.gd to upgrade this deck to the blob-envelope shape")
+			else:
+				var env_errors: Array = validate_blob_envelope(src)
+				for e in env_errors:
+					errors.append("src.%s" % e)
 		TILE_SPREADSHEET:
 			# Accept int OR whole-number float — JSON.parse() returns all numbers
 			# as float, so a round-tripped {rows:2} arrives as 2.0. Reject 2.5.
