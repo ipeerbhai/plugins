@@ -18,8 +18,10 @@ extends Control
 ## convention. See memory: project_minerva_ui_conventions.md.
 
 signal tile_selected(tile_id: String)            # "" = cleared
-signal tile_moved(tile_id: String, x: float, y: float)
-signal tile_resized(tile_id: String, x: float, y: float, w: float, h: float)
+## Per-event tile_moved/tile_resized signals were removed: nothing ever emitted
+## them. The panel's listeners just called _emit_modified() — that path is
+## already covered by content_mutated, which fires on every relevant mutation
+## (see _on_host_annotations_changed and update_tile_view).
 signal tile_added(tile_id: String)               # newly-created tile (panel notifies model)
 signal tile_deleted(tile_id: String)
 signal content_mutated                           # any change worth marking the doc dirty
@@ -390,14 +392,19 @@ func _build_background() -> void:
 	if kind == _SlideModel.BG_IMAGE:
 		# Image backgrounds carry their bytes in a blob envelope.
 		var b64: String = _SlideModel.envelope_base64(value)
-		var tex: Texture2D = _texture_from_base64(b64) if not b64.is_empty() else null
+		# Explicit if/else here rather than ternary — GDScript 4 flags Texture2D
+		# vs null ternary branches as "mutually incompatible" even though the
+		# function naturally returns null on empty input.
+		var tex: Texture2D = null
+		if not b64.is_empty():
+			tex = _texture_from_base64(b64)
 		if tex != null:
-			var tr := TextureRect.new()
-			tr.texture = tex
-			tr.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-			tr.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_COVERED
-			tr.mouse_filter = Control.MOUSE_FILTER_IGNORE
-			_bg_view = tr
+			var tex_rect := TextureRect.new()
+			tex_rect.texture = tex
+			tex_rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+			tex_rect.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_COVERED
+			tex_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+			_bg_view = tex_rect
 	if _bg_view == null:
 		var cr := ColorRect.new()
 		# Fall back to white for image backgrounds whose envelope failed to
@@ -479,14 +486,15 @@ func _format_text_content(content: String, mode: String) -> String:
 
 
 func _build_image_view(tile: Dictionary) -> Control:
-	var tr := TextureRect.new()
-	tr.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-	tr.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-	tr.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	# Local var named `tex_rect` (not `tr`) to avoid shadowing Object.tr().
+	var tex_rect := TextureRect.new()
+	tex_rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	tex_rect.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	tex_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	var tex: Texture2D = _texture_from_base64(_SlideModel.envelope_base64(tile.get("src", {})))
 	if tex != null:
-		tr.texture = tex
-	return tr
+		tex_rect.texture = tex
+	return tex_rect
 
 
 func _build_spreadsheet_view(tile: Dictionary) -> Control:
@@ -626,7 +634,9 @@ func _compute_text_tile_font_px(tile: Dictionary, px: Rect2, rtl: RichTextLabel)
 	var hi: int = desired_px
 	var best: int = lo
 	while lo <= hi:
-		var mid: int = int((lo + hi) / 2)
+		# Bit-shift rather than `/ 2` so GDScript doesn't flag integer-division
+		# decimal loss (intentional here — this is a binary search midpoint).
+		var mid: int = (lo + hi) >> 1
 		if _rich_text_fits(rtl, mid, px):
 			best = mid
 			lo = mid + 1
@@ -848,17 +858,21 @@ func _place_rect_to_norm() -> Rect2:
 	var sh: float = _slide_rect.size.y
 	if sw <= 0 or sh <= 0:
 		return Rect2()
+	# Both branches declare nx/ny — wrapping the second branch in an explicit
+	# `else` puts them in sibling scopes (not nested), which avoids GDScript's
+	# "declared below in parent block" shadow warning.
 	if not _place_dragged:
 		# Click without drag → default-sized rect, centered on the click.
 		var click_local: Vector2 = _drag_start_mouse - _slide_rect.position
 		var nx: float = clampf(click_local.x / sw - CLICK_PLACE_NORM_W / 2.0, 0.0, 1.0 - CLICK_PLACE_NORM_W)
 		var ny: float = clampf(click_local.y / sh - CLICK_PLACE_NORM_H / 2.0, 0.0, 1.0 - CLICK_PLACE_NORM_H)
 		return Rect2(nx, ny, CLICK_PLACE_NORM_W, CLICK_PLACE_NORM_H)
-	var nx: float = clampf(_place_rect_local.position.x / sw, 0.0, 1.0)
-	var ny: float = clampf(_place_rect_local.position.y / sh, 0.0, 1.0)
-	var nw: float = clampf(_place_rect_local.size.x / sw, MIN_TILE_NORM, 1.0 - nx)
-	var nh: float = clampf(_place_rect_local.size.y / sh, MIN_TILE_NORM, 1.0 - ny)
-	return Rect2(nx, ny, nw, nh)
+	else:
+		var nx: float = clampf(_place_rect_local.position.x / sw, 0.0, 1.0)
+		var ny: float = clampf(_place_rect_local.position.y / sh, 0.0, 1.0)
+		var nw: float = clampf(_place_rect_local.size.x / sw, MIN_TILE_NORM, 1.0 - nx)
+		var nh: float = clampf(_place_rect_local.size.y / sh, MIN_TILE_NORM, 1.0 - ny)
+		return Rect2(nx, ny, nw, nh)
 
 
 func _finish_placement(rect_norm: Rect2) -> void:

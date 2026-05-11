@@ -57,9 +57,9 @@ var _sheet_header_row_check: CheckBox = null
 var _sheet_header_col_check: CheckBox = null
 var _sheet_edit_btn: Button = null
 
-# File pickers (lazy).
-var _image_picker: FileDialog = null
-var _bg_image_picker: FileDialog = null
+# File pickers used to be cached as class vars (_image_picker / _bg_image_picker)
+# but every callsite now creates them on demand via _open_image_picker(). Vars
+# removed — they were declared but never assigned or read.
 
 
 func _ready() -> void:

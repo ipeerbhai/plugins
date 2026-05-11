@@ -102,8 +102,8 @@ func _build_ui() -> void:
 	_canvas.tile_selected.connect(_on_tile_selected)
 	_canvas.tile_added.connect(func(_id: String) -> void: _emit_modified())
 	_canvas.tile_deleted.connect(func(_id: String) -> void: _emit_modified())
-	_canvas.tile_moved.connect(func(_id: String, _x: float, _y: float) -> void: _emit_modified())
-	_canvas.tile_resized.connect(func(_id: String, _x: float, _y: float, _w: float, _h: float) -> void: _emit_modified())
+	# tile_moved / tile_resized signals removed in canvas — content_mutated
+	# (connected just below) already covers every mutation those would have.
 	_canvas.content_mutated.connect(_emit_modified)
 	_canvas.tool_changed.connect(_on_canvas_tool_changed)
 	_canvas.slide_rect_changed.connect(func(_rect: Rect2) -> void: _sync_annotation_host_rect())
@@ -335,7 +335,7 @@ func _on_panel_restore_from_note(payload: Dictionary) -> bool:
 ## one text part per spreadsheet tile (CSV-ish — much cheaper than rasterising
 ## a whole grid). Provider adapters (work_item 019df4ebf896) translate this
 ## into per-provider wire formats.
-func _on_panel_render_for_llm(_ctx: Dictionary) -> Array:
+func _on_panel_render_for_llm(_render_ctx: Dictionary) -> Array:
 	var parts: Array = []
 	var slides: Array = _deck.get("slides", []) as Array
 	for i in range(slides.size()):
