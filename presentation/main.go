@@ -962,10 +962,77 @@ func toolListSlides(client *hostClient, rawArgs json.RawMessage) map[string]inte
 	if fault != nil {
 		return failResult(fault)
 	}
+
+	// tab_name mode: fetch only the subtree we need via GetNode.
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		return toolListSlidesFromTab(client, tabName)
+	}
+
+	// disk mode: unchanged.
 	deck, fault := loadDeck(client, args)
 	if fault != nil {
 		return failResult(fault)
 	}
+	return listSlidesSummary(deck)
+}
+
+func toolListSlidesFromTab(client *hostClient, tabName string) map[string]interface{} {
+	// Fetch /slides subtree — blob-stripped, metadata only.
+	found, slidesVal, fault := client.GetNode(tabName, "/slides")
+	if fault != nil {
+		return failResult(fault)
+	}
+	if !found {
+		return failResult(&toolFault{Code: "not_found", Msg: "/slides not present in deck state"})
+	}
+	slides, _ := slidesVal.([]interface{})
+
+	// Fetch aspect + version from the root for the metadata fields.
+	foundRoot, rootVal, fault := client.GetNode(tabName, "")
+	if fault != nil {
+		return failResult(fault)
+	}
+	aspect := "16:9"
+	version := 1
+	if foundRoot {
+		if root, ok := rootVal.(map[string]interface{}); ok {
+			if a, _ := root["aspect"].(string); a != "" {
+				aspect = a
+			}
+			if v, ok := root["version"].(float64); ok {
+				version = int(v)
+			}
+		}
+	}
+
+	summaries := []map[string]interface{}{}
+	for i, raw := range slides {
+		s, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		tiles, _ := s["tiles"].([]interface{})
+		entry := map[string]interface{}{
+			"index":      i,
+			"id":         strOr(s, "id", ""),
+			"tile_count": len(tiles),
+		}
+		if title, has := s["title"].(string); has && title != "" {
+			entry["title"] = title
+		}
+		summaries = append(summaries, entry)
+	}
+	return map[string]interface{}{
+		"success": true,
+		"slides":  summaries,
+		"aspect":  aspect,
+		"version": version,
+	}
+}
+
+// listSlidesSummary builds the slides summary response from a loaded deck dict.
+// Used by the disk-mode path.
+func listSlidesSummary(deck map[string]interface{}) map[string]interface{} {
 	slides, _ := deck["slides"].([]interface{})
 	summaries := []map[string]interface{}{}
 	for i, raw := range slides {
@@ -1013,6 +1080,13 @@ func toolListTiles(client *hostClient, rawArgs json.RawMessage) map[string]inter
 	if !ok {
 		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "slide_index is required"})
 	}
+
+	// tab_name mode: fetch only the specific slide's tiles subtree.
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		return toolListTilesFromTab(client, tabName, idx)
+	}
+
+	// disk mode: unchanged.
 	deck, fault := loadDeck(client, args)
 	if fault != nil {
 		return failResult(fault)
@@ -1021,6 +1095,46 @@ func toolListTiles(client *hostClient, rawArgs json.RawMessage) map[string]inter
 	if fault != nil {
 		return failResult(fault)
 	}
+	return tilesSummary(slide, idx)
+}
+
+func toolListTilesFromTab(client *hostClient, tabName string, idx int) map[string]interface{} {
+	path := fmt.Sprintf("/slides/%d/tiles", idx)
+	found, tilesVal, fault := client.GetNode(tabName, path)
+	if fault != nil {
+		return failResult(fault)
+	}
+	if !found {
+		return failResult(&toolFault{Code: "out_of_range", Msg: fmt.Sprintf("slide_index out of range or no tiles: %d", idx)})
+	}
+	tiles, _ := tilesVal.([]interface{})
+	out := []map[string]interface{}{}
+	for i, raw := range tiles {
+		t, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		entry := map[string]interface{}{
+			"index": i,
+			"id":    strOr(t, "id", ""),
+			"kind":  strOr(t, "kind", ""),
+		}
+		for _, axis := range []string{"x", "y", "w", "h"} {
+			if v, has := t[axis].(float64); has {
+				entry[axis] = v
+			}
+		}
+		out = append(out, entry)
+	}
+	return map[string]interface{}{
+		"success":     true,
+		"slide_index": idx,
+		"tiles":       out,
+	}
+}
+
+// tilesSummary builds the tiles listing from a slide dict. Used by disk-mode path.
+func tilesSummary(slide map[string]interface{}, idx int) map[string]interface{} {
 	tiles, _ := slide["tiles"].([]interface{})
 	out := []map[string]interface{}{}
 	for i, raw := range tiles {
@@ -1060,6 +1174,27 @@ func toolListAnnotations(client *hostClient, rawArgs json.RawMessage) map[string
 	if !ok {
 		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "slide_index is required"})
 	}
+
+	// tab_name mode: fetch only the annotations subtree for this slide.
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		path := fmt.Sprintf("/slides/%d/annotations", idx)
+		found, annVal, fault := client.GetNode(tabName, path)
+		if fault != nil {
+			return failResult(fault)
+		}
+		// annotations key may be absent (slide has none) — treat not-found as empty.
+		var annotations []interface{}
+		if found {
+			annotations, _ = annVal.([]interface{})
+		}
+		return map[string]interface{}{
+			"success":     true,
+			"slide_index": idx,
+			"annotations": annotations,
+		}
+	}
+
+	// disk mode: unchanged.
 	deck, fault := loadDeck(client, args)
 	if fault != nil {
 		return failResult(fault)
@@ -1089,6 +1224,29 @@ func toolGetSlide(client *hostClient, rawArgs json.RawMessage) map[string]interf
 	if !ok {
 		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "slide_index is required"})
 	}
+
+	// tab_name mode: fetch only the specific slide subtree.
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		path := fmt.Sprintf("/slides/%d", idx)
+		found, slideVal, fault := client.GetNode(tabName, path)
+		if fault != nil {
+			return failResult(fault)
+		}
+		if !found {
+			return failResult(&toolFault{Code: "out_of_range", Msg: fmt.Sprintf("slide_index out of range: %d", idx)})
+		}
+		slide, ok := slideVal.(map[string]interface{})
+		if !ok {
+			return failResult(&toolFault{Code: "schema_violation", Msg: "slide entry is not a JSON object"})
+		}
+		return map[string]interface{}{
+			"success":     true,
+			"slide_index": idx,
+			"slide":       slide,
+		}
+	}
+
+	// disk mode: unchanged.
 	deck, fault := loadDeck(client, args)
 	if fault != nil {
 		return failResult(fault)
@@ -1121,6 +1279,31 @@ func toolGetTile(client *hostClient, rawArgs json.RawMessage) map[string]interfa
 	if !ok {
 		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "tile_index is required"})
 	}
+
+	// tab_name mode: fetch only the specific tile subtree.
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		path := fmt.Sprintf("/slides/%d/tiles/%d", slideIdx, tileIdx)
+		found, tileVal, fault := client.GetNode(tabName, path)
+		if fault != nil {
+			return failResult(fault)
+		}
+		if !found {
+			return failResult(&toolFault{Code: "out_of_range",
+				Msg: fmt.Sprintf("tile_index out of range: %d (slide %d)", tileIdx, slideIdx)})
+		}
+		tile, ok := tileVal.(map[string]interface{})
+		if !ok {
+			return failResult(&toolFault{Code: "schema_violation", Msg: "tile entry is not a JSON object"})
+		}
+		return map[string]interface{}{
+			"success":     true,
+			"slide_index": slideIdx,
+			"tile_index":  tileIdx,
+			"tile":        tile,
+		}
+	}
+
+	// disk mode: unchanged.
 	deck, fault := loadDeck(client, args)
 	if fault != nil {
 		return failResult(fault)
@@ -1445,7 +1628,7 @@ func findTileInSlide(slide map[string]interface{}, tileID string) (map[string]in
 }
 
 // ---------------------------------------------------------------------------
-// Write tools — slide-level mutators (T6 R3)
+// Write tools — slide-level mutators (T6 R3, R6 tab_name paths)
 // ---------------------------------------------------------------------------
 
 func toolAddSlide(client *hostClient, rawArgs json.RawMessage) map[string]interface{} {
@@ -1453,6 +1636,49 @@ func toolAddSlide(client *hostClient, rawArgs json.RawMessage) map[string]interf
 	if fault != nil {
 		return failResult(fault)
 	}
+
+	// tab_name mode: read /slides count, then patch with add op.
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		// Need the current slides to determine append index + validate position.
+		found, slidesVal, fault := client.GetNode(tabName, "/slides")
+		if fault != nil {
+			return failResult(fault)
+		}
+		if !found {
+			return failResult(&toolFault{Code: "not_found", Msg: "/slides not present in deck state"})
+		}
+		slides, _ := slidesVal.([]interface{})
+		insertAt := len(slides)
+		if p, ok := intArg(args, "position", -1); ok {
+			if p < 0 {
+				p = 0
+			}
+			if p > len(slides) {
+				p = len(slides)
+			}
+			insertAt = p
+		}
+		title, _ := args["title"].(string)
+		newSlide := makeSlide(title)
+		// JSON Pointer for array insert: use index for mid-deck, "-" suffix for append.
+		var patchPath string
+		if insertAt == len(slides) {
+			patchPath = "/slides/-"
+		} else {
+			patchPath = fmt.Sprintf("/slides/%d", insertAt)
+		}
+		_, patchFault := client.Patch(tabName).Add(patchPath, newSlide).Send()
+		if patchFault != nil {
+			return failResult(patchFault)
+		}
+		return map[string]interface{}{
+			"success":     true,
+			"slide_index": insertAt,
+			"slide_id":    newSlide["id"],
+		}
+	}
+
+	// disk mode: unchanged.
 	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
 		slides, _ := deck["slides"].([]interface{})
 		insertAt := len(slides)
@@ -1492,6 +1718,36 @@ func toolSetSlideTitle(client *hostClient, rawArgs json.RawMessage) map[string]i
 		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "slide_index is required"})
 	}
 	title, _ := args["title"].(string)
+
+	// tab_name mode: one replace or remove op on the title field.
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		titlePath := fmt.Sprintf("/slides/%d/title", idx)
+		var patchFault *toolFault
+		if title == "" {
+			// Verify the slide exists before attempting remove.
+			found, _, f := client.GetNode(tabName, fmt.Sprintf("/slides/%d", idx))
+			if f != nil {
+				return failResult(f)
+			}
+			if !found {
+				return failResult(&toolFault{Code: "out_of_range", Msg: fmt.Sprintf("slide_index out of range: %d", idx)})
+			}
+			_, patchFault = client.Patch(tabName).Remove(titlePath).Send()
+		} else {
+			// Use add (idempotent: sets whether key exists or not).
+			_, patchFault = client.Patch(tabName).Add(titlePath, title).Send()
+		}
+		if patchFault != nil {
+			return failResult(patchFault)
+		}
+		return map[string]interface{}{
+			"success":     true,
+			"slide_index": idx,
+			"title":       title,
+		}
+	}
+
+	// disk mode: unchanged.
 	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
 		slide, fault := slideAt(deck, idx)
 		if fault != nil {
@@ -1521,6 +1777,17 @@ func toolSetAspect(client *hostClient, rawArgs json.RawMessage) map[string]inter
 	if !aspectIsValid(aspect) {
 		return failResult(&toolFault{Code: "schema_validation_failed", Msg: fmt.Sprintf("aspect must be one of %v", validAspects)})
 	}
+
+	// tab_name mode: single replace op on /aspect.
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		_, patchFault := client.Patch(tabName).Replace("/aspect", aspect).Send()
+		if patchFault != nil {
+			return failResult(patchFault)
+		}
+		return map[string]interface{}{"success": true, "aspect": aspect}
+	}
+
+	// disk mode: unchanged.
 	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
 		deck["aspect"] = aspect
 		return map[string]interface{}{"aspect": aspect}, nil
@@ -1537,6 +1804,38 @@ func toolMoveSlide(client *hostClient, rawArgs json.RawMessage) map[string]inter
 	if !okFrom || !okTo {
 		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "from_index and to_index are required"})
 	}
+
+	// tab_name mode: use JSON Patch move op.
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		if from == to {
+			return map[string]interface{}{"success": true, "from_index": from, "to_index": to, "no_op": true}
+		}
+		// Validate indices exist before patching.
+		found, slidesVal, f := client.GetNode(tabName, "/slides")
+		if f != nil {
+			return failResult(f)
+		}
+		if !found {
+			return failResult(&toolFault{Code: "not_found", Msg: "/slides not present in deck state"})
+		}
+		slides, _ := slidesVal.([]interface{})
+		n := len(slides)
+		if from < 0 || from >= n {
+			return failResult(&toolFault{Code: "out_of_range", Msg: fmt.Sprintf("from_index out of range: %d (deck has %d slides)", from, n)})
+		}
+		if to < 0 || to >= n {
+			return failResult(&toolFault{Code: "out_of_range", Msg: fmt.Sprintf("to_index out of range: %d (deck has %d slides)", to, n)})
+		}
+		fromPath := fmt.Sprintf("/slides/%d", from)
+		toPath := fmt.Sprintf("/slides/%d", to)
+		_, patchFault := client.Patch(tabName).Move(fromPath, toPath).Send()
+		if patchFault != nil {
+			return failResult(patchFault)
+		}
+		return map[string]interface{}{"success": true, "from_index": from, "to_index": to}
+	}
+
+	// disk mode: unchanged.
 	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
 		slides, _ := deck["slides"].([]interface{})
 		n := len(slides)
@@ -1566,6 +1865,41 @@ func toolRemoveSlide(client *hostClient, rawArgs json.RawMessage) map[string]int
 	if !ok {
 		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "slide_index is required"})
 	}
+
+	// tab_name mode: read slides to validate, then patch remove.
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		found, slidesVal, f := client.GetNode(tabName, "/slides")
+		if f != nil {
+			return failResult(f)
+		}
+		if !found {
+			return failResult(&toolFault{Code: "not_found", Msg: "/slides not present in deck state"})
+		}
+		slides, _ := slidesVal.([]interface{})
+		n := len(slides)
+		if idx < 0 || idx >= n {
+			return failResult(&toolFault{Code: "out_of_range", Msg: fmt.Sprintf("slide_index out of range: %d (deck has %d slides)", idx, n)})
+		}
+		if n <= 1 {
+			return failResult(&toolFault{Code: "deck_empty_forbidden", Msg: "Cannot remove the only slide (would leave deck empty)"})
+		}
+		removedID := ""
+		if removed, ok := slides[idx].(map[string]interface{}); ok {
+			removedID, _ = removed["id"].(string)
+		}
+		_, patchFault := client.Patch(tabName).Remove(fmt.Sprintf("/slides/%d", idx)).Send()
+		if patchFault != nil {
+			return failResult(patchFault)
+		}
+		return map[string]interface{}{
+			"success":          true,
+			"slide_index":      idx,
+			"slide_id":         removedID,
+			"remaining_slides": n - 1,
+		}
+	}
+
+	// disk mode: unchanged.
 	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
 		slides, _ := deck["slides"].([]interface{})
 		n := len(slides)
@@ -1608,6 +1942,49 @@ func toolRemoveTile(client *hostClient, rawArgs json.RawMessage) map[string]inte
 	if !ok {
 		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "slide_index is required"})
 	}
+
+	// tab_name mode: read the slide, find tile index, patch remove tile + scrub reveal.
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		slidePath := fmt.Sprintf("/slides/%d", sIdx)
+		found, slideVal, f := client.GetNode(tabName, slidePath)
+		if f != nil {
+			return failResult(f)
+		}
+		if !found {
+			return failResult(&toolFault{Code: "out_of_range", Msg: fmt.Sprintf("slide_index out of range: %d", sIdx)})
+		}
+		slide, ok := slideVal.(map[string]interface{})
+		if !ok {
+			return failResult(&toolFault{Code: "schema_violation", Msg: "slide is not a JSON object"})
+		}
+		_, tileIdx, tileFound := findTileInSlide(slide, tileID)
+		if !tileFound {
+			return failResult(&toolFault{Code: "tile_not_found", Msg: fmt.Sprintf("tile_id not found on slide %d: %s", sIdx, tileID)})
+		}
+		// Build patch: remove tile, then rebuild reveal without this tile id.
+		pb := client.Patch(tabName).Remove(fmt.Sprintf("/slides/%d/tiles/%d", sIdx, tileIdx))
+		if rev, ok := slide["reveal"].([]interface{}); ok {
+			// Rebuild reveal list without the removed tile, then replace.
+			newReveal := []interface{}{}
+			for _, r := range rev {
+				if s, _ := r.(string); s != tileID {
+					newReveal = append(newReveal, s)
+				}
+			}
+			pb = pb.Replace(fmt.Sprintf("/slides/%d/reveal", sIdx), newReveal)
+		}
+		if _, patchFault := pb.Send(); patchFault != nil {
+			return failResult(patchFault)
+		}
+		return map[string]interface{}{
+			"success":     true,
+			"slide_index": sIdx,
+			"tile_id":     tileID,
+			"removed_at":  tileIdx,
+		}
+	}
+
+	// disk mode: unchanged.
 	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
 		slide, fault := slideAt(deck, sIdx)
 		if fault != nil {
@@ -1658,7 +2035,7 @@ func toolAddTextTile(client *hostClient, rawArgs json.RawMessage) map[string]int
 	if !textModeIsValid(textMode) {
 		return failResult(&toolFault{Code: "schema_validation_failed", Msg: fmt.Sprintf("text_mode must be one of %v", validTextModes)})
 	}
-	// Optional fields validated up front so we fail fast before disk I/O.
+	// Optional fields validated up front so we fail fast before any I/O.
 	var fontSize int
 	if v, has := args["font_size"]; has && v != nil {
 		fs, _ := intArg(args, "font_size", 0)
@@ -1678,11 +2055,8 @@ func toolAddTextTile(client *hostClient, rawArgs json.RawMessage) map[string]int
 		rotation = v
 	}
 
-	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
-		slide, fault := slideAt(deck, sIdx)
-		if fault != nil {
-			return nil, fault
-		}
+	// Build the tile dict (shared by both paths).
+	buildTile := func() map[string]interface{} {
 		tile := map[string]interface{}{
 			"id":        genID("tile"),
 			"kind":      tileKindText,
@@ -1702,6 +2076,33 @@ func toolAddTextTile(client *hostClient, rawArgs json.RawMessage) map[string]int
 		if rotation != 0.0 {
 			tile["rotation"] = rotation
 		}
+		return tile
+	}
+
+	// tab_name mode: verify slide exists, append tile via patch.
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		found, _, f := client.GetNode(tabName, fmt.Sprintf("/slides/%d", sIdx))
+		if f != nil {
+			return failResult(f)
+		}
+		if !found {
+			return failResult(&toolFault{Code: "out_of_range", Msg: fmt.Sprintf("slide_index out of range: %d", sIdx)})
+		}
+		tile := buildTile()
+		_, patchFault := client.Patch(tabName).Add(fmt.Sprintf("/slides/%d/tiles/-", sIdx), tile).Send()
+		if patchFault != nil {
+			return failResult(patchFault)
+		}
+		return map[string]interface{}{"success": true, "tile_id": tile["id"]}
+	}
+
+	// disk mode: unchanged.
+	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
+		slide, fault := slideAt(deck, sIdx)
+		if fault != nil {
+			return nil, fault
+		}
+		tile := buildTile()
 		tiles, _ := slide["tiles"].([]interface{})
 		tiles = append(tiles, tile)
 		slide["tiles"] = tiles
@@ -1770,11 +2171,8 @@ func toolAddSpreadsheetTile(client *hostClient, rawArgs json.RawMessage) map[str
 		rotation = v
 	}
 
-	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
-		slide, fault := slideAt(deck, sIdx)
-		if fault != nil {
-			return nil, fault
-		}
+	// Build tile dict (shared by both paths).
+	buildTile := func() map[string]interface{} {
 		tile := map[string]interface{}{
 			"id":         genID("tile"),
 			"kind":       tileKindSpreadsheet,
@@ -1791,6 +2189,37 @@ func toolAddSpreadsheetTile(client *hostClient, rawArgs json.RawMessage) map[str
 		if rotation != 0.0 {
 			tile["rotation"] = rotation
 		}
+		return tile
+	}
+
+	// tab_name mode: verify slide exists, append tile via patch.
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		found, _, f := client.GetNode(tabName, fmt.Sprintf("/slides/%d", sIdx))
+		if f != nil {
+			return failResult(f)
+		}
+		if !found {
+			return failResult(&toolFault{Code: "out_of_range", Msg: fmt.Sprintf("slide_index out of range: %d", sIdx)})
+		}
+		tile := buildTile()
+		_, patchFault := client.Patch(tabName).Add(fmt.Sprintf("/slides/%d/tiles/-", sIdx), tile).Send()
+		if patchFault != nil {
+			return failResult(patchFault)
+		}
+		return map[string]interface{}{
+			"success":     true,
+			"slide_index": sIdx,
+			"tile_id":     tile["id"],
+		}
+	}
+
+	// disk mode: unchanged.
+	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
+		slide, fault := slideAt(deck, sIdx)
+		if fault != nil {
+			return nil, fault
+		}
+		tile := buildTile()
 		tiles, _ := slide["tiles"].([]interface{})
 		tiles = append(tiles, tile)
 		slide["tiles"] = tiles
@@ -1820,22 +2249,15 @@ func toolModifySpreadsheetCells(client *hostClient, rawArgs json.RawMessage) map
 		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "cells must be an array"})
 	}
 
-	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
-		slide, fault := slideAt(deck, sIdx)
-		if fault != nil {
-			return nil, fault
-		}
-		tile, _, found := findTileInSlide(slide, tileID)
-		if !found {
-			return nil, &toolFault{Code: "tile_not_found", Msg: fmt.Sprintf("tile_id not found on slide %d: %s", sIdx, tileID)}
-		}
+	// applyPatchesToTile performs the cell mutation logic on a tile dict and
+	// returns (updated, skipped, fault). Shared by both tab and disk paths.
+	applyPatchesToTile := func(tile map[string]interface{}) (int, []interface{}, *toolFault) {
 		if k, _ := tile["kind"].(string); k != tileKindSpreadsheet {
-			return nil, &toolFault{Code: "kind_mismatch", Msg: "modify_spreadsheet_cells only applies to spreadsheet tiles"}
+			return 0, nil, &toolFault{Code: "kind_mismatch", Msg: "modify_spreadsheet_cells only applies to spreadsheet tiles"}
 		}
 		rows, _ := intArg(tile, "rows", 0)
 		cols, _ := intArg(tile, "cols", 0)
 		cells, _ := tile["cells"].([]interface{})
-
 		updated := 0
 		skipped := []interface{}{}
 		for _, pv := range patches {
@@ -1876,6 +2298,61 @@ func toolModifySpreadsheetCells(client *hostClient, rawArgs json.RawMessage) map
 			}
 			updated++
 		}
+		return updated, skipped, nil
+	}
+
+	// tab_name mode: fetch the tile via GetNode, apply patch logic in memory,
+	// then replace the cells array via Patch.
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		// Fetch the full slide to locate the tile by id.
+		found, slideVal, f := client.GetNode(tabName, fmt.Sprintf("/slides/%d", sIdx))
+		if f != nil {
+			return failResult(f)
+		}
+		if !found {
+			return failResult(&toolFault{Code: "out_of_range", Msg: fmt.Sprintf("slide_index out of range: %d", sIdx)})
+		}
+		slide, ok := slideVal.(map[string]interface{})
+		if !ok {
+			return failResult(&toolFault{Code: "schema_violation", Msg: "slide is not a JSON object"})
+		}
+		tile, tileIdx, tileFound := findTileInSlide(slide, tileID)
+		if !tileFound {
+			return failResult(&toolFault{Code: "tile_not_found", Msg: fmt.Sprintf("tile_id not found on slide %d: %s", sIdx, tileID)})
+		}
+		updated, skipped, applyFault := applyPatchesToTile(tile)
+		if applyFault != nil {
+			return failResult(applyFault)
+		}
+		// Patch only the cells array (smallest affected subtree).
+		cellsPath := fmt.Sprintf("/slides/%d/tiles/%d/cells", sIdx, tileIdx)
+		_, patchFault := client.Patch(tabName).Replace(cellsPath, tile["cells"]).Send()
+		if patchFault != nil {
+			return failResult(patchFault)
+		}
+		return map[string]interface{}{
+			"success":       true,
+			"slide_index":   sIdx,
+			"tile_id":       tileID,
+			"cells_updated": updated,
+			"skipped":       skipped,
+		}
+	}
+
+	// disk mode: unchanged.
+	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
+		slide, fault := slideAt(deck, sIdx)
+		if fault != nil {
+			return nil, fault
+		}
+		tile, _, found := findTileInSlide(slide, tileID)
+		if !found {
+			return nil, &toolFault{Code: "tile_not_found", Msg: fmt.Sprintf("tile_id not found on slide %d: %s", sIdx, tileID)}
+		}
+		updated, skipped, applyFault := applyPatchesToTile(tile)
+		if applyFault != nil {
+			return nil, applyFault
+		}
 		return map[string]interface{}{
 			"slide_index":   sIdx,
 			"tile_id":       tileID,
@@ -1905,22 +2382,14 @@ func toolResizeSpreadsheet(client *hostClient, rawArgs json.RawMessage) map[stri
 		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "rows and cols must both be >= 1"})
 	}
 
-	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
-		slide, fault := slideAt(deck, sIdx)
-		if fault != nil {
-			return nil, fault
-		}
-		tile, _, found := findTileInSlide(slide, tileID)
-		if !found {
-			return nil, &toolFault{Code: "tile_not_found", Msg: fmt.Sprintf("tile_id not found on slide %d: %s", sIdx, tileID)}
-		}
+	// computeNewCells builds the resized cell grid from an existing tile dict.
+	computeNewCells := func(tile map[string]interface{}) ([]interface{}, int, int, *toolFault) {
 		if k, _ := tile["kind"].(string); k != tileKindSpreadsheet {
-			return nil, &toolFault{Code: "kind_mismatch", Msg: "resize_spreadsheet only applies to spreadsheet tiles"}
+			return nil, 0, 0, &toolFault{Code: "kind_mismatch", Msg: "resize_spreadsheet only applies to spreadsheet tiles"}
 		}
 		oldRows, _ := intArg(tile, "rows", 0)
 		oldCols, _ := intArg(tile, "cols", 0)
 		oldCells, _ := tile["cells"].([]interface{})
-
 		newCells := make([]interface{}, newRows)
 		for r := 0; r < newRows; r++ {
 			row := make([]interface{}, newCols)
@@ -1933,6 +2402,62 @@ func toolResizeSpreadsheet(client *hostClient, rawArgs json.RawMessage) map[stri
 				}
 			}
 			newCells[r] = row
+		}
+		return newCells, oldRows, oldCols, nil
+	}
+
+	// tab_name mode: fetch the tile, compute new cells, patch rows/cols/cells.
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		found, slideVal, f := client.GetNode(tabName, fmt.Sprintf("/slides/%d", sIdx))
+		if f != nil {
+			return failResult(f)
+		}
+		if !found {
+			return failResult(&toolFault{Code: "out_of_range", Msg: fmt.Sprintf("slide_index out of range: %d", sIdx)})
+		}
+		slide, ok := slideVal.(map[string]interface{})
+		if !ok {
+			return failResult(&toolFault{Code: "schema_violation", Msg: "slide is not a JSON object"})
+		}
+		tile, tileIdx, tileFound := findTileInSlide(slide, tileID)
+		if !tileFound {
+			return failResult(&toolFault{Code: "tile_not_found", Msg: fmt.Sprintf("tile_id not found on slide %d: %s", sIdx, tileID)})
+		}
+		newCells, oldRows, oldCols, computeFault := computeNewCells(tile)
+		if computeFault != nil {
+			return failResult(computeFault)
+		}
+		tileBase := fmt.Sprintf("/slides/%d/tiles/%d", sIdx, tileIdx)
+		_, patchFault := client.Patch(tabName).
+			Replace(tileBase+"/rows", newRows).
+			Replace(tileBase+"/cols", newCols).
+			Replace(tileBase+"/cells", newCells).
+			Send()
+		if patchFault != nil {
+			return failResult(patchFault)
+		}
+		return map[string]interface{}{
+			"success":     true,
+			"slide_index": sIdx,
+			"tile_id":     tileID,
+			"old_rows":    oldRows, "old_cols": oldCols,
+			"new_rows": newRows, "new_cols": newCols,
+		}
+	}
+
+	// disk mode: unchanged.
+	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
+		slide, fault := slideAt(deck, sIdx)
+		if fault != nil {
+			return nil, fault
+		}
+		tile, _, found := findTileInSlide(slide, tileID)
+		if !found {
+			return nil, &toolFault{Code: "tile_not_found", Msg: fmt.Sprintf("tile_id not found on slide %d: %s", sIdx, tileID)}
+		}
+		newCells, oldRows, oldCols, computeFault := computeNewCells(tile)
+		if computeFault != nil {
+			return nil, computeFault
 		}
 		tile["rows"] = newRows
 		tile["cols"] = newCols
@@ -2006,6 +2531,8 @@ func toolSetSlideBackground(client *hostClient, rawArgs json.RawMessage) map[str
 		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "Provide exactly one of: color, image_path, image_base64"})
 	}
 
+	// Build the background dict. For image_path, read the file once up front
+	// (fail fast before any I/O to the broker).
 	var bg map[string]interface{}
 	switch {
 	case hasColor:
@@ -2020,6 +2547,17 @@ func toolSetSlideBackground(client *hostClient, rawArgs json.RawMessage) map[str
 		bg = map[string]interface{}{"kind": bgKindImage, "value": imageBase64}
 	}
 
+	// tab_name mode: single replace op on the slide's background field.
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		bgPath := fmt.Sprintf("/slides/%d/background", sIdx)
+		_, patchFault := client.Patch(tabName).Replace(bgPath, bg).Send()
+		if patchFault != nil {
+			return failResult(patchFault)
+		}
+		return map[string]interface{}{"success": true, "slide_index": sIdx}
+	}
+
+	// disk mode: unchanged.
 	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
 		slide, fault := slideAt(deck, sIdx)
 		if fault != nil {

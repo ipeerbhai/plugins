@@ -1392,3 +1392,651 @@ func TestPatchBuilder_AllOpTypes_WireShape(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5 R6 — tab_name path tests: verify tools use get_node / patch_state
+// rather than get_state / set_state.
+// ---------------------------------------------------------------------------
+
+// cannedGetNodeSlides returns a canned broker response for get_node("/slides").
+func cannedGetNodeSlides(id string, slides interface{}) string {
+	payload, _ := json.Marshal(map[string]interface{}{
+		"success": true,
+		"result": map[string]interface{}{
+			"editor_name": "deck.mdeck",
+			"path":        "/slides",
+			"found":       true,
+			"value":       slides,
+		},
+	})
+	return cannedCapResponse(id, string(payload))
+}
+
+// cannedGetNodeRoot returns a canned broker response for get_node("") (root).
+func cannedGetNodeRoot(id string, root interface{}) string {
+	payload, _ := json.Marshal(map[string]interface{}{
+		"success": true,
+		"result": map[string]interface{}{
+			"editor_name": "deck.mdeck",
+			"path":        "",
+			"found":       true,
+			"value":       root,
+		},
+	})
+	return cannedCapResponse(id, string(payload))
+}
+
+// cannedGetNodePath returns a canned broker response for get_node(path).
+func cannedGetNodePath(id, path string, found bool, value interface{}) string {
+	payload, _ := json.Marshal(map[string]interface{}{
+		"success": true,
+		"result": map[string]interface{}{
+			"editor_name": "deck.mdeck",
+			"path":        path,
+			"found":       found,
+			"value":       value,
+		},
+	})
+	return cannedCapResponse(id, string(payload))
+}
+
+// cannedPatchOK returns a canned broker success for patch_state.
+func cannedPatchOK(id string, opCount int) string {
+	payload, _ := json.Marshal(map[string]interface{}{
+		"success": true,
+		"result": map[string]interface{}{
+			"editor_name": "deck.mdeck",
+			"op_count":    opCount,
+			"applied_ops": opCount,
+			"dirty":       true,
+		},
+	})
+	return cannedCapResponse(id, string(payload))
+}
+
+// TestToolListSlides_TabName_CallsGetNode verifies list_slides with tab_name
+// calls host.documents.get_node at /slides (not get_state).
+func TestToolListSlides_TabName_CallsGetNode(t *testing.T) {
+	slides := []interface{}{
+		map[string]interface{}{"id": "s1", "title": "First", "tiles": []interface{}{}},
+		map[string]interface{}{"id": "s2", "tiles": []interface{}{"t1"}},
+	}
+	root := map[string]interface{}{"aspect": "4:3", "version": float64(1)}
+	// Two sequential capability calls: cap-1 = /slides, cap-2 = root.
+	canned := cannedGetNodeSlides("cap-1", slides) + cannedGetNodeRoot("cap-2", root)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+	rawArgs, _ := json.Marshal(map[string]interface{}{"tab_name": "deck.mdeck"})
+	out := toolListSlides(client, rawArgs)
+
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	wireOut := stdout.String()
+	// Must use get_node, NOT get_state.
+	if strings.Contains(wireOut, `"capability":"host.documents.get_state"`) {
+		t.Errorf("tab_name mode must NOT call get_state; wire: %s", wireOut)
+	}
+	if !strings.Contains(wireOut, `"capability":"host.documents.get_node"`) {
+		t.Errorf("expected get_node capability in wire, got: %s", wireOut)
+	}
+	// /slides path must appear in one of the get_node calls.
+	if !strings.Contains(wireOut, `"/slides"`) {
+		t.Errorf("expected /slides path in wire, got: %s", wireOut)
+	}
+	// Aspect and version should propagate from root call.
+	if aspect, _ := out["aspect"].(string); aspect != "4:3" {
+		t.Errorf("expected aspect=4:3, got %v", out["aspect"])
+	}
+	// Tile count should be correct.
+	summaries, ok := out["slides"].([]map[string]interface{})
+	if !ok {
+		t.Fatalf("expected slides slice, got %T", out["slides"])
+	}
+	if len(summaries) != 2 {
+		t.Fatalf("expected 2 slides, got %d", len(summaries))
+	}
+	if summaries[0]["title"] != "First" {
+		t.Errorf("expected first slide title=First, got %v", summaries[0]["title"])
+	}
+	if summaries[1]["tile_count"] != 1 {
+		t.Errorf("expected second slide tile_count=1, got %v", summaries[1]["tile_count"])
+	}
+}
+
+// TestToolGetSlide_TabName_CallsGetNode verifies get_slide with tab_name
+// calls get_node at /slides/<i>, not get_state.
+func TestToolGetSlide_TabName_CallsGetNode(t *testing.T) {
+	slide := map[string]interface{}{"id": "s0", "title": "Intro", "tiles": []interface{}{}}
+	canned := cannedGetNodePath("cap-1", "/slides/0", true, slide)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+	rawArgs, _ := json.Marshal(map[string]interface{}{"tab_name": "deck.mdeck", "slide_index": 0})
+	out := toolGetSlide(client, rawArgs)
+
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	wireOut := stdout.String()
+	if strings.Contains(wireOut, `"capability":"host.documents.get_state"`) {
+		t.Errorf("tab_name mode must NOT call get_state; wire: %s", wireOut)
+	}
+	if !strings.Contains(wireOut, `"/slides/0"`) {
+		t.Errorf("expected /slides/0 path in wire, got: %s", wireOut)
+	}
+	if s, _ := out["slide"].(map[string]interface{}); s["title"] != "Intro" {
+		t.Errorf("expected slide title=Intro, got %v", out["slide"])
+	}
+}
+
+// TestToolGetSlide_TabName_NotFound verifies that a not-found get_node for a
+// slide index maps to out_of_range, not a protocol error.
+func TestToolGetSlide_TabName_NotFound(t *testing.T) {
+	canned := cannedGetNodePath("cap-1", "/slides/99", false, nil)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+	rawArgs, _ := json.Marshal(map[string]interface{}{"tab_name": "deck.mdeck", "slide_index": 99})
+	out := toolGetSlide(client, rawArgs)
+
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected failure on out-of-range, got %+v", out)
+	}
+	if code, _ := out["error_code"].(string); code != "out_of_range" {
+		t.Errorf("expected out_of_range, got %q", code)
+	}
+}
+
+// TestToolGetTile_TabName_CallsGetNode verifies get_tile with tab_name
+// calls get_node at /slides/<i>/tiles/<j>, not get_state.
+func TestToolGetTile_TabName_CallsGetNode(t *testing.T) {
+	tile := map[string]interface{}{"id": "t0", "kind": "text", "x": 0.1, "y": 0.1, "w": 0.5, "h": 0.3}
+	canned := cannedGetNodePath("cap-1", "/slides/0/tiles/0", true, tile)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+	rawArgs, _ := json.Marshal(map[string]interface{}{"tab_name": "deck.mdeck", "slide_index": 0, "tile_index": 0})
+	out := toolGetTile(client, rawArgs)
+
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	wireOut := stdout.String()
+	if strings.Contains(wireOut, `"capability":"host.documents.get_state"`) {
+		t.Errorf("tab_name mode must NOT call get_state; wire: %s", wireOut)
+	}
+	if !strings.Contains(wireOut, `"/slides/0/tiles/0"`) {
+		t.Errorf("expected /slides/0/tiles/0 path in wire, got: %s", wireOut)
+	}
+}
+
+// TestToolListTiles_TabName_CallsGetNode verifies list_tiles with tab_name
+// calls get_node at /slides/<i>/tiles.
+func TestToolListTiles_TabName_CallsGetNode(t *testing.T) {
+	tiles := []interface{}{
+		map[string]interface{}{"id": "t0", "kind": "text", "x": 0.1, "y": 0.1, "w": 0.5, "h": 0.3},
+	}
+	canned := cannedGetNodePath("cap-1", "/slides/0/tiles", true, tiles)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+	rawArgs, _ := json.Marshal(map[string]interface{}{"tab_name": "deck.mdeck", "slide_index": 0})
+	out := toolListTiles(client, rawArgs)
+
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	wireOut := stdout.String()
+	if strings.Contains(wireOut, `"capability":"host.documents.get_state"`) {
+		t.Errorf("tab_name mode must NOT call get_state; wire: %s", wireOut)
+	}
+	if !strings.Contains(wireOut, `"/slides/0/tiles"`) {
+		t.Errorf("expected /slides/0/tiles path in wire, got: %s", wireOut)
+	}
+}
+
+// TestToolListAnnotations_TabName_CallsGetNode verifies list_annotations with
+// tab_name calls get_node at /slides/<i>/annotations.
+func TestToolListAnnotations_TabName_CallsGetNode(t *testing.T) {
+	anns := []interface{}{
+		map[string]interface{}{"id": "a1", "kind": "comment"},
+	}
+	canned := cannedGetNodePath("cap-1", "/slides/0/annotations", true, anns)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+	rawArgs, _ := json.Marshal(map[string]interface{}{"tab_name": "deck.mdeck", "slide_index": 0})
+	out := toolListAnnotations(client, rawArgs)
+
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	wireOut := stdout.String()
+	if !strings.Contains(wireOut, `"/slides/0/annotations"`) {
+		t.Errorf("expected /slides/0/annotations path in wire, got: %s", wireOut)
+	}
+}
+
+// TestToolSetAspect_TabName_CallsPatchState verifies set_aspect with tab_name
+// calls patch_state (not set_state) with a replace op on /aspect.
+func TestToolSetAspect_TabName_CallsPatchState(t *testing.T) {
+	canned := cannedPatchOK("cap-1", 1)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+	rawArgs, _ := json.Marshal(map[string]interface{}{"tab_name": "deck.mdeck", "aspect": "4:3"})
+	out := toolSetAspect(client, rawArgs)
+
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	wireOut := stdout.String()
+	if strings.Contains(wireOut, `"capability":"host.documents.set_state"`) {
+		t.Errorf("tab_name mode must NOT call set_state; wire: %s", wireOut)
+	}
+	if !strings.Contains(wireOut, `"capability":"host.documents.patch_state"`) {
+		t.Errorf("expected patch_state in wire, got: %s", wireOut)
+	}
+	if !strings.Contains(wireOut, `"op":"replace"`) {
+		t.Errorf("expected replace op in wire, got: %s", wireOut)
+	}
+	if !strings.Contains(wireOut, `"/aspect"`) {
+		t.Errorf("expected /aspect path in wire, got: %s", wireOut)
+	}
+}
+
+// TestToolSetSlideTitle_TabName_CallsPatchState_Set verifies set_slide_title
+// with tab_name uses patch_state with an add op (title → set).
+func TestToolSetSlideTitle_TabName_CallsPatchState_Set(t *testing.T) {
+	canned := cannedPatchOK("cap-1", 1)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+	rawArgs, _ := json.Marshal(map[string]interface{}{"tab_name": "deck.mdeck", "slide_index": 0, "title": "My Title"})
+	out := toolSetSlideTitle(client, rawArgs)
+
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	wireOut := stdout.String()
+	if strings.Contains(wireOut, `"capability":"host.documents.set_state"`) {
+		t.Errorf("tab_name mode must NOT call set_state; wire: %s", wireOut)
+	}
+	if !strings.Contains(wireOut, `"capability":"host.documents.patch_state"`) {
+		t.Errorf("expected patch_state in wire, got: %s", wireOut)
+	}
+}
+
+// TestToolSetSlideTitle_TabName_CallsPatchState_Clear verifies set_slide_title
+// with title="" issues a get_node (to validate slide exists) then a remove op.
+func TestToolSetSlideTitle_TabName_CallsPatchState_Clear(t *testing.T) {
+	slide := map[string]interface{}{"id": "s0", "title": "Old", "tiles": []interface{}{}}
+	// cap-1 = get_node to verify slide, cap-2 = patch_state remove op.
+	canned := cannedGetNodePath("cap-1", "/slides/0", true, slide) + cannedPatchOK("cap-2", 1)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+	rawArgs, _ := json.Marshal(map[string]interface{}{"tab_name": "deck.mdeck", "slide_index": 0, "title": ""})
+	out := toolSetSlideTitle(client, rawArgs)
+
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	wireOut := stdout.String()
+	if !strings.Contains(wireOut, `"op":"remove"`) {
+		t.Errorf("expected remove op for title clear, got: %s", wireOut)
+	}
+}
+
+// TestToolAddSlide_TabName_CallsPatchState verifies add_slide with tab_name
+// reads /slides count then calls patch_state with an add op.
+func TestToolAddSlide_TabName_CallsPatchState(t *testing.T) {
+	slides := []interface{}{
+		map[string]interface{}{"id": "s0"},
+	}
+	// cap-1 = get_node /slides, cap-2 = patch_state add.
+	canned := cannedGetNodeSlides("cap-1", slides) + cannedPatchOK("cap-2", 1)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+	rawArgs, _ := json.Marshal(map[string]interface{}{"tab_name": "deck.mdeck", "title": "New Slide"})
+	out := toolAddSlide(client, rawArgs)
+
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	wireOut := stdout.String()
+	if strings.Contains(wireOut, `"capability":"host.documents.set_state"`) {
+		t.Errorf("tab_name mode must NOT call set_state; wire: %s", wireOut)
+	}
+	if !strings.Contains(wireOut, `"capability":"host.documents.patch_state"`) {
+		t.Errorf("expected patch_state in wire, got: %s", wireOut)
+	}
+	// Appending to end → /slides/- path.
+	if !strings.Contains(wireOut, `"/slides/-"`) {
+		t.Errorf("expected /slides/- path for append, got: %s", wireOut)
+	}
+	// slide_index should be 1 (was 1 slide, appended at index 1).
+	if idx, _ := out["slide_index"].(int); idx != 1 {
+		t.Errorf("expected slide_index=1, got %v", out["slide_index"])
+	}
+}
+
+// TestToolRemoveSlide_TabName_CallsPatchState verifies remove_slide with tab_name
+// reads /slides to validate, then calls patch_state with a remove op.
+func TestToolRemoveSlide_TabName_CallsPatchState(t *testing.T) {
+	slides := []interface{}{
+		map[string]interface{}{"id": "a"},
+		map[string]interface{}{"id": "b"},
+	}
+	// cap-1 = get_node /slides, cap-2 = patch_state remove.
+	canned := cannedGetNodeSlides("cap-1", slides) + cannedPatchOK("cap-2", 1)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+	rawArgs, _ := json.Marshal(map[string]interface{}{"tab_name": "deck.mdeck", "slide_index": 0})
+	out := toolRemoveSlide(client, rawArgs)
+
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	wireOut := stdout.String()
+	if strings.Contains(wireOut, `"capability":"host.documents.set_state"`) {
+		t.Errorf("tab_name mode must NOT call set_state; wire: %s", wireOut)
+	}
+	if !strings.Contains(wireOut, `"op":"remove"`) {
+		t.Errorf("expected remove op in wire, got: %s", wireOut)
+	}
+	if id, _ := out["slide_id"].(string); id != "a" {
+		t.Errorf("expected removed id=a, got %v", out["slide_id"])
+	}
+	if rem, _ := out["remaining_slides"].(int); rem != 1 {
+		t.Errorf("expected remaining_slides=1, got %v", out["remaining_slides"])
+	}
+}
+
+// TestToolRemoveSlide_TabName_RefusesLastSlide verifies deck_empty_forbidden
+// fires before calling patch_state when only 1 slide remains.
+func TestToolRemoveSlide_TabName_RefusesLastSlide(t *testing.T) {
+	slides := []interface{}{map[string]interface{}{"id": "only"}}
+	canned := cannedGetNodeSlides("cap-1", slides)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+	rawArgs, _ := json.Marshal(map[string]interface{}{"tab_name": "deck.mdeck", "slide_index": 0})
+	out := toolRemoveSlide(client, rawArgs)
+
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected failure on last slide, got %+v", out)
+	}
+	if code, _ := out["error_code"].(string); code != "deck_empty_forbidden" {
+		t.Errorf("expected deck_empty_forbidden, got %q", code)
+	}
+	// Must not have called patch_state.
+	wireOut := stdout.String()
+	if strings.Contains(wireOut, `"capability":"host.documents.patch_state"`) {
+		t.Errorf("must not call patch_state when refusing to empty deck: %s", wireOut)
+	}
+}
+
+// TestToolMoveSlide_TabName_CallsPatchState verifies move_slide with tab_name
+// uses patch_state with a move op.
+func TestToolMoveSlide_TabName_CallsPatchState(t *testing.T) {
+	slides := []interface{}{
+		map[string]interface{}{"id": "a"},
+		map[string]interface{}{"id": "b"},
+		map[string]interface{}{"id": "c"},
+	}
+	// cap-1 = get_node /slides, cap-2 = patch_state move.
+	canned := cannedGetNodeSlides("cap-1", slides) + cannedPatchOK("cap-2", 1)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+	rawArgs, _ := json.Marshal(map[string]interface{}{"tab_name": "deck.mdeck", "from_index": 0, "to_index": 2})
+	out := toolMoveSlide(client, rawArgs)
+
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	wireOut := stdout.String()
+	if !strings.Contains(wireOut, `"op":"move"`) {
+		t.Errorf("expected move op in wire, got: %s", wireOut)
+	}
+}
+
+// TestToolMoveSlide_TabName_NoOp verifies that from==to returns no_op without
+// any capability calls.
+func TestToolMoveSlide_TabName_NoOp(t *testing.T) {
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+	rawArgs, _ := json.Marshal(map[string]interface{}{"tab_name": "deck.mdeck", "from_index": 1, "to_index": 1})
+	out := toolMoveSlide(client, rawArgs)
+
+	if noOp, _ := out["no_op"].(bool); !noOp {
+		t.Errorf("expected no_op=true, got %+v", out)
+	}
+	if stdout.Len() > 0 {
+		t.Errorf("expected no wire calls for no-op, got: %s", stdout.String())
+	}
+}
+
+// TestToolAddTextTile_TabName_CallsPatchState verifies add_text_tile with
+// tab_name uses patch_state with an add op appending to /slides/<i>/tiles.
+func TestToolAddTextTile_TabName_CallsPatchState(t *testing.T) {
+	slide := map[string]interface{}{"id": "s0", "tiles": []interface{}{}}
+	// cap-1 = get_node /slides/0 (existence check), cap-2 = patch_state add.
+	canned := cannedGetNodePath("cap-1", "/slides/0", true, slide) + cannedPatchOK("cap-2", 1)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"tab_name":    "deck.mdeck",
+		"slide_index": 0,
+		"x":           0.1, "y": 0.1, "w": 0.5, "h": 0.3,
+		"content": "hello",
+	})
+	out := toolAddTextTile(client, rawArgs)
+
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	wireOut := stdout.String()
+	if strings.Contains(wireOut, `"capability":"host.documents.set_state"`) {
+		t.Errorf("tab_name mode must NOT call set_state; wire: %s", wireOut)
+	}
+	if !strings.Contains(wireOut, `"/slides/0/tiles/-"`) {
+		t.Errorf("expected /slides/0/tiles/- append path in wire, got: %s", wireOut)
+	}
+}
+
+// TestToolAddSpreadsheetTile_TabName_CallsPatchState verifies add_spreadsheet_tile
+// with tab_name calls patch_state (not set_state).
+func TestToolAddSpreadsheetTile_TabName_CallsPatchState(t *testing.T) {
+	slide := map[string]interface{}{"id": "s0", "tiles": []interface{}{}}
+	// cap-1 = get_node /slides/0, cap-2 = patch_state add.
+	canned := cannedGetNodePath("cap-1", "/slides/0", true, slide) + cannedPatchOK("cap-2", 1)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"tab_name":    "deck.mdeck",
+		"slide_index": 0,
+		"x":           0.0, "y": 0.0, "w": 0.5, "h": 0.5,
+		"rows": 2, "cols": 3,
+	})
+	out := toolAddSpreadsheetTile(client, rawArgs)
+
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	wireOut := stdout.String()
+	if strings.Contains(wireOut, `"capability":"host.documents.set_state"`) {
+		t.Errorf("tab_name mode must NOT call set_state; wire: %s", wireOut)
+	}
+	if !strings.Contains(wireOut, `"capability":"host.documents.patch_state"`) {
+		t.Errorf("expected patch_state in wire, got: %s", wireOut)
+	}
+}
+
+// TestToolRemoveTile_TabName_CallsPatchState verifies remove_tile with tab_name
+// calls patch_state with remove (and replace for reveal scrub).
+func TestToolRemoveTile_TabName_CallsPatchState(t *testing.T) {
+	slide := map[string]interface{}{
+		"id":     "s0",
+		"tiles":  []interface{}{map[string]interface{}{"id": "t_a"}, map[string]interface{}{"id": "t_b"}},
+		"reveal": []interface{}{"t_a", "t_b"},
+	}
+	// cap-1 = get_node /slides/0, cap-2 = patch_state (remove tile + replace reveal).
+	canned := cannedGetNodePath("cap-1", "/slides/0", true, slide) + cannedPatchOK("cap-2", 2)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"tab_name":    "deck.mdeck",
+		"slide_index": 0,
+		"tile_id":     "t_a",
+	})
+	out := toolRemoveTile(client, rawArgs)
+
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	wireOut := stdout.String()
+	if strings.Contains(wireOut, `"capability":"host.documents.set_state"`) {
+		t.Errorf("tab_name mode must NOT call set_state; wire: %s", wireOut)
+	}
+	if !strings.Contains(wireOut, `"op":"remove"`) {
+		t.Errorf("expected remove op in wire, got: %s", wireOut)
+	}
+	if removed, _ := out["removed_at"].(int); removed != 0 {
+		t.Errorf("expected removed_at=0 (t_a is first), got %v", out["removed_at"])
+	}
+}
+
+// TestToolSetSlideBackground_TabName_CallsPatchState verifies set_slide_background
+// with tab_name calls patch_state with a replace op on /slides/<i>/background.
+func TestToolSetSlideBackground_TabName_CallsPatchState(t *testing.T) {
+	canned := cannedPatchOK("cap-1", 1)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"tab_name":    "deck.mdeck",
+		"slide_index": 0,
+		"color":       "#FF0000",
+	})
+	out := toolSetSlideBackground(client, rawArgs)
+
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	wireOut := stdout.String()
+	if strings.Contains(wireOut, `"capability":"host.documents.set_state"`) {
+		t.Errorf("tab_name mode must NOT call set_state; wire: %s", wireOut)
+	}
+	if !strings.Contains(wireOut, `"/slides/0/background"`) {
+		t.Errorf("expected /slides/0/background path in wire, got: %s", wireOut)
+	}
+	if !strings.Contains(wireOut, `"op":"replace"`) {
+		t.Errorf("expected replace op in wire, got: %s", wireOut)
+	}
+}
+
+// TestToolModifySpreadsheetCells_TabName_CallsPatchState verifies
+// modify_spreadsheet_cells with tab_name calls get_node for the slide, mutates
+// cells in memory, then patches only /slides/<i>/tiles/<j>/cells.
+func TestToolModifySpreadsheetCells_TabName_CallsPatchState(t *testing.T) {
+	slide := map[string]interface{}{
+		"id": "s0",
+		"tiles": []interface{}{
+			map[string]interface{}{
+				"id":   "t1",
+				"kind": "spreadsheet",
+				"rows": float64(2), "cols": float64(2),
+				"cells": []interface{}{
+					[]interface{}{map[string]interface{}{"value": "a", "type": float64(1)}, map[string]interface{}{"value": "b", "type": float64(1)}},
+					[]interface{}{map[string]interface{}{"value": "c", "type": float64(1)}, map[string]interface{}{"value": "d", "type": float64(1)}},
+				},
+			},
+		},
+	}
+	// cap-1 = get_node /slides/0, cap-2 = patch_state replace cells.
+	canned := cannedGetNodePath("cap-1", "/slides/0", true, slide) + cannedPatchOK("cap-2", 1)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"tab_name":    "deck.mdeck",
+		"slide_index": 0,
+		"tile_id":     "t1",
+		"cells": []map[string]interface{}{
+			{"row": 0, "col": 0, "value": "X", "type": 1},
+		},
+	})
+	out := toolModifySpreadsheetCells(client, rawArgs)
+
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	wireOut := stdout.String()
+	if strings.Contains(wireOut, `"capability":"host.documents.set_state"`) {
+		t.Errorf("tab_name mode must NOT call set_state; wire: %s", wireOut)
+	}
+	// Must patch only the cells subtree, not the full tile or slide.
+	if !strings.Contains(wireOut, `/slides/0/tiles/0/cells`) {
+		t.Errorf("expected /slides/0/tiles/0/cells path in patch, got: %s", wireOut)
+	}
+	if up, _ := out["cells_updated"].(int); up != 1 {
+		t.Errorf("expected cells_updated=1, got %v", out["cells_updated"])
+	}
+}
+
+// TestToolResizeSpreadsheet_TabName_CallsPatchState verifies resize_spreadsheet
+// with tab_name patches rows/cols/cells atomically.
+func TestToolResizeSpreadsheet_TabName_CallsPatchState(t *testing.T) {
+	slide := map[string]interface{}{
+		"id": "s0",
+		"tiles": []interface{}{
+			map[string]interface{}{
+				"id":   "t1",
+				"kind": "spreadsheet",
+				"rows": float64(2), "cols": float64(2),
+				"cells": []interface{}{
+					[]interface{}{map[string]interface{}{"value": "a", "type": float64(1)}, map[string]interface{}{"value": "b", "type": float64(1)}},
+					[]interface{}{map[string]interface{}{"value": "c", "type": float64(1)}, map[string]interface{}{"value": "d", "type": float64(1)}},
+				},
+			},
+		},
+	}
+	// cap-1 = get_node /slides/0, cap-2 = patch_state (3 replace ops: rows/cols/cells).
+	canned := cannedGetNodePath("cap-1", "/slides/0", true, slide) + cannedPatchOK("cap-2", 3)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"tab_name":    "deck.mdeck",
+		"slide_index": 0,
+		"tile_id":     "t1",
+		"rows":        3, "cols": 3,
+	})
+	out := toolResizeSpreadsheet(client, rawArgs)
+
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	wireOut := stdout.String()
+	if strings.Contains(wireOut, `"capability":"host.documents.set_state"`) {
+		t.Errorf("tab_name mode must NOT call set_state; wire: %s", wireOut)
+	}
+	if !strings.Contains(wireOut, `"capability":"host.documents.patch_state"`) {
+		t.Errorf("expected patch_state in wire, got: %s", wireOut)
+	}
+	if old, _ := out["old_rows"].(int); old != 2 {
+		t.Errorf("expected old_rows=2, got %v", out["old_rows"])
+	}
+	if nw, _ := out["new_rows"].(int); nw != 3 {
+		t.Errorf("expected new_rows=3, got %v", out["new_rows"])
+	}
+}
