@@ -470,7 +470,7 @@ func _format_text_content(content: String, mode: String) -> String:
 			continue
 		var stripped: String = line.lstrip(" ")
 		var indent_spaces: int = line.length() - stripped.length()
-		var level: int = mini(indent_spaces / _INDENT_SPACES_PER_LEVEL, _BULLET_GLYPHS.size() - 1)
+		var level: int = mini(int(indent_spaces / float(_INDENT_SPACES_PER_LEVEL)), _BULLET_GLYPHS.size() - 1)
 		var body: String = stripped
 		if body.begins_with("- "):
 			body = body.substr(2)
