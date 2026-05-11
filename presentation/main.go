@@ -15,8 +15,10 @@
 // tools/call, Minerva will NOT send another tools/call. So when a handler
 // writes a minerva/capability request to stdout, the next line on stdin is
 // guaranteed to be either:
-//   (a) the matching response (correlated by id), or
-//   (b) stdin EOF.
+//
+//	(a) the matching response (correlated by id), or
+//	(b) stdin EOF.
+//
 // The synchronous read pattern below is safe under that guarantee.
 package main
 
@@ -155,6 +157,240 @@ func (c *hostClient) callCapability(capability string, args map[string]interface
 		return nil, &rpcError{Code: -32603, Message: "stdin read error: " + err.Error()}
 	}
 	return nil, &rpcError{Code: -32603, Message: "stdin closed waiting for capability response"}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 host.documents.* helpers
+// ---------------------------------------------------------------------------
+
+// GetNode reads a subtree at a JSON Pointer path within an editor's panel
+// state. The returned value is blob-stripped: blob bytes are replaced by
+// handles — caller fetches bytes via GetBlob only when needed.
+//
+// path: "" for the entire state root, otherwise an RFC 6901 JSON Pointer
+// (must start with "/").
+//
+// Returns (found, value, fault). Not-found is a non-error outcome — the
+// caller may legitimately probe for optional fields. Returns fault on
+// protocol or validation errors (e.g. unknown editor, malformed path).
+func (c *hostClient) GetNode(editorName, path string) (found bool, value interface{}, fault *toolFault) {
+	raw, capErr := c.callCapability("host.documents.get_node", map[string]interface{}{
+		"editor_name": editorName,
+		"path":        path,
+	})
+	if capErr != nil {
+		return false, nil, &toolFault{
+			Code: fmt.Sprintf("rpc_error_%d", capErr.Code),
+			Msg:  capErr.Message,
+		}
+	}
+	var resp struct {
+		Success      bool   `json:"success"`
+		ErrorCode    string `json:"error_code,omitempty"`
+		ErrorMessage string `json:"error_message,omitempty"`
+		Result       *struct {
+			EditorName string      `json:"editor_name"`
+			Path       string      `json:"path"`
+			Found      bool        `json:"found"`
+			Value      interface{} `json:"value"`
+		} `json:"result,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return false, nil, &toolFault{Code: "parse_error", Msg: "parse host.documents.get_node response: " + err.Error()}
+	}
+	if !resp.Success {
+		return false, nil, &toolFault{Code: resp.ErrorCode, Msg: resp.ErrorMessage}
+	}
+	if resp.Result == nil {
+		return false, nil, &toolFault{Code: "parse_error", Msg: "host.documents.get_node returned success but no result"}
+	}
+	return resp.Result.Found, resp.Result.Value, nil
+}
+
+// GetBlob fetches blob bytes for a handle. Returns the decoded bytes and
+// content type.
+//
+// Use only when the bytes are actually needed (e.g. an image-edit tool);
+// plain metadata operations should read the handle via GetNode and call
+// GetBlob only if the bytes themselves are about to be operated on.
+func (c *hostClient) GetBlob(editorName, blobHandle string) (contentType string, data []byte, fault *toolFault) {
+	raw, capErr := c.callCapability("host.documents.get_blob", map[string]interface{}{
+		"editor_name": editorName,
+		"blob_handle": blobHandle,
+	})
+	if capErr != nil {
+		return "", nil, &toolFault{
+			Code: fmt.Sprintf("rpc_error_%d", capErr.Code),
+			Msg:  capErr.Message,
+		}
+	}
+	var resp struct {
+		Success      bool   `json:"success"`
+		ErrorCode    string `json:"error_code,omitempty"`
+		ErrorMessage string `json:"error_message,omitempty"`
+		Result       *struct {
+			EditorName  string `json:"editor_name"`
+			BlobHandle  string `json:"blob_handle"`
+			ContentType string `json:"content_type"`
+			BytesB64    string `json:"bytes_b64"`
+		} `json:"result,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return "", nil, &toolFault{Code: "parse_error", Msg: "parse host.documents.get_blob response: " + err.Error()}
+	}
+	if !resp.Success {
+		return "", nil, &toolFault{Code: resp.ErrorCode, Msg: resp.ErrorMessage}
+	}
+	if resp.Result == nil {
+		return "", nil, &toolFault{Code: "parse_error", Msg: "host.documents.get_blob returned success but no result"}
+	}
+	decoded, err := base64.StdEncoding.DecodeString(resp.Result.BytesB64)
+	if err != nil {
+		return "", nil, &toolFault{Code: "parse_error", Msg: "base64 decode blob bytes: " + err.Error()}
+	}
+	return resp.Result.ContentType, decoded, nil
+}
+
+// PutBlob uploads bytes to the editor's blob store and returns a handle the
+// caller can then reference in a subsequent Patch call. Refcount is 1 after
+// store; the blob stays in the store until referenced by panel state via
+// patch_state, or until the editor is closed.
+func (c *hostClient) PutBlob(editorName, contentType string, data []byte) (blobHandle string, fault *toolFault) {
+	raw, capErr := c.callCapability("host.documents.put_blob", map[string]interface{}{
+		"editor_name":  editorName,
+		"content_type": contentType,
+		"bytes_b64":    base64.StdEncoding.EncodeToString(data),
+	})
+	if capErr != nil {
+		return "", &toolFault{
+			Code: fmt.Sprintf("rpc_error_%d", capErr.Code),
+			Msg:  capErr.Message,
+		}
+	}
+	var resp struct {
+		Success      bool   `json:"success"`
+		ErrorCode    string `json:"error_code,omitempty"`
+		ErrorMessage string `json:"error_message,omitempty"`
+		Result       *struct {
+			EditorName  string `json:"editor_name"`
+			BlobHandle  string `json:"blob_handle"`
+			ContentType string `json:"content_type"`
+		} `json:"result,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return "", &toolFault{Code: "parse_error", Msg: "parse host.documents.put_blob response: " + err.Error()}
+	}
+	if !resp.Success {
+		return "", &toolFault{Code: resp.ErrorCode, Msg: resp.ErrorMessage}
+	}
+	if resp.Result == nil {
+		return "", &toolFault{Code: "parse_error", Msg: "host.documents.put_blob returned success but no result"}
+	}
+	return resp.Result.BlobHandle, nil
+}
+
+// PatchBuilder accumulates RFC 6902 JSON Patch operations for atomic
+// application to an editor's panel state. Call Send() to dispatch. The
+// builder is single-use: Send consumes it.
+//
+// Obtain a builder via hostClient.Patch(editorName). Chain op methods, then
+// call Send().
+type PatchBuilder struct {
+	client     *hostClient
+	editorName string
+	ops        []map[string]interface{}
+}
+
+// Patch returns a new PatchBuilder for the named editor. Chain Add, Remove,
+// Replace, Move, Copy, or Test calls, then call Send() to dispatch.
+func (c *hostClient) Patch(editorName string) *PatchBuilder {
+	return &PatchBuilder{client: c, editorName: editorName}
+}
+
+// Add appends an RFC 6902 "add" operation. path must be an RFC 6901 JSON
+// Pointer (e.g. "/slides/0/title"). value is the node to add.
+func (b *PatchBuilder) Add(path string, value interface{}) *PatchBuilder {
+	b.ops = append(b.ops, map[string]interface{}{"op": "add", "path": path, "value": value})
+	return b
+}
+
+// Remove appends an RFC 6902 "remove" operation. path is the JSON Pointer of
+// the node to remove.
+func (b *PatchBuilder) Remove(path string) *PatchBuilder {
+	b.ops = append(b.ops, map[string]interface{}{"op": "remove", "path": path})
+	return b
+}
+
+// Replace appends an RFC 6902 "replace" operation. path is the JSON Pointer
+// of the node to replace; value is the replacement.
+func (b *PatchBuilder) Replace(path string, value interface{}) *PatchBuilder {
+	b.ops = append(b.ops, map[string]interface{}{"op": "replace", "path": path, "value": value})
+	return b
+}
+
+// Move appends an RFC 6902 "move" operation. from is the source JSON Pointer;
+// path is the destination.
+func (b *PatchBuilder) Move(from, path string) *PatchBuilder {
+	b.ops = append(b.ops, map[string]interface{}{"op": "move", "from": from, "path": path})
+	return b
+}
+
+// Copy appends an RFC 6902 "copy" operation. from is the source JSON Pointer;
+// path is the destination.
+func (b *PatchBuilder) Copy(from, path string) *PatchBuilder {
+	b.ops = append(b.ops, map[string]interface{}{"op": "copy", "from": from, "path": path})
+	return b
+}
+
+// Test appends an RFC 6902 "test" operation. The broker rejects the entire
+// patch (atomically) if the node at path does not equal value.
+func (b *PatchBuilder) Test(path string, value interface{}) *PatchBuilder {
+	b.ops = append(b.ops, map[string]interface{}{"op": "test", "path": path, "value": value})
+	return b
+}
+
+// Send dispatches the accumulated patch via host.documents.patch_state.
+// Returns (op_count, nil) on success. Returns (0, fault) on validation,
+// apply, or write-back failure.
+//
+// Fail-fast: if no ops have been accumulated, Send returns an "empty_patch"
+// fault without making a wire call — the broker rejects empty patches but the
+// helper saves the roundtrip.
+func (b *PatchBuilder) Send() (opCount int, fault *toolFault) {
+	if len(b.ops) == 0 {
+		return 0, &toolFault{Code: "empty_patch", Msg: "patch has no operations; add at least one op before calling Send"}
+	}
+	raw, capErr := b.client.callCapability("host.documents.patch_state", map[string]interface{}{
+		"editor_name": b.editorName,
+		"patch":       b.ops,
+	})
+	if capErr != nil {
+		return 0, &toolFault{
+			Code: fmt.Sprintf("rpc_error_%d", capErr.Code),
+			Msg:  capErr.Message,
+		}
+	}
+	var resp struct {
+		Success      bool   `json:"success"`
+		ErrorCode    string `json:"error_code,omitempty"`
+		ErrorMessage string `json:"error_message,omitempty"`
+		Result       *struct {
+			EditorName string `json:"editor_name"`
+			OpCount    int    `json:"op_count"`
+			AppliedOps int    `json:"applied_ops"`
+			Dirty      bool   `json:"dirty"`
+		} `json:"result,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return 0, &toolFault{Code: "parse_error", Msg: "parse host.documents.patch_state response: " + err.Error()}
+	}
+	if !resp.Success {
+		return 0, &toolFault{Code: resp.ErrorCode, Msg: resp.ErrorMessage}
+	}
+	if resp.Result == nil {
+		return 0, &toolFault{Code: "parse_error", Msg: "host.documents.patch_state returned success but no result"}
+	}
+	return resp.Result.OpCount, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -306,9 +542,9 @@ var toolList = []map[string]interface{}{
 		"inputSchema": map[string]interface{}{
 			"type": "object",
 			"properties": withProps(targetSchema, map[string]interface{}{
-				"slide_index": map[string]interface{}{"type": "integer"},
-				"color":       map[string]interface{}{"type": "string", "description": "Hex color (with or without leading #)."},
-				"image_path":  map[string]interface{}{"type": "string", "description": "Path to a PNG/JPEG file."},
+				"slide_index":  map[string]interface{}{"type": "integer"},
+				"color":        map[string]interface{}{"type": "string", "description": "Hex color (with or without leading #)."},
+				"image_path":   map[string]interface{}{"type": "string", "description": "Path to a PNG/JPEG file."},
 				"image_base64": map[string]interface{}{"type": "string", "description": "Bare base64 PNG/JPEG (no data: prefix)."},
 			}),
 			"required": []string{"slide_index"},
@@ -627,7 +863,6 @@ func intArg(args map[string]interface{}, key string, fallback int) (int, bool) {
 	return fallback, false
 }
 
-
 // ---------------------------------------------------------------------------
 // Tool: minerva_presentation_list_open_decks
 // ---------------------------------------------------------------------------
@@ -636,9 +871,9 @@ func toolListOpenDecks(client *hostClient, _ json.RawMessage) map[string]interfa
 	rawResult, capErr := client.callCapability("host.documents.list_open", map[string]interface{}{})
 	if capErr != nil {
 		return map[string]interface{}{
-			"success":     false,
-			"error":       capErr.Message,
-			"error_code":  fmt.Sprintf("rpc_error_%d", capErr.Code),
+			"success":    false,
+			"error":      capErr.Message,
+			"error_code": fmt.Sprintf("rpc_error_%d", capErr.Code),
 		}
 	}
 
@@ -698,7 +933,6 @@ func toolListOpenDecks(client *hostClient, _ json.RawMessage) map[string]interfa
 	}
 }
 
-
 // ---------------------------------------------------------------------------
 // Tool: minerva_presentation_list_annotation_kinds
 // ---------------------------------------------------------------------------
@@ -709,7 +943,6 @@ func toolListAnnotationKinds(_ json.RawMessage) map[string]interface{} {
 		"kinds":   supportedAnnotationKinds,
 	}
 }
-
 
 // ---------------------------------------------------------------------------
 // Tool: minerva_presentation_list_slides
@@ -758,7 +991,6 @@ func toolListSlides(client *hostClient, rawArgs json.RawMessage) map[string]inte
 	}
 }
 
-
 // ---------------------------------------------------------------------------
 // Tool: minerva_presentation_list_tiles
 // ---------------------------------------------------------------------------
@@ -806,7 +1038,6 @@ func toolListTiles(client *hostClient, rawArgs json.RawMessage) map[string]inter
 	}
 }
 
-
 // ---------------------------------------------------------------------------
 // Tool: minerva_presentation_list_annotations
 // ---------------------------------------------------------------------------
@@ -836,7 +1067,6 @@ func toolListAnnotations(client *hostClient, rawArgs json.RawMessage) map[string
 	}
 }
 
-
 // ---------------------------------------------------------------------------
 // Tool: minerva_presentation_get_slide
 // ---------------------------------------------------------------------------
@@ -864,7 +1094,6 @@ func toolGetSlide(client *hostClient, rawArgs json.RawMessage) map[string]interf
 		"slide":       slide,
 	}
 }
-
 
 // ---------------------------------------------------------------------------
 // Tool: minerva_presentation_get_tile
@@ -908,7 +1137,6 @@ func toolGetTile(client *hostClient, rawArgs json.RawMessage) map[string]interfa
 	}
 }
 
-
 // strOr returns m[key] as string, or fallback if missing/wrong type.
 func strOr(m map[string]interface{}, key, fallback string) string {
 	if v, ok := m[key].(string); ok {
@@ -916,7 +1144,6 @@ func strOr(m map[string]interface{}, key, fallback string) string {
 	}
 	return fallback
 }
-
 
 // ---------------------------------------------------------------------------
 // Deck writer — shared mutate-and-save pipeline (T6 R3)
@@ -954,7 +1181,6 @@ func mutateDeck(
 	return out
 }
 
-
 func saveDeck(client *hostClient, args map[string]interface{}, deck map[string]interface{}) *toolFault {
 	if tabName, _ := args["tab_name"].(string); tabName != "" {
 		return saveDeckToTab(client, tabName, deck)
@@ -964,7 +1190,6 @@ func saveDeck(client *hostClient, args map[string]interface{}, deck map[string]i
 	}
 	return &toolFault{Code: "schema_validation_failed", Msg: "no target supplied"}
 }
-
 
 func saveDeckToTab(client *hostClient, tabName string, deck map[string]interface{}) *toolFault {
 	raw, capErr := client.callCapability("host.documents.set_state", map[string]interface{}{
@@ -988,7 +1213,6 @@ func saveDeckToTab(client *hostClient, tabName string, deck map[string]interface
 	return nil
 }
 
-
 func saveDeckToPath(path string, deck map[string]interface{}) *toolFault {
 	body, err := json.MarshalIndent(deck, "", "  ")
 	if err != nil {
@@ -1007,7 +1231,6 @@ func saveDeckToPath(path string, deck map[string]interface{}) *toolFault {
 	return nil
 }
 
-
 // ---------------------------------------------------------------------------
 // ID generation + slide construction — mirror MCPPresentationTools._gen_id
 // ---------------------------------------------------------------------------
@@ -1025,7 +1248,6 @@ func genID(prefix string) string {
 	return fmt.Sprintf("%s_%06x", prefix, idSeed&0xffffff)
 }
 
-
 func makeSlide(title string) map[string]interface{} {
 	s := map[string]interface{}{
 		"id":         genID("slide"),
@@ -1039,13 +1261,11 @@ func makeSlide(title string) map[string]interface{} {
 	return s
 }
 
-
 // timeNowUnix is a small indirection so tests can keep idSeed deterministic
 // without spawning real time. genID's seed is salted by os.Getpid() anyway.
 func timeNowUnix() int64 {
 	return time.Now().Unix()
 }
-
 
 // ---------------------------------------------------------------------------
 // Aspect validation — must match MCPPresentationTools.ASPECTS_VALID
@@ -1062,16 +1282,15 @@ func aspectIsValid(a string) bool {
 	return false
 }
 
-
 // ---------------------------------------------------------------------------
 // Tile helpers — text mode validation, coord validation, tile lookup
 // ---------------------------------------------------------------------------
 
 const (
-	tileKindText        = "text"
-	textModePlain       = "plain"
-	textModeBullet      = "bullet"
-	textModeNumbered    = "numbered"
+	tileKindText     = "text"
+	textModePlain    = "plain"
+	textModeBullet   = "bullet"
+	textModeNumbered = "numbered"
 )
 
 var validTextModes = []string{textModePlain, textModeBullet, textModeNumbered}
@@ -1215,7 +1434,6 @@ func findTileInSlide(slide map[string]interface{}, tileID string) (map[string]in
 	}
 	return nil, -1, false
 }
-
 
 // ---------------------------------------------------------------------------
 // Write tools — slide-level mutators (T6 R3)
@@ -1363,7 +1581,6 @@ func toolRemoveSlide(client *hostClient, rawArgs json.RawMessage) map[string]int
 	})
 }
 
-
 // ---------------------------------------------------------------------------
 // Write tools — tile-level mutators (T6 R4)
 // ---------------------------------------------------------------------------
@@ -1482,7 +1699,6 @@ func toolAddTextTile(client *hostClient, rawArgs json.RawMessage) map[string]int
 		return map[string]interface{}{"tile_id": tile["id"]}, nil
 	})
 }
-
 
 // ---------------------------------------------------------------------------
 // Write tools — spreadsheet ops (T6 R5)
@@ -1721,7 +1937,6 @@ func toolResizeSpreadsheet(client *hostClient, rawArgs json.RawMessage) map[stri
 	})
 }
 
-
 // ---------------------------------------------------------------------------
 // Background helpers (T6 R7) — color normalization, image base64 reading
 // ---------------------------------------------------------------------------
@@ -1806,7 +2021,6 @@ func toolSetSlideBackground(client *hostClient, rawArgs json.RawMessage) map[str
 	})
 }
 
-
 // ---------------------------------------------------------------------------
 // Deck creation (T6 R6) — pure file IO, no host roundtrip
 // ---------------------------------------------------------------------------
@@ -1859,7 +2073,6 @@ func toolCreateDeck(_ *hostClient, rawArgs json.RawMessage) map[string]interface
 		"deck_id":     fmt.Sprintf("v%d/%s", schemaVersion, aspect),
 	}
 }
-
 
 // ---------------------------------------------------------------------------
 // Top-level dispatch

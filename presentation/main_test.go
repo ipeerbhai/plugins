@@ -7,6 +7,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"os"
@@ -23,7 +24,6 @@ func newMockClient(stdin io.Reader, stdout io.Writer) *hostClient {
 	enc := json.NewEncoder(stdout)
 	return newHostClient(enc, scanner)
 }
-
 
 func TestCallCapability_HappyPath(t *testing.T) {
 	// Pre-canned response: cap-1 succeeded with documents list.
@@ -124,7 +124,6 @@ func TestCallCapability_IDIncrementsAcrossCalls(t *testing.T) {
 		t.Errorf("expected both cap-1 and cap-2 ids in stdout, got: %s", out)
 	}
 }
-
 
 func TestToolListOpenDecks_FiltersByPluginId(t *testing.T) {
 	// Mixed list: one plugin-scene presentation deck, one .mdeck text editor,
@@ -1066,5 +1065,290 @@ func TestToolRemoveSlide_HappyPath(t *testing.T) {
 	}
 	if slides[0].(map[string]interface{})["id"] != "a" || slides[1].(map[string]interface{})["id"] != "c" {
 		t.Errorf("expected order [a,c], got %v", slides)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 R5 — hostClient helper tests: GetNode, GetBlob, PutBlob, Patch
+// ---------------------------------------------------------------------------
+
+// cannedCapResponse builds a single-line canned broker response for cap-N.
+func cannedCapResponse(id, resultJSON string) string {
+	return `{"jsonrpc":"2.0","id":"` + id + `","result":` + resultJSON + `}` + "\n"
+}
+
+// TestHostClient_GetNode_HappyPath_RootValue verifies that GetNode with path=""
+// returns the broker's result value intact and found=true.
+func TestHostClient_GetNode_HappyPath_RootValue(t *testing.T) {
+	resultPayload := `{"success":true,"result":{"editor_name":"deck.mdeck","path":"","found":true,"value":{"aspect":"16:9","slides":[]}}}`
+	canned := cannedCapResponse("cap-1", resultPayload)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+
+	found, value, fault := client.GetNode("deck.mdeck", "")
+	if fault != nil {
+		t.Fatalf("expected nil fault, got %+v", fault)
+	}
+	if !found {
+		t.Fatal("expected found=true")
+	}
+	m, ok := value.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map value, got %T", value)
+	}
+	if aspect, _ := m["aspect"].(string); aspect != "16:9" {
+		t.Errorf("expected aspect=16:9, got %v", m["aspect"])
+	}
+
+	// Verify the wire request named the right capability.
+	if !strings.Contains(stdout.String(), `"capability":"host.documents.get_node"`) {
+		t.Errorf("expected get_node capability in wire request, got: %s", stdout.String())
+	}
+}
+
+// TestHostClient_GetNode_NotFound_IsNotError verifies that a not-found result
+// returns found=false and no fault — it is a legitimate outcome, not an error.
+func TestHostClient_GetNode_NotFound_IsNotError(t *testing.T) {
+	resultPayload := `{"success":true,"result":{"editor_name":"deck.mdeck","path":"/slides/99","found":false,"value":null}}`
+	canned := cannedCapResponse("cap-1", resultPayload)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+
+	found, value, fault := client.GetNode("deck.mdeck", "/slides/99")
+	if fault != nil {
+		t.Fatalf("expected nil fault on not-found, got %+v", fault)
+	}
+	if found {
+		t.Error("expected found=false")
+	}
+	if value != nil {
+		t.Errorf("expected nil value on not-found, got %v", value)
+	}
+}
+
+// TestHostClient_GetNode_PassesThroughBrokerErrorCode verifies that a broker
+// error (success=false) surfaces the broker's error_code unchanged.
+func TestHostClient_GetNode_PassesThroughBrokerErrorCode(t *testing.T) {
+	resultPayload := `{"success":false,"error_code":"not_buffer_canonical","error_message":"editor is not buffer-canonical"}`
+	canned := cannedCapResponse("cap-1", resultPayload)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+
+	found, _, fault := client.GetNode("deck.mdeck", "/slides")
+	if fault == nil {
+		t.Fatal("expected fault, got nil")
+	}
+	if fault.Code != "not_buffer_canonical" {
+		t.Errorf("expected error_code=not_buffer_canonical, got %q", fault.Code)
+	}
+	if found {
+		t.Error("expected found=false on error path")
+	}
+}
+
+// TestHostClient_GetBlob_HappyPath_RoundTripBytes verifies that GetBlob
+// base64-decodes the broker's bytes_b64 field correctly.
+func TestHostClient_GetBlob_HappyPath_RoundTripBytes(t *testing.T) {
+	original := []byte("hello blob world")
+	encoded := base64.StdEncoding.EncodeToString(original)
+	resultPayload := `{"success":true,"result":{"editor_name":"deck.mdeck","blob_handle":"blob-7","content_type":"image/png","bytes_b64":"` + encoded + `"}}`
+	canned := cannedCapResponse("cap-1", resultPayload)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+
+	ct, data, fault := client.GetBlob("deck.mdeck", "blob-7")
+	if fault != nil {
+		t.Fatalf("expected nil fault, got %+v", fault)
+	}
+	if ct != "image/png" {
+		t.Errorf("expected content_type=image/png, got %q", ct)
+	}
+	if !bytes.Equal(data, original) {
+		t.Errorf("round-trip mismatch: got %q, want %q", data, original)
+	}
+}
+
+// TestHostClient_GetBlob_PassesThroughBlobNotFound verifies that a broker
+// blob_not_found error surfaces the code unchanged.
+func TestHostClient_GetBlob_PassesThroughBlobNotFound(t *testing.T) {
+	resultPayload := `{"success":false,"error_code":"blob_not_found","error_message":"no blob with handle blob-99"}`
+	canned := cannedCapResponse("cap-1", resultPayload)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+
+	ct, data, fault := client.GetBlob("deck.mdeck", "blob-99")
+	if fault == nil {
+		t.Fatal("expected fault, got nil")
+	}
+	if fault.Code != "blob_not_found" {
+		t.Errorf("expected error_code=blob_not_found, got %q", fault.Code)
+	}
+	if ct != "" || data != nil {
+		t.Errorf("expected empty ct and nil data on error, got ct=%q data=%v", ct, data)
+	}
+}
+
+// TestHostClient_PutBlob_HappyPath_ReturnsHandle verifies that PutBlob
+// returns the broker-assigned handle on success.
+func TestHostClient_PutBlob_HappyPath_ReturnsHandle(t *testing.T) {
+	resultPayload := `{"success":true,"result":{"editor_name":"deck.mdeck","blob_handle":"blob-42","content_type":"image/jpeg"}}`
+	canned := cannedCapResponse("cap-1", resultPayload)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+
+	handle, fault := client.PutBlob("deck.mdeck", "image/jpeg", []byte("fake jpeg data"))
+	if fault != nil {
+		t.Fatalf("expected nil fault, got %+v", fault)
+	}
+	if handle != "blob-42" {
+		t.Errorf("expected handle=blob-42, got %q", handle)
+	}
+}
+
+// TestHostClient_PutBlob_EncodesBytesAsBase64 verifies that the wire payload
+// contains the base64 encoding of the input bytes (not raw bytes).
+func TestHostClient_PutBlob_EncodesBytesAsBase64(t *testing.T) {
+	rawBytes := []byte("binary\x00\x01\x02content")
+	expectedB64 := base64.StdEncoding.EncodeToString(rawBytes)
+
+	resultPayload := `{"success":true,"result":{"editor_name":"deck.mdeck","blob_handle":"blob-1","content_type":"application/octet-stream"}}`
+	canned := cannedCapResponse("cap-1", resultPayload)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+
+	_, fault := client.PutBlob("deck.mdeck", "application/octet-stream", rawBytes)
+	if fault != nil {
+		t.Fatalf("expected nil fault, got %+v", fault)
+	}
+
+	wireOut := stdout.String()
+	if !strings.Contains(wireOut, expectedB64) {
+		t.Errorf("wire payload missing expected base64 %q in: %s", expectedB64, wireOut)
+	}
+	if !strings.Contains(wireOut, `"capability":"host.documents.put_blob"`) {
+		t.Errorf("expected put_blob capability in wire request, got: %s", wireOut)
+	}
+}
+
+// TestPatchBuilder_ChainedAddRemove_DispatchesOnePatch verifies that chaining
+// Add + Remove on a builder results in a single wire call carrying both ops,
+// in order.
+func TestPatchBuilder_ChainedAddRemove_DispatchesOnePatch(t *testing.T) {
+	resultPayload := `{"success":true,"result":{"editor_name":"deck.mdeck","op_count":2,"applied_ops":2,"dirty":true}}`
+	canned := cannedCapResponse("cap-1", resultPayload)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+
+	opCount, fault := client.Patch("deck.mdeck").
+		Add("/slides/-", map[string]interface{}{"id": "new-slide"}).
+		Remove("/slides/0").
+		Send()
+	if fault != nil {
+		t.Fatalf("expected nil fault, got %+v", fault)
+	}
+	if opCount != 2 {
+		t.Errorf("expected opCount=2, got %d", opCount)
+	}
+
+	wireOut := stdout.String()
+	// Only one wire call should have been made.
+	if strings.Count(wireOut, `"method":"minerva/capability"`) != 1 {
+		t.Errorf("expected exactly one wire call, got: %s", wireOut)
+	}
+	if !strings.Contains(wireOut, `"capability":"host.documents.patch_state"`) {
+		t.Errorf("expected patch_state capability, got: %s", wireOut)
+	}
+
+	// Both ops must appear, add before remove.
+	addIdx := strings.Index(wireOut, `"op":"add"`)
+	removeIdx := strings.Index(wireOut, `"op":"remove"`)
+	if addIdx < 0 || removeIdx < 0 {
+		t.Errorf("missing op entries in wire payload: %s", wireOut)
+	}
+	if addIdx > removeIdx {
+		t.Errorf("expected add before remove in wire payload")
+	}
+}
+
+// TestPatchBuilder_EmptySend_ReturnsEmptyPatchFault verifies the client-side
+// fail-fast when Send is called with no ops accumulated.
+func TestPatchBuilder_EmptySend_ReturnsEmptyPatchFault(t *testing.T) {
+	// No canned response needed — Send must fail before any wire call.
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	opCount, fault := client.Patch("deck.mdeck").Send()
+	if fault == nil {
+		t.Fatal("expected fault on empty patch, got nil")
+	}
+	if fault.Code != "empty_patch" {
+		t.Errorf("expected code=empty_patch, got %q", fault.Code)
+	}
+	if opCount != 0 {
+		t.Errorf("expected opCount=0, got %d", opCount)
+	}
+	// No wire call should have been made.
+	if stdout.Len() > 0 {
+		t.Errorf("expected no wire output on empty-patch fail-fast, got: %s", stdout.String())
+	}
+}
+
+// TestPatchBuilder_PassesThroughPatchFailedFromBroker verifies that a broker
+// patch_failed error surfaces the code unchanged.
+func TestPatchBuilder_PassesThroughPatchFailedFromBroker(t *testing.T) {
+	resultPayload := `{"success":false,"error_code":"patch_failed","error_message":"op 1: path /slides/99 not found"}`
+	canned := cannedCapResponse("cap-1", resultPayload)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+
+	opCount, fault := client.Patch("deck.mdeck").
+		Replace("/slides/99/title", "Oops").
+		Send()
+	if fault == nil {
+		t.Fatal("expected fault, got nil")
+	}
+	if fault.Code != "patch_failed" {
+		t.Errorf("expected error_code=patch_failed, got %q", fault.Code)
+	}
+	if opCount != 0 {
+		t.Errorf("expected opCount=0 on failure, got %d", opCount)
+	}
+}
+
+// TestPatchBuilder_AllOpTypes_WireShape verifies that all six op constructors
+// produce correctly-shaped ops in the wire payload.
+func TestPatchBuilder_AllOpTypes_WireShape(t *testing.T) {
+	resultPayload := `{"success":true,"result":{"editor_name":"deck.mdeck","op_count":6,"applied_ops":6,"dirty":true}}`
+	canned := cannedCapResponse("cap-1", resultPayload)
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+
+	_, fault := client.Patch("deck.mdeck").
+		Add("/a", "v1").
+		Remove("/b").
+		Replace("/c", "v2").
+		Move("/d", "/e").
+		Copy("/f", "/g").
+		Test("/h", "v3").
+		Send()
+	if fault != nil {
+		t.Fatalf("expected nil fault, got %+v", fault)
+	}
+
+	wireOut := stdout.String()
+	for _, op := range []string{"add", "remove", "replace", "move", "copy", "test"} {
+		if !strings.Contains(wireOut, `"op":"`+op+`"`) {
+			t.Errorf("missing op %q in wire payload: %s", op, wireOut)
+		}
 	}
 }
