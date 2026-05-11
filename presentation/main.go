@@ -299,6 +299,7 @@ type PatchBuilder struct {
 	client     *hostClient
 	editorName string
 	ops        []map[string]interface{}
+	sent       bool
 }
 
 // Patch returns a new PatchBuilder for the named editor. Chain Add, Remove,
@@ -356,10 +357,18 @@ func (b *PatchBuilder) Test(path string, value interface{}) *PatchBuilder {
 // Fail-fast: if no ops have been accumulated, Send returns an "empty_patch"
 // fault without making a wire call — the broker rejects empty patches but the
 // helper saves the roundtrip.
+//
+// Single-use guard: a second Send() on the same builder returns "already_sent"
+// without making a wire call, so accidental re-dispatch of the same patch is
+// caught early rather than silently doubling the mutation.
 func (b *PatchBuilder) Send() (opCount int, fault *toolFault) {
+	if b.sent {
+		return 0, &toolFault{Code: "already_sent", Msg: "PatchBuilder.Send was already called on this builder; create a new builder via hostClient.Patch(...) for a new dispatch"}
+	}
 	if len(b.ops) == 0 {
 		return 0, &toolFault{Code: "empty_patch", Msg: "patch has no operations; add at least one op before calling Send"}
 	}
+	b.sent = true
 	raw, capErr := b.client.callCapability("host.documents.patch_state", map[string]interface{}{
 		"editor_name": b.editorName,
 		"patch":       b.ops,

@@ -1301,6 +1301,46 @@ func TestPatchBuilder_EmptySend_ReturnsEmptyPatchFault(t *testing.T) {
 	}
 }
 
+// TestPatchBuilder_SecondSend_ReturnsAlreadySent (cold-review R5 follow-up):
+// Send is documented as single-use. Verify a second .Send() on the same
+// builder returns the "already_sent" fault and does NOT make a second wire
+// call (which would double-dispatch the same patch — invisible to the broker
+// but a real-world correctness hazard).
+func TestPatchBuilder_SecondSend_ReturnsAlreadySent(t *testing.T) {
+	// First Send: provide a canned success response so the builder transitions
+	// to sent=true.
+	resp := `{"jsonrpc":"2.0","id":"cap-1","result":{"success":true,"result":{"editor_name":"deck.mdeck","op_count":1,"applied_ops":1,"dirty":true}}}` + "\n"
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(resp), &stdout)
+
+	builder := client.Patch("deck.mdeck").Add("/aspect", "16:9")
+	opCount1, fault1 := builder.Send()
+	if fault1 != nil {
+		t.Fatalf("first Send unexpected fault: %+v", fault1)
+	}
+	if opCount1 != 1 {
+		t.Errorf("first Send opCount: want 1, got %d", opCount1)
+	}
+
+	// Record stdout length so we can prove the second Send did NOT write.
+	preSecondLen := stdout.Len()
+
+	// Second Send must return already_sent without touching the wire.
+	opCount2, fault2 := builder.Send()
+	if fault2 == nil {
+		t.Fatal("second Send: expected already_sent fault, got nil")
+	}
+	if fault2.Code != "already_sent" {
+		t.Errorf("second Send: want code=already_sent, got %q", fault2.Code)
+	}
+	if opCount2 != 0 {
+		t.Errorf("second Send: want opCount=0, got %d", opCount2)
+	}
+	if stdout.Len() != preSecondLen {
+		t.Errorf("second Send wrote to wire (len delta = %d); should have short-circuited", stdout.Len()-preSecondLen)
+	}
+}
+
 // TestPatchBuilder_PassesThroughPatchFailedFromBroker verifies that a broker
 // patch_failed error surfaces the code unchanged.
 func TestPatchBuilder_PassesThroughPatchFailedFromBroker(t *testing.T) {
