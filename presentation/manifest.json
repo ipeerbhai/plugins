@@ -47,7 +47,11 @@
     "host_capabilities": [
       "host.documents.list_open",
       "host.documents.get_state",
-      "host.documents.set_state"
+      "host.documents.set_state",
+      "host.documents.get_node",
+      "host.documents.get_blob",
+      "host.documents.patch_state",
+      "host.documents.put_blob"
     ],
     "network": {
       "mode": "none"
