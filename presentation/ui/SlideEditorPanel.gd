@@ -392,10 +392,12 @@ func _slide_to_llm_text(idx: int, slide: Dictionary) -> String:
 ## Decode an image tile's base64 src into a Godot Image. Returns null on
 ## decode failure (LLM payload simply omits the image part).
 func _image_tile_to_image(tile: Dictionary) -> Image:
-	var src: String = String(tile.get("src", ""))
-	if src.is_empty():
+	# Image bytes live under tile.src as a {__blob__:true, content_type, bytes}
+	# envelope (phase 5 R3 plugin-side adoption).
+	var src_b64: String = _SlideModel.envelope_base64(tile.get("src", {}))
+	if src_b64.is_empty():
 		return null
-	var bytes: PackedByteArray = Marshalls.base64_to_raw(src)
+	var bytes: PackedByteArray = Marshalls.base64_to_raw(src_b64)
 	if bytes.is_empty():
 		return null
 	var img: = Image.new()
@@ -619,9 +621,13 @@ func _on_bg_pick_image() -> void:
 			f.close()
 			if bytes.size() > 0:
 				var b64: String = Marshalls.raw_to_base64(bytes)
+				var ct: String = _SlideModel.sniff_image_content_type(bytes)
 				var slide := _current_slide()
 				if not slide.is_empty():
-					slide["background"] = {"kind": _SlideModel.BG_IMAGE, "value": b64}
+					slide["background"] = {
+						"kind": _SlideModel.BG_IMAGE,
+						"value": _SlideModel.make_blob_envelope(b64, ct),
+					}
 					_emit_modified()
 					_canvas.set_slide(slide)
 		picker.queue_free()

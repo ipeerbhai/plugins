@@ -386,9 +386,11 @@ func _rebuild_views() -> void:
 func _build_background() -> void:
 	var bg: Dictionary = _slide.get("background", _SlideModel.BG_DEFAULT) as Dictionary
 	var kind: String = str(bg.get("kind", _SlideModel.BG_COLOR))
-	var value: String = str(bg.get("value", "#ffffff"))
-	if kind == _SlideModel.BG_IMAGE and not value.is_empty():
-		var tex: Texture2D = _texture_from_base64(value)
+	var value: Variant = bg.get("value", "#ffffff")
+	if kind == _SlideModel.BG_IMAGE:
+		# Image backgrounds carry their bytes in a blob envelope.
+		var b64: String = _SlideModel.envelope_base64(value)
+		var tex: Texture2D = _texture_from_base64(b64) if not b64.is_empty() else null
 		if tex != null:
 			var tr := TextureRect.new()
 			tr.texture = tex
@@ -398,7 +400,9 @@ func _build_background() -> void:
 			_bg_view = tr
 	if _bg_view == null:
 		var cr := ColorRect.new()
-		cr.color = _color_from_hex(value)
+		# Fall back to white for image backgrounds whose envelope failed to
+		# decode; otherwise `value` is the hex string for color backgrounds.
+		cr.color = _color_from_hex(str(value)) if kind == _SlideModel.BG_COLOR else Color.WHITE
 		cr.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		_bg_view = cr
 	_content_layer.add_child(_bg_view)
@@ -479,7 +483,7 @@ func _build_image_view(tile: Dictionary) -> Control:
 	tr.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	tr.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	tr.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	var tex: Texture2D = _texture_from_base64(str(tile.get("src", "")))
+	var tex: Texture2D = _texture_from_base64(_SlideModel.envelope_base64(tile.get("src", {})))
 	if tex != null:
 		tr.texture = tex
 	return tr
@@ -905,9 +909,14 @@ func _run_image_picker_then_place(rect_norm: Rect2) -> void:
 	picker.file_selected.connect(func(path: String) -> void:
 		var b64 := _read_file_as_base64(path)
 		if b64 != "":
+			# Sniff content_type from the decoded bytes so the envelope records
+			# the right type instead of defaulting to "image/png" for JPEGs.
+			var raw: PackedByteArray = Marshalls.base64_to_raw(b64)
+			var ct: String = _SlideModel.sniff_image_content_type(raw)
 			var tile: Dictionary = _SlideModel.make_image_tile(b64,
 				rect_norm.position.x, rect_norm.position.y,
-				rect_norm.size.x, rect_norm.size.y)
+				rect_norm.size.x, rect_norm.size.y,
+				0.0, ct)
 			(_slide["tiles"] as Array).append(tile)
 			_selected_tile_id = tile["id"]
 			tile_added.emit(tile["id"])

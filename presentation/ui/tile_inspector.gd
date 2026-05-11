@@ -288,8 +288,9 @@ func _refresh_tile_section() -> void:
 			_text_content_edit.text = str(t.get("content", ""))
 		_SlideModel.TILE_IMAGE:
 			_image_section.visible = true
-			var src: String = str(t.get("src", ""))
-			_image_status_label.text = "(no image set)" if src == "" else "Image set (%d chars base64)" % src.length()
+			# Post-phase-5 R3: src is a blob envelope, not a bare base64 String.
+			var src_b64: String = _SlideModel.envelope_base64(t.get("src", {}))
+			_image_status_label.text = "(no image set)" if src_b64.is_empty() else "Image set (%d chars base64)" % src_b64.length()
 		_SlideModel.TILE_SPREADSHEET:
 			_sheet_section.visible = true
 			_sheet_rows_spin.value = float(t.get("rows", 1))
@@ -409,12 +410,14 @@ func _handle_image_picked(path: String, is_background: bool) -> void:
 		push_warning("[presentation] image at %s is empty" % path)
 		return
 	var b64: String = Marshalls.raw_to_base64(bytes)
+	var ct: String = _SlideModel.sniff_image_content_type(bytes)
+	var envelope: Dictionary = _SlideModel.make_blob_envelope(b64, ct)
 	if is_background:
-		var bg: Dictionary = {"kind": _SlideModel.BG_IMAGE, "value": b64}
+		var bg: Dictionary = {"kind": _SlideModel.BG_IMAGE, "value": envelope}
 		slide_background_changed.emit(str(_slide.get("id", "")), bg)
 	else:
 		if _tile_id != "":
-			tile_property_changed.emit(_tile_id, "src", b64)
+			tile_property_changed.emit(_tile_id, "src", envelope)
 
 
 # ---------------------------------------------------------------------------

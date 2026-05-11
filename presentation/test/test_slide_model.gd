@@ -24,6 +24,19 @@ func _init() -> void:
 	test_make_slide_with_explicit_id_and_title()
 	test_make_text_tile_defaults()
 	test_make_image_tile_requires_src()
+	test_make_image_tile_with_content_type()
+	test_make_blob_envelope_shape()
+	test_envelope_base64_extracts()
+	test_envelope_base64_returns_empty_for_non_envelope()
+	test_envelope_base64_tolerates_json_float_true()
+	test_validate_blob_envelope_happy()
+	test_validate_blob_envelope_rejects_non_dict()
+	test_validate_blob_envelope_rejects_missing_fields()
+	test_sniff_content_type_png()
+	test_sniff_content_type_jpeg()
+	test_sniff_content_type_gif()
+	test_sniff_content_type_webp()
+	test_sniff_content_type_unknown_defaults_to_png()
 	test_make_spreadsheet_tile_default_grid()
 	test_make_spreadsheet_tile_with_provided_cells()
 	test_make_cell_default_empty()
@@ -173,13 +186,116 @@ func test_make_text_tile_defaults() -> void:
 
 func test_make_image_tile_requires_src() -> void:
 	print("test_make_image_tile_requires_src:")
+	# Post-phase-5 R3: src is a {__blob__:true, content_type, bytes} envelope,
+	# not a bare base64 String. make_image_tile wraps src_base64 in that shape.
 	var t: Dictionary = SlideModel.make_image_tile("dGVzdA==")
 	check_eq("kind", t["kind"], SlideModel.TILE_IMAGE)
-	check_eq("src round-trips", t["src"], "dGVzdA==")
+	check("src is a Dictionary (envelope)", t["src"] is Dictionary)
+	var src_env := t["src"] as Dictionary
+	check_eq("envelope __blob__ true", src_env.get("__blob__", false), true)
+	check_eq("envelope content_type default", str(src_env.get("content_type", "")), "image/png")
+	check_eq("envelope bytes round-trips base64", str(src_env.get("bytes", "")), "dGVzdA==")
 	check("validates with src", SlideModel.validate_tile(t).is_empty())
-	# Empty src should fail validation.
+	# Empty src should fail validation (envelope has empty bytes).
 	var t_bad: Dictionary = SlideModel.make_image_tile("")
 	check("empty src fails validate_tile", not SlideModel.validate_tile(t_bad).is_empty())
+
+
+func test_make_image_tile_with_content_type() -> void:
+	print("test_make_image_tile_with_content_type:")
+	var t: Dictionary = SlideModel.make_image_tile("dGVzdA==", 0.1, 0.1, 0.4, 0.4, 0.0, "image/jpeg")
+	var env := t["src"] as Dictionary
+	check_eq("content_type honored", str(env.get("content_type", "")), "image/jpeg")
+	check("validates", SlideModel.validate_tile(t).is_empty())
+
+
+# ---------------------------------------------------------------------------
+# Blob envelope helper tests (added with phase-5 R3 plugin-side adoption)
+# ---------------------------------------------------------------------------
+
+func test_make_blob_envelope_shape() -> void:
+	print("test_make_blob_envelope_shape:")
+	var env: Dictionary = SlideModel.make_blob_envelope("dGVzdA==", "image/png")
+	check_eq("__blob__ true", env.get("__blob__", false), true)
+	check_eq("content_type set", str(env.get("content_type", "")), "image/png")
+	check_eq("bytes preserved", str(env.get("bytes", "")), "dGVzdA==")
+
+
+func test_envelope_base64_extracts() -> void:
+	print("test_envelope_base64_extracts:")
+	var env: Dictionary = SlideModel.make_blob_envelope("aGVsbG8=", "image/png")
+	check_eq("extracts base64", SlideModel.envelope_base64(env), "aGVsbG8=")
+
+
+func test_envelope_base64_returns_empty_for_non_envelope() -> void:
+	print("test_envelope_base64_returns_empty_for_non_envelope:")
+	check_eq("empty for non-Dictionary", SlideModel.envelope_base64("raw-string"), "")
+	check_eq("empty for missing flag", SlideModel.envelope_base64({"bytes": "abc"}), "")
+	check_eq("empty for non-String bytes",
+		SlideModel.envelope_base64({"__blob__": true, "bytes": 42, "content_type": "x"}), "")
+
+
+func test_envelope_base64_tolerates_json_float_true() -> void:
+	print("test_envelope_base64_tolerates_json_float_true:")
+	# JSON round-trip can deliver true as 1.0 in Godot 4 — same tolerance as
+	# the broker's strip walker.
+	var env: Dictionary = {"__blob__": 1.0, "content_type": "image/png", "bytes": "Zm9v"}
+	check_eq("tolerates 1.0", SlideModel.envelope_base64(env), "Zm9v")
+
+
+func test_validate_blob_envelope_happy() -> void:
+	print("test_validate_blob_envelope_happy:")
+	var env: Dictionary = SlideModel.make_blob_envelope("abc", "image/png")
+	check("validates", SlideModel.validate_blob_envelope(env).is_empty())
+
+
+func test_validate_blob_envelope_rejects_non_dict() -> void:
+	print("test_validate_blob_envelope_rejects_non_dict:")
+	var errs: Array = SlideModel.validate_blob_envelope("just a string")
+	check("non-dict reported", not errs.is_empty())
+
+
+func test_validate_blob_envelope_rejects_missing_fields() -> void:
+	print("test_validate_blob_envelope_rejects_missing_fields:")
+	check("missing flag reported",
+		not SlideModel.validate_blob_envelope({"content_type": "image/png", "bytes": "abc"}).is_empty())
+	check("missing content_type reported",
+		not SlideModel.validate_blob_envelope({"__blob__": true, "bytes": "abc"}).is_empty())
+	check("missing bytes reported",
+		not SlideModel.validate_blob_envelope({"__blob__": true, "content_type": "image/png"}).is_empty())
+	check("empty bytes reported",
+		not SlideModel.validate_blob_envelope({"__blob__": true, "content_type": "image/png", "bytes": ""}).is_empty())
+
+
+func test_sniff_content_type_png() -> void:
+	print("test_sniff_content_type_png:")
+	var png_magic := PackedByteArray([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+	check_eq("png magic", SlideModel.sniff_image_content_type(png_magic), "image/png")
+
+
+func test_sniff_content_type_jpeg() -> void:
+	print("test_sniff_content_type_jpeg:")
+	var jpeg_magic := PackedByteArray([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10])
+	check_eq("jpeg magic", SlideModel.sniff_image_content_type(jpeg_magic), "image/jpeg")
+
+
+func test_sniff_content_type_gif() -> void:
+	print("test_sniff_content_type_gif:")
+	var gif_magic := PackedByteArray([0x47, 0x49, 0x46, 0x38, 0x39, 0x61])
+	check_eq("gif magic", SlideModel.sniff_image_content_type(gif_magic), "image/gif")
+
+
+func test_sniff_content_type_webp() -> void:
+	print("test_sniff_content_type_webp:")
+	var webp_magic := PackedByteArray([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50])
+	check_eq("webp magic", SlideModel.sniff_image_content_type(webp_magic), "image/webp")
+
+
+func test_sniff_content_type_unknown_defaults_to_png() -> void:
+	print("test_sniff_content_type_unknown_defaults_to_png:")
+	check_eq("empty falls back to png", SlideModel.sniff_image_content_type(PackedByteArray()), "image/png")
+	check_eq("garbage falls back to png",
+		SlideModel.sniff_image_content_type(PackedByteArray([0x00, 0x00, 0x00])), "image/png")
 
 
 func test_make_spreadsheet_tile_default_grid() -> void:
@@ -512,9 +628,23 @@ func test_validate_spreadsheet_row_not_array() -> void:
 
 func test_validate_background_image_kind_empty_value() -> void:
 	print("test_validate_background_image_kind_empty_value:")
-	var bg: Dictionary = {"kind": SlideModel.BG_IMAGE, "value": ""}
-	var errs: Array = SlideModel.validate_background(bg)
-	check("empty image bg value reported", str(errs).contains("non-empty"))
+	# Image background values are blob envelopes — bare empty string is rejected,
+	# and so is an envelope with empty bytes.
+	var bg_bare: Dictionary = {"kind": SlideModel.BG_IMAGE, "value": ""}
+	check("bare empty value reported", not SlideModel.validate_background(bg_bare).is_empty())
+	var bg_env_empty: Dictionary = {
+		"kind": SlideModel.BG_IMAGE,
+		"value": SlideModel.make_blob_envelope("", "image/png"),
+	}
+	check("envelope with empty bytes reported",
+		not SlideModel.validate_background(bg_env_empty).is_empty())
+	# Sanity: a proper envelope validates.
+	var bg_ok: Dictionary = {
+		"kind": SlideModel.BG_IMAGE,
+		"value": SlideModel.make_blob_envelope("abc", "image/png"),
+	}
+	check("envelope with non-empty bytes validates",
+		SlideModel.validate_background(bg_ok).is_empty())
 
 
 func test_gen_id_uniqueness() -> void:

@@ -37,6 +37,29 @@ const BG_KINDS_VALID: PackedStringArray = [BG_COLOR, BG_IMAGE]
 
 const BG_DEFAULT: Dictionary = {"kind": "color", "value": "#ffffff"}
 
+# ---------------------------------------------------------------------------
+# Blob envelope shape (phase 5 R3 plugin-side adoption)
+#
+# Image bytes are stored under image tiles (`tile.src`) and image backgrounds
+# (`slide.background.value`) using the blob envelope contract:
+#
+#   {__blob__: true, content_type: "image/png", bytes: "<base64-string>"}
+#
+# The broker's _strip_blobs_for_outbound walks panel state and replaces these
+# envelopes with {__blob_handle__, content_type} placeholders on every
+# capability-call response (host.documents.get_node, etc.) — so MCP tool
+# responses stay bounded even on image-heavy decks (the 58MB list_slides
+# bug). Bytes are fetchable separately via host.documents.get_blob.
+#
+# In-memory and on-disk shape is the envelope. On-the-wire (capability call)
+# shape is the handle. Renderers read `envelope.bytes` to get the base64.
+# ---------------------------------------------------------------------------
+
+const BLOB_FLAG: String = "__blob__"
+const BLOB_CONTENT_TYPE: String = "content_type"
+const BLOB_BYTES: String = "bytes"
+const BLOB_DEFAULT_CT: String = "image/png"
+
 # Cell types mirror SpreadsheetCell.CellType (singleton_object peers expect these ints).
 const CELL_EMPTY: int = 0
 const CELL_TEXT: int = 1
@@ -114,17 +137,130 @@ static func make_image_tile(
 	y: float = 0.1,
 	w: float = 0.4,
 	h: float = 0.4,
-	rotation: float = 0.0
+	rotation: float = 0.0,
+	content_type: String = BLOB_DEFAULT_CT
 ) -> Dictionary:
+	# `src` is a blob envelope, not a bare String — see "Blob envelope shape"
+	# header. Callers that import from a file should sniff content_type via
+	# sniff_image_content_type() before calling; otherwise the default
+	# "image/png" is used (renderers tolerate the wrong type because Godot's
+	# image loader sniffs magic bytes itself).
 	var t: Dictionary = {
 		"id": gen_id("tile"),
 		"kind": TILE_IMAGE,
 		"x": x, "y": y, "w": w, "h": h,
-		"src": src_base64,
+		"src": make_blob_envelope(src_base64, content_type),
 	}
 	if not is_zero_approx(rotation):
 		t["rotation"] = rotation
 	return t
+
+
+# ---------------------------------------------------------------------------
+# Blob envelope helpers
+# ---------------------------------------------------------------------------
+
+## Construct a {__blob__: true, content_type, bytes: <base64>} envelope.
+## Plugin save-shape stores image bytes in this envelope so the broker can
+## strip them to handles on capability-call responses.
+static func make_blob_envelope(base64: String, content_type: String) -> Dictionary:
+	return {
+		BLOB_FLAG: true,
+		BLOB_CONTENT_TYPE: content_type,
+		BLOB_BYTES: base64,
+	}
+
+
+## Extract the base64-encoded bytes from a blob envelope (in-memory or on-disk
+## shape). Returns "" if the value is not a recognized envelope — renderers
+## use the empty return to skip the texture and fall back to the default.
+##
+## Accepts both {__blob__: true, ...} (in-memory / on-disk after JSON round-trip)
+## envelopes. Does NOT accept handle placeholders ({__blob_handle__, ...}) —
+## those are broker-internal and never surface in the panel's view of state.
+static func envelope_base64(envelope: Variant) -> String:
+	if not (envelope is Dictionary):
+		return ""
+	var d: Dictionary = envelope as Dictionary
+	if not d.has(BLOB_FLAG):
+		return ""
+	# Tolerate JSON-round-tripped bool (true → 1.0) — see hint
+	# godot/gdscript-variant-local-equals-bool-raises for why we discriminate
+	# via typeof() rather than chaining `== true or == 1 or == 1.0` on a
+	# Variant-typed local (the local form raises "Invalid operands" at runtime).
+	if not _is_truthy_variant(d[BLOB_FLAG]):
+		return ""
+	var bytes_v: Variant = d.get(BLOB_BYTES, "")
+	if bytes_v is String:
+		return bytes_v as String
+	return ""
+
+
+## Truthy check that survives Variant-typed-local comparison quirks in
+## Godot 4 (see hint godot/gdscript-variant-local-equals-bool-raises).
+static func _is_truthy_variant(v: Variant) -> bool:
+	match typeof(v):
+		TYPE_BOOL: return v
+		TYPE_INT: return (v as int) != 0
+		TYPE_FLOAT: return (v as float) != 0.0
+	return false
+
+
+## Return the content_type recorded in a blob envelope, or a fallback if the
+## value isn't a recognized envelope.
+static func envelope_content_type(envelope: Variant, fallback: String = BLOB_DEFAULT_CT) -> String:
+	if not (envelope is Dictionary):
+		return fallback
+	var d: Dictionary = envelope as Dictionary
+	var ct: Variant = d.get(BLOB_CONTENT_TYPE, fallback)
+	return str(ct) if ct is String else fallback
+
+
+## Sniff a content_type from the raw bytes' magic header. Used by import
+## paths (file pickers, migration script) to record an accurate content_type
+## in the envelope instead of guessing.
+##
+## Recognises PNG, JPEG, GIF, WebP. Falls back to "image/png" — that's the
+## current ecosystem default and Godot's image loader doesn't strictly require
+## a correct hint anyway (it sniffs magic itself).
+static func sniff_image_content_type(bytes: PackedByteArray) -> String:
+	if bytes.size() >= 8 \
+			and bytes[0] == 0x89 and bytes[1] == 0x50 \
+			and bytes[2] == 0x4E and bytes[3] == 0x47:
+		return "image/png"
+	if bytes.size() >= 3 \
+			and bytes[0] == 0xFF and bytes[1] == 0xD8 and bytes[2] == 0xFF:
+		return "image/jpeg"
+	if bytes.size() >= 6 \
+			and bytes[0] == 0x47 and bytes[1] == 0x49 and bytes[2] == 0x46:
+		return "image/gif"
+	if bytes.size() >= 12 \
+			and bytes[0] == 0x52 and bytes[1] == 0x49 \
+			and bytes[2] == 0x46 and bytes[3] == 0x46 \
+			and bytes[8] == 0x57 and bytes[9] == 0x45 \
+			and bytes[10] == 0x42 and bytes[11] == 0x50:
+		return "image/webp"
+	return BLOB_DEFAULT_CT
+
+
+## Validate a blob envelope. Returns Array of error strings; empty = valid.
+## Used by validate_tile (TILE_IMAGE.src) and validate_background (BG_IMAGE.value).
+static func validate_blob_envelope(value: Variant) -> Array:
+	var errors: Array = []
+	if not (value is Dictionary):
+		return ["expected blob envelope Dictionary, got %s" % str(value)]
+	var d: Dictionary = value as Dictionary
+	# Per hint godot/gdscript-variant-local-equals-bool-raises: don't bind to a
+	# Variant-typed local and chain == comparisons; discriminate by typeof().
+	if not d.has(BLOB_FLAG) or not _is_truthy_variant(d[BLOB_FLAG]):
+		errors.append("%s: expected true, got %s" % [BLOB_FLAG, str(d.get(BLOB_FLAG, "<missing>"))])
+	var ct: Variant = d.get(BLOB_CONTENT_TYPE, null)
+	if not (ct is String) or (ct as String).is_empty():
+		errors.append("%s: expected non-empty String, got %s" % [BLOB_CONTENT_TYPE, str(ct)])
+	var b: Variant = d.get(BLOB_BYTES, null)
+	if not (b is String) or (b as String).is_empty():
+		errors.append("%s: expected non-empty String (base64), got %s" % [BLOB_BYTES, str(b)])
+	return errors
 
 
 static func make_spreadsheet_tile(
@@ -270,10 +406,16 @@ static func validate_background(bg: Variant) -> Array:
 	if not (kind is String) or not BG_KINDS_VALID.has(kind):
 		errors.append("kind: expected one of %s, got %s" % [str(BG_KINDS_VALID), str(kind)])
 	var value: Variant = b.get("value", null)
-	if not (value is String):
-		errors.append("value: expected String, got %s" % str(value))
-	elif kind == BG_IMAGE and (value as String).is_empty():
-		errors.append("value: image background requires non-empty base64")
+	if kind == BG_IMAGE:
+		# Image backgrounds carry their bytes in a blob envelope so the broker
+		# strip walker can swap them for handles on capability responses.
+		var env_errors: Array = validate_blob_envelope(value)
+		for e in env_errors:
+			errors.append("value.%s" % e)
+	else:
+		# Color backgrounds remain plain hex Strings ("#rrggbb").
+		if not (value is String):
+			errors.append("value: expected String, got %s" % str(value))
 	return errors
 
 
@@ -320,8 +462,10 @@ static func validate_tile(tile: Variant) -> Array:
 				errors.append("auto_fit: expected bool, got %s" % str(t["auto_fit"]))
 		TILE_IMAGE:
 			var src: Variant = t.get("src", null)
-			if not (src is String) or (src as String).is_empty():
-				errors.append("src: expected non-empty String (base64)")
+			# Post-phase-5 R3: src is a blob envelope, not a bare String.
+			var env_errors: Array = validate_blob_envelope(src)
+			for e in env_errors:
+				errors.append("src.%s" % e)
 		TILE_SPREADSHEET:
 			# Accept int OR whole-number float — JSON.parse() returns all numbers
 			# as float, so a round-tripped {rows:2} arrives as 2.0. Reject 2.5.
