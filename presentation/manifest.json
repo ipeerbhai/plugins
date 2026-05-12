@@ -51,7 +51,8 @@
       "host.documents.get_node",
       "host.documents.get_blob",
       "host.documents.patch_state",
-      "host.documents.put_blob"
+      "host.documents.put_blob",
+      "host.editors.export"
     ],
     "network": {
       "mode": "none"

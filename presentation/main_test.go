@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -2825,10 +2826,18 @@ func TestToolModifyTile_RejectsCoordsOutOfRange(t *testing.T) {
 	}
 }
 
-func TestToolModifyTile_SourceGraphicsEditorDeferredCleanly(t *testing.T) {
+func TestToolModifyTile_SourceGraphicsEditorReplacesSrc(t *testing.T) {
+	// T6 tail R4: source_graphics_editor now resolves via host.editors.export.
+	// Canned response delivers a minimal PNG (just the magic header).
+	pngBytes := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01}
+	pngB64 := base64.StdEncoding.EncodeToString(pngBytes)
+	canned := fmt.Sprintf(
+		`{"jsonrpc":"2.0","id":"cap-1","result":{"success":true,"result":{"editor_name":"diagram1","format":"png","mime":"image/png","size":%d,"content":"%s"}}}`+"\n",
+		len(pngBytes), pngB64)
+
 	path := writeDeckWithTiles(t)
 	var stdout bytes.Buffer
-	client := newMockClient(strings.NewReader(""), &stdout)
+	client := newMockClient(strings.NewReader(canned), &stdout)
 
 	rawArgs, _ := json.Marshal(map[string]interface{}{
 		"path":                   path,
@@ -2837,11 +2846,21 @@ func TestToolModifyTile_SourceGraphicsEditorDeferredCleanly(t *testing.T) {
 		"source_graphics_editor": "diagram1",
 	})
 	out := toolModifyTile(client, rawArgs)
-	if success, _ := out["success"].(bool); success {
-		t.Fatalf("expected not-yet-supported error, got %+v", out)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success after R4 wired host.editors.export, got %+v", out)
 	}
-	if code, _ := out["error_code"].(string); code != "not_implemented_in_plugin_yet" {
-		t.Errorf("expected not_implemented_in_plugin_yet, got %q", code)
+	wire := stdout.String()
+	if !strings.Contains(wire, `"capability":"host.editors.export"`) {
+		t.Errorf("expected host.editors.export call on wire, got: %s", wire)
+	}
+	if !strings.Contains(wire, `"format":"png"`) {
+		t.Errorf("expected format=png in args, got: %s", wire)
+	}
+	// Verify tile.src was replaced with the canned PNG.
+	deck := readDeck(t, path)
+	tile := deck["slides"].([]interface{})[0].(map[string]interface{})["tiles"].([]interface{})[1].(map[string]interface{})
+	if src, _ := tile["src"].(string); src != pngB64 {
+		t.Errorf("tile.src should match exported PNG b64; got len=%d (head=%q)", len(src), src[:min(20, len(src))])
 	}
 }
 
@@ -2873,5 +2892,206 @@ func TestParseAspectRatio_FallbackOnGarbage(t *testing.T) {
 	}
 	if r := parseAspectRatio("1:1"); r != 1.0 {
 		t.Errorf("1:1: %v", r)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// minerva_presentation_add_image_tile (T6 tail R4)
+// ---------------------------------------------------------------------------
+
+func TestToolAddImageTile_FromBase64(t *testing.T) {
+	path := writeBlankDeck(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":         path,
+		"slide_index":  0,
+		"x":            0.1, "y": 0.1, "w": 0.4, "h": 0.3,
+		"image_base64": "Zm9vYmFy", // "foobar"
+	})
+	out := toolAddImageTile(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	tileID, _ := out["tile_id"].(string)
+	if tileID == "" {
+		t.Fatal("tile_id missing")
+	}
+	deck := readDeck(t, path)
+	tiles := deck["slides"].([]interface{})[0].(map[string]interface{})["tiles"].([]interface{})
+	if len(tiles) != 1 {
+		t.Fatalf("expected 1 tile, got %d", len(tiles))
+	}
+	tile := tiles[0].(map[string]interface{})
+	if tile["kind"] != "image" {
+		t.Errorf("kind: %v", tile["kind"])
+	}
+	if tile["src"] != "Zm9vYmFy" {
+		t.Errorf("src: %v", tile["src"])
+	}
+	if tile["x"] != 0.1 {
+		t.Errorf("x: %v", tile["x"])
+	}
+}
+
+func TestToolAddImageTile_FromImagePath(t *testing.T) {
+	tmp := t.TempDir()
+	deckPath := tmp + "/d.mdeck"
+	imgPath := tmp + "/i.png"
+	body := `{"version":1,"aspect":"16:9","slides":[{"id":"s_a","tiles":[]}]}`
+	if err := os.WriteFile(deckPath, []byte(body), 0644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	pngBytes := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 'X', 'Y'}
+	if err := os.WriteFile(imgPath, pngBytes, 0644); err != nil {
+		t.Fatalf("setup img: %v", err)
+	}
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":        deckPath,
+		"slide_index": 0,
+		"x":           0.0, "y": 0.0, "w": 0.5, "h": 0.5,
+		"image_path": imgPath,
+	})
+	out := toolAddImageTile(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	deck := readDeck(t, deckPath)
+	tile := deck["slides"].([]interface{})[0].(map[string]interface{})["tiles"].([]interface{})[0].(map[string]interface{})
+	expectedB64 := base64.StdEncoding.EncodeToString(pngBytes)
+	if tile["src"] != expectedB64 {
+		t.Errorf("src mismatch")
+	}
+}
+
+func TestToolAddImageTile_FromSolidColor(t *testing.T) {
+	path := writeBlankDeck(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":        path,
+		"slide_index": 0,
+		"x":           0.1, "y": 0.1, "w": 0.4, "h": 0.3,
+		"solid_color": "#ff0000",
+		"rotation":    0.785,
+	})
+	out := toolAddImageTile(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	deck := readDeck(t, path)
+	tile := deck["slides"].([]interface{})[0].(map[string]interface{})["tiles"].([]interface{})[0].(map[string]interface{})
+	src, _ := tile["src"].(string)
+	raw, err := base64.StdEncoding.DecodeString(src)
+	if err != nil {
+		t.Fatalf("src not base64: %v", err)
+	}
+	if len(raw) < 8 || raw[1] != 'P' || raw[2] != 'N' || raw[3] != 'G' {
+		t.Errorf("solid_color should synthesize PNG; got %v", raw[:min(8, len(raw))])
+	}
+	if tile["rotation"] != 0.785 {
+		t.Errorf("rotation: %v", tile["rotation"])
+	}
+}
+
+func TestToolAddImageTile_FromSourceGraphicsEditor(t *testing.T) {
+	pngBytes := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x99}
+	pngB64 := base64.StdEncoding.EncodeToString(pngBytes)
+	canned := fmt.Sprintf(
+		`{"jsonrpc":"2.0","id":"cap-1","result":{"success":true,"result":{"editor_name":"sketch","format":"png","mime":"image/png","size":%d,"content":"%s"}}}`+"\n",
+		len(pngBytes), pngB64)
+
+	path := writeBlankDeck(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":        path,
+		"slide_index": 0,
+		"x":           0.1, "y": 0.1, "w": 0.4, "h": 0.3,
+		"source_graphics_editor": "sketch",
+	})
+	out := toolAddImageTile(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	wire := stdout.String()
+	if !strings.Contains(wire, `"capability":"host.editors.export"`) {
+		t.Errorf("expected host.editors.export on wire, got: %s", wire)
+	}
+	deck := readDeck(t, path)
+	tile := deck["slides"].([]interface{})[0].(map[string]interface{})["tiles"].([]interface{})[0].(map[string]interface{})
+	if tile["src"] != pngB64 {
+		t.Errorf("src should match exported PNG; got len=%d", len(tile["src"].(string)))
+	}
+}
+
+func TestToolAddImageTile_RequiresExactlyOneSource(t *testing.T) {
+	path := writeBlankDeck(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	// Zero sources.
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":        path,
+		"slide_index": 0,
+		"x":           0.1, "y": 0.1, "w": 0.4, "h": 0.3,
+	})
+	out := toolAddImageTile(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected failure with no source, got %+v", out)
+	}
+
+	// Two sources.
+	rawArgs, _ = json.Marshal(map[string]interface{}{
+		"path":         path,
+		"slide_index":  0,
+		"x":            0.1, "y": 0.1, "w": 0.4, "h": 0.3,
+		"image_base64": "AA==",
+		"solid_color":  "#fff",
+	})
+	out = toolAddImageTile(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected failure with two sources, got %+v", out)
+	}
+}
+
+func TestToolAddImageTile_CoordOutOfRange(t *testing.T) {
+	path := writeBlankDeck(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":         path,
+		"slide_index":  0,
+		"x":            -0.5,
+		"y":            0.1, "w": 0.4, "h": 0.3,
+		"image_base64": "AA==",
+	})
+	out := toolAddImageTile(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected reject for x<0, got %+v", out)
+	}
+}
+
+func TestToolAddImageTile_OutOfRangeSlide(t *testing.T) {
+	path := writeBlankDeck(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":         path,
+		"slide_index":  99,
+		"x":            0.1, "y": 0.1, "w": 0.4, "h": 0.3,
+		"image_base64": "AA==",
+	})
+	out := toolAddImageTile(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected out_of_range, got %+v", out)
 	}
 }

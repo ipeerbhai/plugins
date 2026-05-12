@@ -295,6 +295,50 @@ func (c *hostClient) PutBlob(editorName, contentType string, data []byte) (blobH
 	return resp.Result.BlobHandle, nil
 }
 
+// ExportEditor pulls a rendered representation of an editor via the
+// host.editors.export capability. Returns the (mime, raw bytes) of the export
+// — the host base64-decodes the wire payload for us.
+//
+// For graphics editors the canonical format is "png".
+func (c *hostClient) ExportEditor(editorName, format string) (mime string, data []byte, fault *toolFault) {
+	raw, capErr := c.callCapability("host.editors.export", map[string]interface{}{
+		"editor_name": editorName,
+		"format":      format,
+	})
+	if capErr != nil {
+		return "", nil, &toolFault{
+			Code: fmt.Sprintf("rpc_error_%d", capErr.Code),
+			Msg:  capErr.Message,
+		}
+	}
+	var resp struct {
+		Success      bool   `json:"success"`
+		ErrorCode    string `json:"error_code,omitempty"`
+		ErrorMessage string `json:"error_message,omitempty"`
+		Result       *struct {
+			EditorName string `json:"editor_name"`
+			Format     string `json:"format"`
+			Mime       string `json:"mime"`
+			Size       int    `json:"size"`
+			Content    string `json:"content"`
+		} `json:"result,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return "", nil, &toolFault{Code: "parse_error", Msg: "parse host.editors.export response: " + err.Error()}
+	}
+	if !resp.Success {
+		return "", nil, &toolFault{Code: resp.ErrorCode, Msg: resp.ErrorMessage}
+	}
+	if resp.Result == nil {
+		return "", nil, &toolFault{Code: "parse_error", Msg: "host.editors.export returned success but no result"}
+	}
+	bytes, err := base64.StdEncoding.DecodeString(resp.Result.Content)
+	if err != nil {
+		return "", nil, &toolFault{Code: "parse_error", Msg: "host.editors.export content not base64: " + err.Error()}
+	}
+	return resp.Result.Mime, bytes, nil
+}
+
 // PatchBuilder accumulates RFC 6902 JSON Patch operations for atomic
 // application to an editor's panel state. Call Send() to dispatch. The
 // builder is single-use: Send consumes it.
@@ -695,6 +739,26 @@ var toolList = []map[string]interface{}{
 		},
 	},
 	{
+		"name":        "minerva_presentation_add_image_tile",
+		"description": "Add an image tile to a slide. Coords x/y/w/h are 0..1 normalized. Provide exactly one image source: image_path (read from disk), image_base64 (bare base64 PNG/JPEG), solid_color (hex; generates aspect-correct solid PNG sized to the tile's rendered rect), or source_graphics_editor (name of an open graphics editor — pulls its PNG via host.editors.export). Optional rotation in radians.",
+		"inputSchema": map[string]interface{}{
+			"type": "object",
+			"properties": withProps(targetSchema, map[string]interface{}{
+				"slide_index":            map[string]interface{}{"type": "integer"},
+				"x":                      map[string]interface{}{"type": "number"},
+				"y":                      map[string]interface{}{"type": "number"},
+				"w":                      map[string]interface{}{"type": "number"},
+				"h":                      map[string]interface{}{"type": "number"},
+				"image_path":             map[string]interface{}{"type": "string"},
+				"image_base64":           map[string]interface{}{"type": "string", "description": "Bare base64 PNG/JPEG."},
+				"source_graphics_editor": map[string]interface{}{"type": "string", "description": "Name of an open graphics editor — pulls its top layer via host.editors.export."},
+				"solid_color":            map[string]interface{}{"type": "string", "description": "Hex color (e.g. #1F4E5A) — synthesizes an aspect-correct solid PNG."},
+				"rotation":               map[string]interface{}{"type": "number"},
+			}),
+			"required": []string{"slide_index", "x", "y", "w", "h"},
+		},
+	},
+	{
 		"name":        "minerva_presentation_modify_tile",
 		"description": "Modify fields on an existing tile by id. Every field is optional; only specified ones change. Coords clamped to [0,1]. For image tiles, provide AT MOST ONE of image_path, image_base64, solid_color to replace tile.src — kind cannot change (remove + add for that). For text tiles, content/text_mode update straightforwardly. font_size sets fixed-font mode (8..200 px); pass 0 to clear (coupled mode). auto_fit=true picks largest font fitting; false clears the field. Rotation=0 erases the field. source_graphics_editor will land in a follow-up round.",
 		"inputSchema": map[string]interface{}{
@@ -849,6 +913,8 @@ func dispatchTool(client *hostClient, msg *rpcRequest) {
 		respondTool(client.enc, msg.ID, toolSetAnnotationResolved(client, p.Arguments))
 	case "minerva_presentation_modify_tile":
 		respondTool(client.enc, msg.ID, toolModifyTile(client, p.Arguments))
+	case "minerva_presentation_add_image_tile":
+		respondTool(client.enc, msg.ID, toolAddImageTile(client, p.Arguments))
 	case "minerva_presentation_set_slide_background":
 		respondTool(client.enc, msg.ID, toolSetSlideBackground(client, p.Arguments))
 	default:
@@ -3591,18 +3657,12 @@ func toolModifyTile(client *hostClient, rawArgs json.RawMessage) map[string]inte
 	}
 
 	// Image-source mutual-exclusivity check (runs before any read so the LLM
-	// gets a clean error fast). source_graphics_editor is rejected up-front —
-	// host.editors.export isn't declared in the manifest yet (T6 tail R4 will
-	// pick it up alongside add_image_tile).
-	if _, has := args["source_graphics_editor"]; has {
-		return failResult(&toolFault{
-			Code: "not_implemented_in_plugin_yet",
-			Msg:  "source_graphics_editor will be supported in a future modify_tile round; for now, fetch via host.editors.export and pass as image_base64",
-		})
-	}
+	// gets a clean error fast). T6 tail R4 added source_graphics_editor via
+	// host.editors.export.
 	hasPath := args["image_path"] != nil && fmt.Sprint(args["image_path"]) != ""
 	hasB64 := args["image_base64"] != nil && fmt.Sprint(args["image_base64"]) != ""
 	hasSolid := args["solid_color"] != nil && fmt.Sprint(args["solid_color"]) != ""
+	hasSrcEditor := args["source_graphics_editor"] != nil && fmt.Sprint(args["source_graphics_editor"]) != ""
 	srcCount := 0
 	if hasPath {
 		srcCount++
@@ -3613,10 +3673,13 @@ func toolModifyTile(client *hostClient, rawArgs json.RawMessage) map[string]inte
 	if hasSolid {
 		srcCount++
 	}
+	if hasSrcEditor {
+		srcCount++
+	}
 	if srcCount > 1 {
 		return failResult(&toolFault{
 			Code: "schema_validation_failed",
-			Msg:  "Provide at most one of: image_path, image_base64, solid_color",
+			Msg:  "Provide at most one of: image_path, image_base64, solid_color, source_graphics_editor",
 		})
 	}
 
@@ -3730,6 +3793,13 @@ func toolModifyTile(client *hostClient, rawArgs json.RawMessage) map[string]inte
 				b64 = base64.StdEncoding.EncodeToString(bytes)
 			case hasB64:
 				b64, _ = args["image_base64"].(string)
+			case hasSrcEditor:
+				editorName, _ := args["source_graphics_editor"].(string)
+				_, bytes, exportFault := client.ExportEditor(editorName, "png")
+				if exportFault != nil {
+					return nil, nil, exportFault
+				}
+				b64 = base64.StdEncoding.EncodeToString(bytes)
 			default:
 				// Solid color — synthesize at post-merge w/h so a same-call
 				// resize is reflected in the synthesized aspect.
@@ -3890,6 +3960,192 @@ func toolModifyTile(client *hostClient, rawArgs json.RawMessage) map[string]inte
 			"slide_index": idx,
 			"tile_id":     tileID,
 		}, nil
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Tool: minerva_presentation_add_image_tile  (T6 tail R4)
+// ---------------------------------------------------------------------------
+
+// validateCoords clamps + validates x/y/w/h (required for add_image_tile).
+// Returns a fault on first invalid axis. Coords must be in [0,1].
+func validateImageCoords(args map[string]interface{}) (x, y, w, h float64, fault *toolFault) {
+	for _, axis := range []string{"x", "y", "w", "h"} {
+		v, has := floatArg(args, axis)
+		if !has {
+			return 0, 0, 0, 0, &toolFault{
+				Code: "schema_validation_failed",
+				Msg:  fmt.Sprintf("%s is required", axis),
+			}
+		}
+		if v < 0.0 || v > 1.0 {
+			return 0, 0, 0, 0, &toolFault{
+				Code: "schema_validation_failed",
+				Msg:  fmt.Sprintf("%s must be in [0, 1], got %f", axis, v),
+			}
+		}
+		switch axis {
+		case "x":
+			x = v
+		case "y":
+			y = v
+		case "w":
+			w = v
+		case "h":
+			h = v
+		}
+	}
+	return x, y, w, h, nil
+}
+
+func toolAddImageTile(client *hostClient, rawArgs json.RawMessage) map[string]interface{} {
+	args, fault := parseTargetArgs(rawArgs)
+	if fault != nil {
+		return failResult(fault)
+	}
+	idx, ok := intArg(args, "slide_index", -1)
+	if !ok {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "slide_index is required"})
+	}
+	x, y, w, h, coordFault := validateImageCoords(args)
+	if coordFault != nil {
+		return failResult(coordFault)
+	}
+
+	hasPath := args["image_path"] != nil && fmt.Sprint(args["image_path"]) != ""
+	hasB64 := args["image_base64"] != nil && fmt.Sprint(args["image_base64"]) != ""
+	hasSolid := args["solid_color"] != nil && fmt.Sprint(args["solid_color"]) != ""
+	hasSrcEditor := args["source_graphics_editor"] != nil && fmt.Sprint(args["source_graphics_editor"]) != ""
+	srcCount := 0
+	if hasPath {
+		srcCount++
+	}
+	if hasB64 {
+		srcCount++
+	}
+	if hasSolid {
+		srcCount++
+	}
+	if hasSrcEditor {
+		srcCount++
+	}
+	if srcCount != 1 {
+		return failResult(&toolFault{
+			Code: "schema_validation_failed",
+			Msg:  "Provide exactly one of: image_path, image_base64, source_graphics_editor, solid_color",
+		})
+	}
+
+	// Resolve the image bytes → base64. Done up-front so file/network failures
+	// land before we begin any deck mutation. solid_color synthesis needs the
+	// deck aspect, which differs per branch (tab vs disk).
+	resolveSource := func(slideAspect float64) (string, *toolFault) {
+		switch {
+		case hasPath:
+			path, _ := args["image_path"].(string)
+			bytes, err := os.ReadFile(path)
+			if err != nil {
+				return "", &toolFault{Code: "file_io_failed", Msg: err.Error()}
+			}
+			return base64.StdEncoding.EncodeToString(bytes), nil
+		case hasB64:
+			b64, _ := args["image_base64"].(string)
+			return b64, nil
+		case hasSrcEditor:
+			editorName, _ := args["source_graphics_editor"].(string)
+			_, bytes, exportFault := client.ExportEditor(editorName, "png")
+			if exportFault != nil {
+				return "", exportFault
+			}
+			return base64.StdEncoding.EncodeToString(bytes), nil
+		default:
+			hex, _ := args["solid_color"].(string)
+			b64 := makeSolidColorPNGBase64(hex, w, h, slideAspect)
+			if b64 == "" {
+				return "", &toolFault{
+					Code: "schema_validation_failed",
+					Msg:  "solid_color must be a valid hex color (e.g. #1F4E5A)",
+				}
+			}
+			return b64, nil
+		}
+	}
+
+	tileID := genID("tile")
+	buildTile := func(src string) map[string]interface{} {
+		tile := map[string]interface{}{
+			"id":   tileID,
+			"kind": "image",
+			"x":    x,
+			"y":    y,
+			"w":    w,
+			"h":    h,
+			"src":  src,
+		}
+		if rot, has := floatArg(args, "rotation"); has && rot != 0.0 {
+			tile["rotation"] = rot
+		}
+		return tile
+	}
+
+	// tab_name mode: look up the slide aspect via /aspect, resolve source,
+	// append to /slides/{idx}/tiles via op=add /-.
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		_, slideVal, fault := client.GetNode(tabName, fmt.Sprintf("/slides/%d", idx))
+		if fault != nil {
+			return failResult(fault)
+		}
+		if slide, _ := slideVal.(map[string]interface{}); slide == nil {
+			return failResult(&toolFault{
+				Code: "out_of_range",
+				Msg:  fmt.Sprintf("slide_index %d not found", idx),
+			})
+		}
+		_, aspectVal, _ := client.GetNode(tabName, "/aspect")
+		aspectStr, _ := aspectVal.(string)
+		if aspectStr == "" {
+			aspectStr = "16:9"
+		}
+		src, srcFault := resolveSource(parseAspectRatio(aspectStr))
+		if srcFault != nil {
+			return failResult(srcFault)
+		}
+		tile := buildTile(src)
+		patchPath := fmt.Sprintf("/slides/%d/tiles/-", idx)
+		if _, pf := client.Patch(tabName).Add(patchPath, tile).Send(); pf != nil {
+			return failResult(pf)
+		}
+		return map[string]interface{}{
+			"success": true,
+			"tile_id": tileID,
+		}
+	}
+
+	// disk mode.
+	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
+		slides, _ := deck["slides"].([]interface{})
+		if idx < 0 || idx >= len(slides) {
+			return nil, &toolFault{
+				Code: "out_of_range",
+				Msg:  fmt.Sprintf("slide_index %d out of range [0,%d)", idx, len(slides)),
+			}
+		}
+		slide, _ := slides[idx].(map[string]interface{})
+		if slide == nil {
+			return nil, &toolFault{Code: "out_of_range", Msg: "slide is not an object"}
+		}
+		aspectStr, _ := deck["aspect"].(string)
+		if aspectStr == "" {
+			aspectStr = "16:9"
+		}
+		src, srcFault := resolveSource(parseAspectRatio(aspectStr))
+		if srcFault != nil {
+			return nil, srcFault
+		}
+		tile := buildTile(src)
+		tiles, _ := slide["tiles"].([]interface{})
+		slide["tiles"] = append(tiles, tile)
+		return map[string]interface{}{"tile_id": tileID}, nil
 	})
 }
 
