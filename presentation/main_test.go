@@ -3183,6 +3183,105 @@ func TestToolGetState_BufferCanonicalReturnsPanelStateUnavailable(t *testing.T) 
 }
 
 // ---------------------------------------------------------------------------
+// minerva_presentation_open_deck (T6 tail R6)
+// ---------------------------------------------------------------------------
+
+func TestToolOpenDeck_HappyPath(t *testing.T) {
+	// Two canned responses on stdin:
+	//   cap-1 → host.editors.open ok, tab_name "deck.mdeck", was_already_open=false
+	//   cap-2 → host.documents.get_state ok, panel_state with 3 slides
+	openResp := `{"jsonrpc":"2.0","id":"cap-1","result":{"success":true,"result":{"tab_name":"deck.mdeck","kind":"plugin_scene","plugin_id":"presentation","panel_name":"slide_editor_panel","path":"/tmp/deck.mdeck","was_already_open":false}}}` + "\n"
+	stateResp := `{"jsonrpc":"2.0","id":"cap-2","result":{"success":true,"result":{"editor_name":"deck.mdeck","kind":"plugin_scene","plugin_id":"presentation","panel_state":{"version":1,"aspect":"16:9","slides":[{"id":"a"},{"id":"b"},{"id":"c"}]}}}}` + "\n"
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(openResp+stateResp), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{"path": "/tmp/deck.mdeck"})
+	out := toolOpenDeck(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	if v := out["tab_name"]; v != "deck.mdeck" {
+		t.Errorf("tab_name: %v", v)
+	}
+	if v := out["slide_count"]; v != 3 {
+		t.Errorf("slide_count: %v", v)
+	}
+	if v := out["reused_existing_tab"]; v != false {
+		t.Errorf("reused_existing_tab: %v", v)
+	}
+
+	// Wire-level: both capability calls must appear in stdout.
+	wire := stdout.String()
+	if !strings.Contains(wire, `"capability":"host.editors.open"`) {
+		t.Errorf("expected host.editors.open on wire")
+	}
+	if !strings.Contains(wire, `"capability":"host.documents.get_state"`) {
+		t.Errorf("expected host.documents.get_state on wire for slide_count fetch")
+	}
+}
+
+func TestToolOpenDeck_AlreadyOpenSetsFlag(t *testing.T) {
+	openResp := `{"jsonrpc":"2.0","id":"cap-1","result":{"success":true,"result":{"tab_name":"deck.mdeck","kind":"plugin_scene","path":"/tmp/deck.mdeck","was_already_open":true}}}` + "\n"
+	stateResp := `{"jsonrpc":"2.0","id":"cap-2","result":{"success":true,"result":{"panel_state":{"slides":[{"id":"s0"}]}}}}` + "\n"
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(openResp+stateResp), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{"path": "/tmp/deck.mdeck"})
+	out := toolOpenDeck(client, rawArgs)
+	if v := out["reused_existing_tab"]; v != true {
+		t.Errorf("reused_existing_tab should be true when host says was_already_open")
+	}
+}
+
+func TestToolOpenDeck_FileNotFoundPropagates(t *testing.T) {
+	openResp := `{"jsonrpc":"2.0","id":"cap-1","result":{"success":false,"error_code":"file_not_found","error_message":"file_not_found: /nope.mdeck"}}` + "\n"
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(openResp), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{"path": "/nope.mdeck"})
+	out := toolOpenDeck(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected failure, got %+v", out)
+	}
+	if code, _ := out["error_code"].(string); code != "file_not_found" {
+		t.Errorf("expected file_not_found, got %q", code)
+	}
+}
+
+func TestToolOpenDeck_RequiresPath(t *testing.T) {
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{"path": ""})
+	out := toolOpenDeck(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected reject, got %+v", out)
+	}
+}
+
+func TestToolOpenDeck_SlideCountFallsBackOnGetStateFail(t *testing.T) {
+	// Open succeeds; get_state errors. slide_count should be -1, but success
+	// stays true so the LLM at least has the tab_name.
+	openResp := `{"jsonrpc":"2.0","id":"cap-1","result":{"success":true,"result":{"tab_name":"deck.mdeck","path":"/tmp/deck.mdeck","was_already_open":false}}}` + "\n"
+	stateFail := `{"jsonrpc":"2.0","id":"cap-2","result":{"success":false,"error_code":"editor_not_found","error_message":"x"}}` + "\n"
+
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(openResp+stateFail), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{"path": "/tmp/deck.mdeck"})
+	out := toolOpenDeck(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success despite get_state failure, got %+v", out)
+	}
+	if v := out["slide_count"]; v != -1 {
+		t.Errorf("slide_count should fall back to -1 when get_state fails, got %v", v)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // add_image_tile out-of-range slide (continued)
 // ---------------------------------------------------------------------------
 

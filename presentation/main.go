@@ -326,6 +326,48 @@ func (c *hostClient) GetState(editorName string) (map[string]interface{}, *toolF
 	return resp.Result, nil
 }
 
+// OpenEditor asks the host to open a file at the supplied path as an editor
+// tab. The host routes by extension (Minerva's existing open_file_at_path
+// dispatcher), so the plugin doesn't pass plugin_id/panel_name — they're
+// derived from the file. On success returns the tab_name + was_already_open.
+//
+// Errors surface schema_validation_failed / file_not_found /
+// editor_pane_unavailable / open_failed via toolFault.
+func (c *hostClient) OpenEditor(path string) (tabName string, wasAlreadyOpen bool, fault *toolFault) {
+	raw, capErr := c.callCapability("host.editors.open", map[string]interface{}{
+		"path": path,
+	})
+	if capErr != nil {
+		return "", false, &toolFault{
+			Code: fmt.Sprintf("rpc_error_%d", capErr.Code),
+			Msg:  capErr.Message,
+		}
+	}
+	var resp struct {
+		Success      bool   `json:"success"`
+		ErrorCode    string `json:"error_code,omitempty"`
+		ErrorMessage string `json:"error_message,omitempty"`
+		Result       *struct {
+			TabName        string `json:"tab_name"`
+			Kind           string `json:"kind"`
+			PluginID       string `json:"plugin_id,omitempty"`
+			PanelName      string `json:"panel_name,omitempty"`
+			Path           string `json:"path"`
+			WasAlreadyOpen bool   `json:"was_already_open"`
+		} `json:"result,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return "", false, &toolFault{Code: "parse_error", Msg: "parse host.editors.open response: " + err.Error()}
+	}
+	if !resp.Success {
+		return "", false, &toolFault{Code: resp.ErrorCode, Msg: resp.ErrorMessage}
+	}
+	if resp.Result == nil {
+		return "", false, &toolFault{Code: "parse_error", Msg: "host.editors.open returned success but no result"}
+	}
+	return resp.Result.TabName, resp.Result.WasAlreadyOpen, nil
+}
+
 // ExportEditor pulls a rendered representation of an editor via the
 // host.editors.export capability. Returns the (mime, raw bytes) of the export
 // — the host base64-decodes the wire payload for us.
@@ -770,6 +812,17 @@ var toolList = []map[string]interface{}{
 		},
 	},
 	{
+		"name":        "minerva_presentation_open_deck",
+		"description": "Open an existing .mdeck file as a presentation editor tab. Returns the tab_name to use for follow-up live-mutation calls. If a tab with the same path is already open, focuses it (was_already_open=true).",
+		"inputSchema": map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"path": map[string]interface{}{"type": "string", "description": "Absolute path to a .mdeck file on disk."},
+			},
+			"required": []string{"path"},
+		},
+	},
+	{
 		"name":        "minerva_presentation_get_state",
 		"description": "Read the live UI state of an open presentation tab — useful for HITL (\"what slide is the user on?\"). Returns selected_slide_index plus slide_count and the title of the selected slide. Tab must be open; this tool does NOT accept a path because state only exists in a live editor.",
 		"inputSchema": map[string]interface{}{
@@ -959,6 +1012,8 @@ func dispatchTool(client *hostClient, msg *rpcRequest) {
 		respondTool(client.enc, msg.ID, toolAddImageTile(client, p.Arguments))
 	case "minerva_presentation_get_state":
 		respondTool(client.enc, msg.ID, toolGetState(client, p.Arguments))
+	case "minerva_presentation_open_deck":
+		respondTool(client.enc, msg.ID, toolOpenDeck(client, p.Arguments))
 	case "minerva_presentation_set_slide_background":
 		respondTool(client.enc, msg.ID, toolSetSlideBackground(client, p.Arguments))
 	default:
@@ -4269,6 +4324,51 @@ func toolGetState(client *hostClient, rawArgs json.RawMessage) map[string]interf
 	// "panel doesn't expose selection" without inspecting key presence.
 	out["selected_slide_index"] = selected
 	return out
+}
+
+// ---------------------------------------------------------------------------
+// Tool: minerva_presentation_open_deck  (T6 tail R6)
+// ---------------------------------------------------------------------------
+
+// toolOpenDeck asks the host to open the supplied .mdeck path as an editor
+// tab. Wraps host.editors.open + a follow-up host.documents.get_state to
+// derive slide_count (preserved from the core handler's contract — many LLM
+// flows read slide_count off the open response).
+func toolOpenDeck(client *hostClient, rawArgs json.RawMessage) map[string]interface{} {
+	var args map[string]interface{}
+	if len(rawArgs) > 0 && string(rawArgs) != "null" {
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return failResult(&toolFault{Code: "schema_validation_failed", Msg: err.Error()})
+		}
+	}
+	path, _ := args["path"].(string)
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "path is required"})
+	}
+
+	tabName, wasAlreadyOpen, fault := client.OpenEditor(path)
+	if fault != nil {
+		return failResult(fault)
+	}
+
+	// Best-effort slide_count: read the open tab's state. Failure here doesn't
+	// fail the open — we surface slide_count=-1 so callers can detect the gap.
+	slideCount := -1
+	if state, sf := client.GetState(tabName); sf == nil {
+		if panelState, ok := state["panel_state"].(map[string]interface{}); ok {
+			if slides, ok := panelState["slides"].([]interface{}); ok {
+				slideCount = len(slides)
+			}
+		}
+	}
+
+	return map[string]interface{}{
+		"success":             true,
+		"tab_name":            tabName,
+		"slide_count":         slideCount,
+		"reused_existing_tab": wasAlreadyOpen,
+	}
 }
 
 func main() {

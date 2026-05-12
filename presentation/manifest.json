@@ -52,7 +52,8 @@
       "host.documents.get_blob",
       "host.documents.patch_state",
       "host.documents.put_blob",
-      "host.editors.export"
+      "host.editors.export",
+      "host.editors.open"
     ],
     "network": {
       "mode": "none"
