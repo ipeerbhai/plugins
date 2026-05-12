@@ -24,12 +24,18 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -689,6 +695,30 @@ var toolList = []map[string]interface{}{
 		},
 	},
 	{
+		"name":        "minerva_presentation_modify_tile",
+		"description": "Modify fields on an existing tile by id. Every field is optional; only specified ones change. Coords clamped to [0,1]. For image tiles, provide AT MOST ONE of image_path, image_base64, solid_color to replace tile.src — kind cannot change (remove + add for that). For text tiles, content/text_mode update straightforwardly. font_size sets fixed-font mode (8..200 px); pass 0 to clear (coupled mode). auto_fit=true picks largest font fitting; false clears the field. Rotation=0 erases the field. source_graphics_editor will land in a follow-up round.",
+		"inputSchema": map[string]interface{}{
+			"type": "object",
+			"properties": withProps(targetSchema, map[string]interface{}{
+				"slide_index":  map[string]interface{}{"type": "integer"},
+				"tile_id":      map[string]interface{}{"type": "string"},
+				"x":            map[string]interface{}{"type": "number"},
+				"y":            map[string]interface{}{"type": "number"},
+				"w":            map[string]interface{}{"type": "number"},
+				"h":            map[string]interface{}{"type": "number"},
+				"rotation":     map[string]interface{}{"type": "number"},
+				"content":      map[string]interface{}{"type": "string"},
+				"text_mode":    map[string]interface{}{"type": "string", "description": "plain | bullet | numbered (text tiles only)"},
+				"font_size":    map[string]interface{}{"type": "integer", "description": "8..200 (text tiles only). 0 clears to coupled mode."},
+				"auto_fit":     map[string]interface{}{"type": "boolean", "description": "Text tiles only. true=enable; false=clear."},
+				"image_path":   map[string]interface{}{"type": "string"},
+				"image_base64": map[string]interface{}{"type": "string"},
+				"solid_color":  map[string]interface{}{"type": "string", "description": "Hex color (e.g. #1F4E5A) — synthesizes a small solid PNG."},
+			}),
+			"required": []string{"slide_index", "tile_id"},
+		},
+	},
+	{
 		"name":        "minerva_presentation_set_annotation_resolved",
 		"description": "Mark an annotation resolved (true) or open (false). Maps onto substrate's lifecycle field: true → 'resolved', false → 'open'. To set 'applied' or 'stale' explicitly, pass lifecycle directly. Optional note appends to a resolution_notes array on the envelope.",
 		"inputSchema": map[string]interface{}{
@@ -817,6 +847,8 @@ func dispatchTool(client *hostClient, msg *rpcRequest) {
 		respondTool(client.enc, msg.ID, toolRemoveAnnotation(client, p.Arguments))
 	case "minerva_presentation_set_annotation_resolved":
 		respondTool(client.enc, msg.ID, toolSetAnnotationResolved(client, p.Arguments))
+	case "minerva_presentation_modify_tile":
+		respondTool(client.enc, msg.ID, toolModifyTile(client, p.Arguments))
 	case "minerva_presentation_set_slide_background":
 		respondTool(client.enc, msg.ID, toolSetSlideBackground(client, p.Arguments))
 	default:
@@ -3409,6 +3441,454 @@ func toolSetAnnotationResolved(client *hostClient, rawArgs json.RawMessage) map[
 			"slide_index":   idx,
 			"annotation_id": annID,
 			"lifecycle":     targetLifecycle,
+		}, nil
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Tool: minerva_presentation_modify_tile  (T6 tail R3)
+// ---------------------------------------------------------------------------
+
+var modifyCoordKeys = []string{"x", "y", "w", "h"}
+var textModesValid = []string{"plain", "bullet", "numbered"}
+
+// parseAspectRatio parses "16:9" / "4:3" / "1:1" → ratio. Falls back to 16/9
+// on anything unparseable. Mirrors MCPPresentationTools._parse_aspect_ratio.
+func parseAspectRatio(s string) float64 {
+	parts := strings.Split(s, ":")
+	if len(parts) != 2 {
+		return 16.0 / 9.0
+	}
+	w, errW := strconv.ParseFloat(parts[0], 64)
+	h, errH := strconv.ParseFloat(parts[1], 64)
+	if errW != nil || errH != nil || w <= 0 || h <= 0 {
+		return 16.0 / 9.0
+	}
+	return w / h
+}
+
+// parseHexColor: accepts #RRGGBB or #RRGGBBAA (with optional leading #).
+// Returns the parsed color and ok=true on success.
+func parseHexColor(hex string) (color.NRGBA, bool) {
+	s := strings.TrimSpace(hex)
+	if s == "" {
+		return color.NRGBA{}, false
+	}
+	if strings.HasPrefix(s, "#") {
+		s = s[1:]
+	}
+	switch len(s) {
+	case 6:
+		s += "ff"
+	case 8:
+		// ok
+	default:
+		return color.NRGBA{}, false
+	}
+	n, err := strconv.ParseUint(s, 16, 32)
+	if err != nil {
+		return color.NRGBA{}, false
+	}
+	return color.NRGBA{
+		R: uint8((n >> 24) & 0xff),
+		G: uint8((n >> 16) & 0xff),
+		B: uint8((n >> 8) & 0xff),
+		A: uint8(n & 0xff),
+	}, true
+}
+
+// makeSolidColorPNGBase64 synthesizes a base64-encoded PNG of the requested
+// hex color, sized so its pixel aspect matches the rendered rect aspect
+// (so the deck renderer doesn't stretch the bitmap awkwardly). Mirrors
+// MCPPresentationTools._make_solid_color_png_base64 — see nudge
+// presentation-solid-color-png-aspect-contract.
+//
+// Returns "" if hex is invalid.
+func makeSolidColorPNGBase64(hex string, wNorm, hNorm, slideAspect float64) string {
+	c, ok := parseHexColor(hex)
+	if !ok {
+		return ""
+	}
+	wSafe := math.Max(wNorm, 0.0001)
+	hSafe := math.Max(hNorm, 0.0001)
+	rectAspect := (wSafe / hSafe) * math.Max(slideAspect, 0.0001)
+	targetLongPx := 4096
+	var pxW, pxH int
+	if rectAspect >= 1.0 {
+		pxW = targetLongPx
+		pxH = int(math.Floor(float64(targetLongPx) / rectAspect))
+		if pxH < 1 {
+			pxH = 1
+		}
+	} else {
+		pxH = targetLongPx
+		pxW = int(math.Floor(float64(targetLongPx) * rectAspect))
+		if pxW < 1 {
+			pxW = 1
+		}
+	}
+	img := image.NewNRGBA(image.Rect(0, 0, pxW, pxH))
+	// Fill — image/draw is overkill for a uniform fill; touch each pixel.
+	for y := 0; y < pxH; y++ {
+		for x := 0; x < pxW; x++ {
+			img.Set(x, y, c)
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+// floatArg pulls an optional float-typed arg.  Returns (value, ok) — ok=false
+// when the key is absent or explicitly null. Mirrors intArg.
+func floatArg(args map[string]interface{}, key string) (float64, bool) {
+	v, has := args[key]
+	if !has || v == nil {
+		return 0, false
+	}
+	switch tv := v.(type) {
+	case float64:
+		return tv, true
+	case int:
+		return float64(tv), true
+	}
+	return 0, false
+}
+
+// stringArg pulls a non-empty stripped string. Returns ("", false) when
+// absent / empty / null.
+func stringArg(args map[string]interface{}, key string) (string, bool) {
+	v, has := args[key]
+	if !has || v == nil {
+		return "", false
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", false
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false
+	}
+	return s, true
+}
+
+func toolModifyTile(client *hostClient, rawArgs json.RawMessage) map[string]interface{} {
+	args, fault := parseTargetArgs(rawArgs)
+	if fault != nil {
+		return failResult(fault)
+	}
+	idx, ok := intArg(args, "slide_index", -1)
+	if !ok {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "slide_index is required"})
+	}
+	tileID, _ := args["tile_id"].(string)
+	tileID = strings.TrimSpace(tileID)
+	if tileID == "" {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "tile_id is required"})
+	}
+
+	// Image-source mutual-exclusivity check (runs before any read so the LLM
+	// gets a clean error fast). source_graphics_editor is rejected up-front —
+	// host.editors.export isn't declared in the manifest yet (T6 tail R4 will
+	// pick it up alongside add_image_tile).
+	if _, has := args["source_graphics_editor"]; has {
+		return failResult(&toolFault{
+			Code: "not_implemented_in_plugin_yet",
+			Msg:  "source_graphics_editor will be supported in a future modify_tile round; for now, fetch via host.editors.export and pass as image_base64",
+		})
+	}
+	hasPath := args["image_path"] != nil && fmt.Sprint(args["image_path"]) != ""
+	hasB64 := args["image_base64"] != nil && fmt.Sprint(args["image_base64"]) != ""
+	hasSolid := args["solid_color"] != nil && fmt.Sprint(args["solid_color"]) != ""
+	srcCount := 0
+	if hasPath {
+		srcCount++
+	}
+	if hasB64 {
+		srcCount++
+	}
+	if hasSolid {
+		srcCount++
+	}
+	if srcCount > 1 {
+		return failResult(&toolFault{
+			Code: "schema_validation_failed",
+			Msg:  "Provide at most one of: image_path, image_base64, solid_color",
+		})
+	}
+
+	// Helper that takes the live deck + tile and computes the patch + erase
+	// set. Used by both tab and disk branches.
+	applyModify := func(deck, tile map[string]interface{}) (map[string]interface{}, []string, *toolFault) {
+		patch := map[string]interface{}{}
+		erase := []string{}
+		kind, _ := tile["kind"].(string)
+
+		// Coords: validate when provided; clamp to [0,1].
+		for _, axis := range modifyCoordKeys {
+			v, has := floatArg(args, axis)
+			if !has {
+				continue
+			}
+			if v < 0.0 || v > 1.0 {
+				return nil, nil, &toolFault{
+					Code: "schema_validation_failed",
+					Msg:  fmt.Sprintf("%s must be in [0, 1], got %f", axis, v),
+				}
+			}
+			patch[axis] = v
+		}
+
+		// Rotation: 0 erases, nonzero sets.
+		if v, has := floatArg(args, "rotation"); has {
+			if v == 0.0 {
+				erase = append(erase, "rotation")
+			} else {
+				patch["rotation"] = v
+			}
+		}
+
+		// Text-tile fields gated on kind=="text".
+		if v, has := stringArg(args, "content"); has {
+			if kind != "text" {
+				return nil, nil, &toolFault{
+					Code: "schema_validation_failed",
+					Msg:  fmt.Sprintf("content can only be set on text tiles (this is %s)", kind),
+				}
+			}
+			patch["content"] = v
+		}
+		if v, has := stringArg(args, "text_mode"); has {
+			if kind != "text" {
+				return nil, nil, &toolFault{
+					Code: "schema_validation_failed",
+					Msg:  fmt.Sprintf("text_mode can only be set on text tiles (this is %s)", kind),
+				}
+			}
+			if !stringInSlice(v, textModesValid) {
+				return nil, nil, &toolFault{
+					Code: "schema_validation_failed",
+					Msg:  fmt.Sprintf("text_mode must be one of %v", textModesValid),
+				}
+			}
+			patch["text_mode"] = v
+		}
+		if v, has := intArg(args, "font_size", 0); has {
+			if kind != "text" {
+				return nil, nil, &toolFault{
+					Code: "schema_validation_failed",
+					Msg:  fmt.Sprintf("font_size can only be set on text tiles (this is %s)", kind),
+				}
+			}
+			if v == 0 {
+				erase = append(erase, "font_size")
+			} else {
+				if v < 8 || v > 200 {
+					return nil, nil, &toolFault{
+						Code: "schema_validation_failed",
+						Msg:  fmt.Sprintf("font_size must be in [8, 200] or 0 to clear, got %d", v),
+					}
+				}
+				patch["font_size"] = v
+			}
+		}
+		if afv, has := args["auto_fit"]; has && afv != nil {
+			if kind != "text" {
+				return nil, nil, &toolFault{
+					Code: "schema_validation_failed",
+					Msg:  fmt.Sprintf("auto_fit can only be set on text tiles (this is %s)", kind),
+				}
+			}
+			if b, ok := afv.(bool); ok {
+				if b {
+					patch["auto_fit"] = true
+				} else {
+					erase = append(erase, "auto_fit")
+				}
+			}
+		}
+
+		// Image-source replacement: applies only to image tiles.
+		if srcCount == 1 {
+			if kind != "image" {
+				return nil, nil, &toolFault{
+					Code: "schema_validation_failed",
+					Msg:  fmt.Sprintf("Image-source fields only apply to image tiles (this is %s)", kind),
+				}
+			}
+			var b64 string
+			switch {
+			case hasPath:
+				path, _ := args["image_path"].(string)
+				bytes, err := os.ReadFile(path)
+				if err != nil {
+					return nil, nil, &toolFault{Code: "file_io_failed", Msg: err.Error()}
+				}
+				b64 = base64.StdEncoding.EncodeToString(bytes)
+			case hasB64:
+				b64, _ = args["image_base64"].(string)
+			default:
+				// Solid color — synthesize at post-merge w/h so a same-call
+				// resize is reflected in the synthesized aspect.
+				effectiveW := 1.0
+				effectiveH := 1.0
+				if v, ok := patch["w"].(float64); ok {
+					effectiveW = v
+				} else if v, ok := tile["w"].(float64); ok {
+					effectiveW = v
+				}
+				if v, ok := patch["h"].(float64); ok {
+					effectiveH = v
+				} else if v, ok := tile["h"].(float64); ok {
+					effectiveH = v
+				}
+				aspectStr, _ := deck["aspect"].(string)
+				if aspectStr == "" {
+					aspectStr = "16:9"
+				}
+				slideAspect := parseAspectRatio(aspectStr)
+				hex, _ := args["solid_color"].(string)
+				b64 = makeSolidColorPNGBase64(hex, effectiveW, effectiveH, slideAspect)
+				if b64 == "" {
+					return nil, nil, &toolFault{
+						Code: "schema_validation_failed",
+						Msg:  "solid_color must be a valid hex color (e.g. #1F4E5A)",
+					}
+				}
+			}
+			patch["src"] = b64
+		}
+
+		return patch, erase, nil
+	}
+
+	// tab_name mode: read /slides/{idx} (need slide + tile for kind + aspect),
+	// then patch each field individually so partial-failure semantics are clear.
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		_, slideVal, fault := client.GetNode(tabName, fmt.Sprintf("/slides/%d", idx))
+		if fault != nil {
+			return failResult(fault)
+		}
+		slide, _ := slideVal.(map[string]interface{})
+		if slide == nil {
+			return failResult(&toolFault{
+				Code: "out_of_range",
+				Msg:  fmt.Sprintf("slide_index %d not found", idx),
+			})
+		}
+		tiles, _ := slide["tiles"].([]interface{})
+		var tile map[string]interface{}
+		var tileAt int = -1
+		for i, raw := range tiles {
+			t, _ := raw.(map[string]interface{})
+			if t == nil {
+				continue
+			}
+			if id, _ := t["id"].(string); id == tileID {
+				tile = t
+				tileAt = i
+				break
+			}
+		}
+		if tile == nil {
+			return failResult(&toolFault{
+				Code: "not_found",
+				Msg:  fmt.Sprintf("tile_id not found on slide %d: %s", idx, tileID),
+			})
+		}
+
+		// Pull the deck-level aspect (needed for solid_color sizing).
+		_, aspectVal, _ := client.GetNode(tabName, "/aspect")
+		deckLike := map[string]interface{}{"aspect": aspectVal}
+
+		patchKV, eraseKV, applyFault := applyModify(deckLike, tile)
+		if applyFault != nil {
+			return failResult(applyFault)
+		}
+
+		// Build JSON Patch operations: replace for each new value, remove for
+		// each erased key. If the resulting set is empty, return success
+		// without sending a patch (idempotent no-op).
+		if len(patchKV) == 0 && len(eraseKV) == 0 {
+			return map[string]interface{}{
+				"success":     true,
+				"slide_index": idx,
+				"tile_id":     tileID,
+			}
+		}
+		patchBuilder := client.Patch(tabName)
+		for k, v := range patchKV {
+			tilePath := fmt.Sprintf("/slides/%d/tiles/%d/%s", idx, tileAt, k)
+			if _, present := tile[k]; present {
+				patchBuilder = patchBuilder.Replace(tilePath, v)
+			} else {
+				patchBuilder = patchBuilder.Add(tilePath, v)
+			}
+		}
+		for _, k := range eraseKV {
+			if _, present := tile[k]; !present {
+				continue
+			}
+			patchBuilder = patchBuilder.Remove(fmt.Sprintf("/slides/%d/tiles/%d/%s", idx, tileAt, k))
+		}
+		if _, pf := patchBuilder.Send(); pf != nil {
+			return failResult(pf)
+		}
+		return map[string]interface{}{
+			"success":     true,
+			"slide_index": idx,
+			"tile_id":     tileID,
+		}
+	}
+
+	// disk mode.
+	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
+		slides, _ := deck["slides"].([]interface{})
+		if idx < 0 || idx >= len(slides) {
+			return nil, &toolFault{
+				Code: "out_of_range",
+				Msg:  fmt.Sprintf("slide_index %d out of range [0,%d)", idx, len(slides)),
+			}
+		}
+		slide, _ := slides[idx].(map[string]interface{})
+		if slide == nil {
+			return nil, &toolFault{Code: "out_of_range", Msg: "slide is not an object"}
+		}
+		tiles, _ := slide["tiles"].([]interface{})
+		var tile map[string]interface{}
+		for _, raw := range tiles {
+			t, _ := raw.(map[string]interface{})
+			if t == nil {
+				continue
+			}
+			if id, _ := t["id"].(string); id == tileID {
+				tile = t
+				break
+			}
+		}
+		if tile == nil {
+			return nil, &toolFault{
+				Code: "not_found",
+				Msg:  fmt.Sprintf("tile_id not found on slide %d: %s", idx, tileID),
+			}
+		}
+		patchKV, eraseKV, applyFault := applyModify(deck, tile)
+		if applyFault != nil {
+			return nil, applyFault
+		}
+		// Apply atomically (only after all validations pass).
+		for k, v := range patchKV {
+			tile[k] = v
+		}
+		for _, k := range eraseKV {
+			delete(tile, k)
+		}
+		return map[string]interface{}{
+			"slide_index": idx,
+			"tile_id":     tileID,
 		}, nil
 	})
 }

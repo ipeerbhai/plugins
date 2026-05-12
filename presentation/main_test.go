@@ -2580,3 +2580,298 @@ func TestToolSetAnnotationResolved_RequiresOneArg(t *testing.T) {
 		t.Fatalf("expected schema_validation_failed, got %+v", out)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// minerva_presentation_modify_tile (T6 tail R3)
+// ---------------------------------------------------------------------------
+
+// writeDeckWithTiles seeds a deck with one slide containing one text + one
+// image tile. Returns the path; tile ids are "t_text" and "t_image".
+func writeDeckWithTiles(t *testing.T) string {
+	t.Helper()
+	tmp := t.TempDir()
+	path := tmp + "/mt.mdeck"
+	body := `{
+		"version": 1,
+		"aspect": "16:9",
+		"slides": [{
+			"id": "s_a",
+			"tiles": [
+				{"id":"t_text","kind":"text","x":0.1,"y":0.1,"w":0.4,"h":0.2,"content":"hello","text_mode":"plain"},
+				{"id":"t_image","kind":"image","x":0.5,"y":0.5,"w":0.3,"h":0.3,"src":"old"}
+			]
+		}]
+	}`
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	return path
+}
+
+func TestToolModifyTile_CoordsAndRotation(t *testing.T) {
+	path := writeDeckWithTiles(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":        path,
+		"slide_index": 0,
+		"tile_id":     "t_text",
+		"x":           0.2,
+		"w":           0.5,
+		"rotation":    0.785, // pi/4
+	})
+	out := toolModifyTile(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	deck := readDeck(t, path)
+	tile := deck["slides"].([]interface{})[0].(map[string]interface{})["tiles"].([]interface{})[0].(map[string]interface{})
+	if tile["x"] != 0.2 {
+		t.Errorf("x: %v", tile["x"])
+	}
+	if tile["w"] != 0.5 {
+		t.Errorf("w: %v", tile["w"])
+	}
+	if tile["rotation"] != 0.785 {
+		t.Errorf("rotation: %v", tile["rotation"])
+	}
+	if tile["y"] != 0.1 {
+		t.Errorf("y (unchanged) lost: %v", tile["y"])
+	}
+}
+
+func TestToolModifyTile_RotationZeroErases(t *testing.T) {
+	path := writeDeckWithTiles(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	// First set rotation.
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":        path,
+		"slide_index": 0,
+		"tile_id":     "t_text",
+		"rotation":    0.5,
+	})
+	out := toolModifyTile(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("set rotation failed: %+v", out)
+	}
+	// Now clear.
+	rawArgs, _ = json.Marshal(map[string]interface{}{
+		"path":        path,
+		"slide_index": 0,
+		"tile_id":     "t_text",
+		"rotation":    0,
+	})
+	out = toolModifyTile(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("clear rotation failed: %+v", out)
+	}
+	deck := readDeck(t, path)
+	tile := deck["slides"].([]interface{})[0].(map[string]interface{})["tiles"].([]interface{})[0].(map[string]interface{})
+	if _, has := tile["rotation"]; has {
+		t.Errorf("rotation=0 should erase the key, got %+v", tile)
+	}
+}
+
+func TestToolModifyTile_TextFieldsOnImageTileRejected(t *testing.T) {
+	path := writeDeckWithTiles(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":        path,
+		"slide_index": 0,
+		"tile_id":     "t_image",
+		"content":     "should fail",
+	})
+	out := toolModifyTile(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected reject, got %+v", out)
+	}
+	if code, _ := out["error_code"].(string); code != "schema_validation_failed" {
+		t.Errorf("expected schema_validation_failed, got %q", code)
+	}
+}
+
+func TestToolModifyTile_FontSizeBoundsAndClear(t *testing.T) {
+	path := writeDeckWithTiles(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	// Out of range — should fail.
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":        path,
+		"slide_index": 0,
+		"tile_id":     "t_text",
+		"font_size":   500,
+	})
+	out := toolModifyTile(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("font_size=500 should fail, got %+v", out)
+	}
+
+	// In range — sets.
+	rawArgs, _ = json.Marshal(map[string]interface{}{
+		"path":        path,
+		"slide_index": 0,
+		"tile_id":     "t_text",
+		"font_size":   42,
+	})
+	out = toolModifyTile(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("font_size=42 should succeed, got %+v", out)
+	}
+
+	// 0 — clears.
+	rawArgs, _ = json.Marshal(map[string]interface{}{
+		"path":        path,
+		"slide_index": 0,
+		"tile_id":     "t_text",
+		"font_size":   0,
+	})
+	out = toolModifyTile(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("font_size=0 should succeed (clear), got %+v", out)
+	}
+	deck := readDeck(t, path)
+	tile := deck["slides"].([]interface{})[0].(map[string]interface{})["tiles"].([]interface{})[0].(map[string]interface{})
+	if _, has := tile["font_size"]; has {
+		t.Errorf("font_size=0 should erase the key, got %+v", tile["font_size"])
+	}
+}
+
+func TestToolModifyTile_ImageSourceMutualExclusion(t *testing.T) {
+	path := writeDeckWithTiles(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":         path,
+		"slide_index":  0,
+		"tile_id":      "t_image",
+		"image_base64": "ignored",
+		"solid_color":  "#ff0000",
+	})
+	out := toolModifyTile(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected schema_validation_failed on two sources, got %+v", out)
+	}
+}
+
+func TestToolModifyTile_SolidColorSynthesisesPNG(t *testing.T) {
+	path := writeDeckWithTiles(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":        path,
+		"slide_index": 0,
+		"tile_id":     "t_image",
+		"solid_color": "#1F4E5A",
+	})
+	out := toolModifyTile(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	deck := readDeck(t, path)
+	tile := deck["slides"].([]interface{})[0].(map[string]interface{})["tiles"].([]interface{})[1].(map[string]interface{})
+	src, _ := tile["src"].(string)
+	if src == "" || src == "old" {
+		t.Fatalf("expected replaced src with PNG base64, got len=%d (%q)", len(src), src[:min(40, len(src))])
+	}
+	raw, err := base64.StdEncoding.DecodeString(src)
+	if err != nil {
+		t.Fatalf("src is not base64: %v", err)
+	}
+	// PNG magic: 89 50 4E 47 0D 0A 1A 0A
+	if len(raw) < 8 || raw[0] != 0x89 || raw[1] != 'P' || raw[2] != 'N' || raw[3] != 'G' {
+		t.Errorf("not a PNG: %v", raw[:min(8, len(raw))])
+	}
+}
+
+func TestToolModifyTile_SolidColorRejectsInvalidHex(t *testing.T) {
+	path := writeDeckWithTiles(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":        path,
+		"slide_index": 0,
+		"tile_id":     "t_image",
+		"solid_color": "rgb(1,2,3)",
+	})
+	out := toolModifyTile(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected reject, got %+v", out)
+	}
+}
+
+func TestToolModifyTile_RejectsCoordsOutOfRange(t *testing.T) {
+	path := writeDeckWithTiles(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":        path,
+		"slide_index": 0,
+		"tile_id":     "t_text",
+		"x":           1.5,
+	})
+	out := toolModifyTile(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected reject for x>1, got %+v", out)
+	}
+}
+
+func TestToolModifyTile_SourceGraphicsEditorDeferredCleanly(t *testing.T) {
+	path := writeDeckWithTiles(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":                   path,
+		"slide_index":            0,
+		"tile_id":                "t_image",
+		"source_graphics_editor": "diagram1",
+	})
+	out := toolModifyTile(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected not-yet-supported error, got %+v", out)
+	}
+	if code, _ := out["error_code"].(string); code != "not_implemented_in_plugin_yet" {
+		t.Errorf("expected not_implemented_in_plugin_yet, got %q", code)
+	}
+}
+
+func TestToolModifyTile_TileNotFound(t *testing.T) {
+	path := writeDeckWithTiles(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":        path,
+		"slide_index": 0,
+		"tile_id":     "nope",
+	})
+	out := toolModifyTile(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected not_found, got %+v", out)
+	}
+	if code, _ := out["error_code"].(string); code != "not_found" {
+		t.Errorf("expected not_found, got %q", code)
+	}
+}
+
+func TestParseAspectRatio_FallbackOnGarbage(t *testing.T) {
+	if r := parseAspectRatio("garbage"); r != 16.0/9.0 {
+		t.Errorf("fallback failed: %v", r)
+	}
+	if r := parseAspectRatio("4:3"); r != 4.0/3.0 {
+		t.Errorf("4:3: %v", r)
+	}
+	if r := parseAspectRatio("1:1"); r != 1.0 {
+		t.Errorf("1:1: %v", r)
+	}
+}
