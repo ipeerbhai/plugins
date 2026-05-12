@@ -660,6 +660,49 @@ var toolList = []map[string]interface{}{
 			"properties": targetSchema,
 		},
 	},
+	{
+		"name":        "minerva_presentation_add_annotation",
+		"description": "Add an annotation envelope to a slide. kind is one of: callout, 2d_arrow, 2d_text. summary is required (surfaced by list_annotations). Optional: anchor (substrate anchor dict — defaults: callout→plugin=\"presentation\", 2d_arrow/2d_text→plugin=\"core\"); kind_payload (kind-specific dict — text-bearing kinds get summary mirrored to kind_payload.text when not set); lifecycle (open|applied|resolved|stale; default open). Returns annotation_id.",
+		"inputSchema": map[string]interface{}{
+			"type": "object",
+			"properties": withProps(targetSchema, map[string]interface{}{
+				"slide_index":  map[string]interface{}{"type": "integer"},
+				"kind":         map[string]interface{}{"type": "string"},
+				"summary":      map[string]interface{}{"type": "string"},
+				"anchor":       map[string]interface{}{"type": "object"},
+				"kind_payload": map[string]interface{}{"type": "object"},
+				"lifecycle":    map[string]interface{}{"type": "string", "description": "open | applied | resolved | stale (default open)"},
+			}),
+			"required": []string{"slide_index", "kind", "summary"},
+		},
+	},
+	{
+		"name":        "minerva_presentation_remove_annotation",
+		"description": "Remove an annotation from a slide by annotation_id. If the slide.annotations array empties, the key is removed entirely (omit-when-default). Also scrubs any reveal[] entries that reference this annotation_id.",
+		"inputSchema": map[string]interface{}{
+			"type": "object",
+			"properties": withProps(targetSchema, map[string]interface{}{
+				"slide_index":   map[string]interface{}{"type": "integer"},
+				"annotation_id": map[string]interface{}{"type": "string"},
+			}),
+			"required": []string{"slide_index", "annotation_id"},
+		},
+	},
+	{
+		"name":        "minerva_presentation_set_annotation_resolved",
+		"description": "Mark an annotation resolved (true) or open (false). Maps onto substrate's lifecycle field: true → 'resolved', false → 'open'. To set 'applied' or 'stale' explicitly, pass lifecycle directly. Optional note appends to a resolution_notes array on the envelope.",
+		"inputSchema": map[string]interface{}{
+			"type": "object",
+			"properties": withProps(targetSchema, map[string]interface{}{
+				"slide_index":   map[string]interface{}{"type": "integer"},
+				"annotation_id": map[string]interface{}{"type": "string"},
+				"resolved":      map[string]interface{}{"type": "boolean"},
+				"lifecycle":     map[string]interface{}{"type": "string", "description": "Explicit lifecycle state — overrides resolved when present."},
+				"note":          map[string]interface{}{"type": "string"},
+			}),
+			"required": []string{"slide_index", "annotation_id"},
+		},
+	},
 }
 
 // withProps composes two schema-property maps without mutating either.
@@ -675,13 +718,47 @@ func withProps(a, b map[string]interface{}) map[string]interface{} {
 }
 
 // supportedAnnotationKinds is the static catalogue exposed by
-// minerva_presentation_list_annotation_kinds. Mirrors the core
-// MCPPresentationTools.gd ANNOTATION_KIND_* constants — keep in sync until
-// the core implementation is fully removed in T6 R3+.
+// minerva_presentation_list_annotation_kinds. The kinds here MUST match
+// what presentation_tile_annotation_host.gd accepts AND what
+// AnnotationV2Schema validates as substrate-compatible. See
+// MCPPresentationTools.gd:144 ANNOTATION_KINDS_VALID. The pre-T6-tail
+// catalogue (comment / review_note / speaker_note) was a doc bug —
+// substrate would reject all three at validation time.
+//
+// Anchor-compat (AnnotationV2Schema._GENERIC_KIND_ANCHORS):
+//   - callout            anchor "*/*"    → any anchor.plugin works
+//   - 2d_arrow / 2d_text anchor "core/*" → anchor.plugin must be "core"
+//   (handled by anchorDefault when caller omits anchor)
 var supportedAnnotationKinds = []map[string]interface{}{
-	{"id": "comment", "label": "Comment", "target_scope": "tile"},
-	{"id": "review_note", "label": "Review note", "target_scope": "slide"},
-	{"id": "speaker_note", "label": "Speaker note", "target_scope": "slide"},
+	{"kind": "callout"},
+	{"kind": "2d_arrow"},
+	{"kind": "2d_text"},
+}
+
+// annotationKindsValid is the validation set — same names, sans the wrapping
+// dict.  Mirrors MCPPresentationTools.gd:144.
+var annotationKindsValid = []string{"callout", "2d_arrow", "2d_text"}
+
+// annotationKindsTextBearing: text-bearing kinds whose summary is mirrored
+// into kind_payload.text when the caller didn't supply one. Mirrors
+// MCPPresentationTools.gd:149.
+var annotationKindsTextBearing = map[string]bool{
+	"callout": true,
+	"2d_text": true,
+}
+
+// annotationLifecyclesValid mirrors MCPPresentationTools.gd:128.
+var annotationLifecyclesValid = []string{"open", "applied", "resolved", "stale"}
+
+const annotationSchemaVersion = 2
+
+func stringInSlice(needle string, hay []string) bool {
+	for _, v := range hay {
+		if v == needle {
+			return true
+		}
+	}
+	return false
 }
 
 // dispatchTool routes a tools/call by tool name.
@@ -734,6 +811,12 @@ func dispatchTool(client *hostClient, msg *rpcRequest) {
 		respondTool(client.enc, msg.ID, toolCreateDeck(client, p.Arguments))
 	case "minerva_presentation_list_open_annotations":
 		respondTool(client.enc, msg.ID, toolListOpenAnnotations(client, p.Arguments))
+	case "minerva_presentation_add_annotation":
+		respondTool(client.enc, msg.ID, toolAddAnnotation(client, p.Arguments))
+	case "minerva_presentation_remove_annotation":
+		respondTool(client.enc, msg.ID, toolRemoveAnnotation(client, p.Arguments))
+	case "minerva_presentation_set_annotation_resolved":
+		respondTool(client.enc, msg.ID, toolSetAnnotationResolved(client, p.Arguments))
 	case "minerva_presentation_set_slide_background":
 		respondTool(client.enc, msg.ID, toolSetSlideBackground(client, p.Arguments))
 	default:
@@ -957,9 +1040,14 @@ func toolListOpenDecks(client *hostClient, _ json.RawMessage) map[string]interfa
 // ---------------------------------------------------------------------------
 
 func toolListAnnotationKinds(_ json.RawMessage) map[string]interface{} {
+	// Mirrors core _list_annotation_kinds shape: kinds + lifecycle_states +
+	// schema_version. Earlier plugin shape (just {success, kinds}) omitted
+	// the lifecycle catalogue and schema_version pinning.
 	return map[string]interface{}{
-		"success": true,
-		"kinds":   supportedAnnotationKinds,
+		"success":          true,
+		"kinds":            supportedAnnotationKinds,
+		"lifecycle_states": annotationLifecyclesValid,
+		"schema_version":   annotationSchemaVersion,
 	}
 }
 
@@ -2809,6 +2897,520 @@ func toolListOpenAnnotations(client *hostClient, rawArgs json.RawMessage) map[st
 		"open":    open,
 		"count":   len(open),
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Tool: minerva_presentation_add_annotation
+// ---------------------------------------------------------------------------
+
+// anchorDefault builds the substrate anchor when the caller omits one.
+// Mirrors MCPPresentationTools._resolve_annotation_anchor:
+//   callout  → plugin="presentation" (anchor compat "*/*")
+//   2d_arrow / 2d_text → plugin="core" (anchor compat "core/*")
+// All defaults set snapshot.position = [0.5, 0.5] (slide center).
+func anchorDefault(kind, slideID string) map[string]interface{} {
+	plugin := "core"
+	if kind == "callout" {
+		plugin = "presentation"
+	}
+	return map[string]interface{}{
+		"plugin": plugin,
+		"type":   "slide",
+		"id":     slideID,
+		"snapshot": map[string]interface{}{
+			"position": []interface{}{0.5, 0.5},
+		},
+	}
+}
+
+// validateAnnotationEnvelope does the minimum shape checks that the substrate
+// AnnotationV2Schema would otherwise fail at read-time. Returns "" on success.
+// Mirrors MCPPresentationTools._validate_annotation_envelope but is intentionally
+// narrower: we trust the broker-side validator the next layer up; this is the
+// fail-fast convenience layer for the LLM.
+func validateAnnotationEnvelope(env map[string]interface{}) string {
+	if id, _ := env["id"].(string); id == "" {
+		return "id must be non-empty"
+	}
+	kind, _ := env["kind"].(string)
+	if !stringInSlice(kind, annotationKindsValid) {
+		return fmt.Sprintf("kind must be one of %v", annotationKindsValid)
+	}
+	sv, _ := env["schema_version"].(float64)
+	if int(sv) != annotationSchemaVersion {
+		return fmt.Sprintf("schema_version must be %d", annotationSchemaVersion)
+	}
+	anchor, _ := env["anchor"].(map[string]interface{})
+	if anchor == nil {
+		return "anchor is required"
+	}
+	if plugin, _ := anchor["plugin"].(string); plugin == "" {
+		return "anchor.plugin must be non-empty"
+	}
+	if typ, _ := anchor["type"].(string); typ == "" {
+		return "anchor.type must be non-empty"
+	}
+	author, _ := env["author"].(map[string]interface{})
+	if author == nil {
+		return "author is required"
+	}
+	if ak, _ := author["kind"].(string); ak == "" {
+		return "author.kind must be non-empty"
+	}
+	if vc, _ := env["view_context"].(string); vc == "" {
+		return "view_context must be non-empty"
+	}
+	visible, _ := env["visible_in_views"].([]interface{})
+	if len(visible) == 0 {
+		return "visible_in_views must be a non-empty array"
+	}
+	if s, _ := env["summary"].(string); s == "" {
+		return "summary must be non-empty"
+	}
+	lc, _ := env["lifecycle"].(string)
+	if !stringInSlice(lc, annotationLifecyclesValid) {
+		return fmt.Sprintf("lifecycle must be one of %v", annotationLifecyclesValid)
+	}
+	return ""
+}
+
+func toolAddAnnotation(client *hostClient, rawArgs json.RawMessage) map[string]interface{} {
+	args, fault := parseTargetArgs(rawArgs)
+	if fault != nil {
+		return failResult(fault)
+	}
+	idx, ok := intArg(args, "slide_index", -1)
+	if !ok {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "slide_index is required"})
+	}
+	kind, _ := args["kind"].(string)
+	kind = strings.TrimSpace(kind)
+	if !stringInSlice(kind, annotationKindsValid) {
+		return failResult(&toolFault{
+			Code: "schema_validation_failed",
+			Msg:  fmt.Sprintf("kind must be one of %v", annotationKindsValid),
+		})
+	}
+	summary, _ := args["summary"].(string)
+	if summary == "" {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "summary must be a non-empty string"})
+	}
+	lifecycle, _ := args["lifecycle"].(string)
+	if lifecycle == "" {
+		lifecycle = "open"
+	}
+	if !stringInSlice(lifecycle, annotationLifecyclesValid) {
+		return failResult(&toolFault{
+			Code: "schema_validation_failed",
+			Msg:  fmt.Sprintf("lifecycle must be one of %v", annotationLifecyclesValid),
+		})
+	}
+
+	// Build envelope shared by both tab and disk paths. slide_id is filled in
+	// per-branch (tab path looks up via get_node; disk path reads from the
+	// loaded deck) since both modes need to know it for anchor default and
+	// view_context.
+	buildEnvelope := func(slideID string) (map[string]interface{}, string) {
+		annID := genID("ann")
+
+		// Anchor: caller-provided wins verbatim; else synthesize per-kind.
+		var anchor map[string]interface{}
+		if raw, ok := args["anchor"].(map[string]interface{}); ok {
+			anchor = raw
+		} else {
+			anchor = anchorDefault(kind, slideID)
+		}
+
+		// kind_payload: copy if provided; mirror summary → kind_payload.text
+		// for text-bearing kinds when caller didn't supply it.
+		kindPayload := map[string]interface{}{}
+		if rawKP, ok := args["kind_payload"].(map[string]interface{}); ok {
+			for k, v := range rawKP {
+				kindPayload[k] = v
+			}
+		}
+		if annotationKindsTextBearing[kind] {
+			if _, has := kindPayload["text"]; !has {
+				kindPayload["text"] = summary
+			}
+		}
+
+		viewCtxID := slideID
+		if viewCtxID == "" {
+			viewCtxID = fmt.Sprintf("slide_%d", idx)
+		}
+		env := map[string]interface{}{
+			"id":             annID,
+			"kind":           kind,
+			"schema_version": float64(annotationSchemaVersion),
+			"anchor":         anchor,
+			"kind_payload":   kindPayload,
+			"lifecycle":      lifecycle,
+			"author": map[string]interface{}{
+				"kind":       "ai",
+				"id":         "mcp",
+				"session_id": "minerva_presentation_add_annotation",
+			},
+			"view_context":     fmt.Sprintf("presentation:%s", viewCtxID),
+			"visible_in_views": []interface{}{"presentation"},
+			"summary":          summary,
+		}
+		return env, annID
+	}
+
+	// tab_name mode: look up slide_id via get_node, then patch with op=add at
+	// /slides/{idx}/annotations/- (end-of-array). If annotations key is absent
+	// we must first create it (add with empty array) before appending, since
+	// RFC 6902 op=add on /key/- requires the parent array to exist.
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		// Resolve slide_id to fill anchor/view_context defaults.
+		_, slideVal, fault := client.GetNode(tabName, fmt.Sprintf("/slides/%d", idx))
+		if fault != nil {
+			return failResult(fault)
+		}
+		slide, _ := slideVal.(map[string]interface{})
+		if slide == nil {
+			return failResult(&toolFault{
+				Code: "out_of_range",
+				Msg:  fmt.Sprintf("slide_index %d not found", idx),
+			})
+		}
+		slideID, _ := slide["id"].(string)
+
+		env, annID := buildEnvelope(slideID)
+		if verr := validateAnnotationEnvelope(env); verr != "" {
+			return failResult(&toolFault{
+				Code: "schema_validation_failed",
+				Msg:  fmt.Sprintf("envelope rejected: %s", verr),
+			})
+		}
+
+		// Patch: ensure annotations array exists, then append.
+		patch := client.Patch(tabName)
+		if _, has := slide["annotations"]; !has {
+			patch = patch.Add(fmt.Sprintf("/slides/%d/annotations", idx), []interface{}{})
+		}
+		patch = patch.Add(fmt.Sprintf("/slides/%d/annotations/-", idx), env)
+		if _, pf := patch.Send(); pf != nil {
+			return failResult(pf)
+		}
+		return map[string]interface{}{
+			"success":       true,
+			"slide_index":   idx,
+			"annotation_id": annID,
+		}
+	}
+
+	// disk mode: load, mutate, save.
+	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
+		slides, _ := deck["slides"].([]interface{})
+		if idx < 0 || idx >= len(slides) {
+			return nil, &toolFault{
+				Code: "out_of_range",
+				Msg:  fmt.Sprintf("slide_index %d out of range [0,%d)", idx, len(slides)),
+			}
+		}
+		slide, _ := slides[idx].(map[string]interface{})
+		if slide == nil {
+			return nil, &toolFault{Code: "out_of_range", Msg: "slide is not an object"}
+		}
+		slideID, _ := slide["id"].(string)
+
+		env, annID := buildEnvelope(slideID)
+		if verr := validateAnnotationEnvelope(env); verr != "" {
+			return nil, &toolFault{
+				Code: "schema_validation_failed",
+				Msg:  fmt.Sprintf("envelope rejected: %s", verr),
+			}
+		}
+
+		anns, _ := slide["annotations"].([]interface{})
+		slide["annotations"] = append(anns, env)
+		return map[string]interface{}{
+			"slide_index":   idx,
+			"annotation_id": annID,
+		}, nil
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Tool: minerva_presentation_remove_annotation
+// ---------------------------------------------------------------------------
+
+// findAnnotationIndex returns the index of an annotation by id within the
+// given annotations slice, or -1 if not found.
+func findAnnotationIndex(anns []interface{}, annID string) int {
+	for i, raw := range anns {
+		env, _ := raw.(map[string]interface{})
+		if env == nil {
+			continue
+		}
+		if id, _ := env["id"].(string); id == annID {
+			return i
+		}
+	}
+	return -1
+}
+
+// scrubRevealRefs removes any reveal[] entries equal to the supplied id.
+// reveal can contain tile ids OR annotation ids; this is called from
+// remove_annotation to honor the "scrub annotation refs" rule from
+// MCPPresentationTools.gd:1012-1019.
+func scrubRevealRefs(slide map[string]interface{}, id string) {
+	reveal, _ := slide["reveal"].([]interface{})
+	if len(reveal) == 0 {
+		return
+	}
+	out := reveal[:0]
+	for _, r := range reveal {
+		if s, _ := r.(string); s == id {
+			continue
+		}
+		out = append(out, r)
+	}
+	slide["reveal"] = out
+}
+
+func toolRemoveAnnotation(client *hostClient, rawArgs json.RawMessage) map[string]interface{} {
+	args, fault := parseTargetArgs(rawArgs)
+	if fault != nil {
+		return failResult(fault)
+	}
+	idx, ok := intArg(args, "slide_index", -1)
+	if !ok {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "slide_index is required"})
+	}
+	annID, _ := args["annotation_id"].(string)
+	annID = strings.TrimSpace(annID)
+	if annID == "" {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "annotation_id is required"})
+	}
+
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		// Need to read the slide to find the annotation index (op=remove takes
+		// the numeric index, not the id) and to know whether the resulting
+		// annotations array empties (omit-when-default → op=remove the key).
+		_, slideVal, fault := client.GetNode(tabName, fmt.Sprintf("/slides/%d", idx))
+		if fault != nil {
+			return failResult(fault)
+		}
+		slide, _ := slideVal.(map[string]interface{})
+		if slide == nil {
+			return failResult(&toolFault{
+				Code: "out_of_range",
+				Msg:  fmt.Sprintf("slide_index %d not found", idx),
+			})
+		}
+		anns, _ := slide["annotations"].([]interface{})
+		if len(anns) == 0 {
+			return failResult(&toolFault{Code: "not_found", Msg: "Slide has no annotations"})
+		}
+		annAt := findAnnotationIndex(anns, annID)
+		if annAt < 0 {
+			return failResult(&toolFault{
+				Code: "not_found",
+				Msg:  fmt.Sprintf("annotation_id not found on slide %d: %s", idx, annID),
+			})
+		}
+
+		patch := client.Patch(tabName).Remove(fmt.Sprintf("/slides/%d/annotations/%d", idx, annAt))
+		// If this was the last annotation, also remove the annotations key.
+		if len(anns) == 1 {
+			patch = patch.Remove(fmt.Sprintf("/slides/%d/annotations", idx))
+		}
+		// Scrub reveal refs to this id (if any).
+		reveal, _ := slide["reveal"].([]interface{})
+		removedFromReveal := 0
+		for _, r := range reveal {
+			if s, _ := r.(string); s == annID {
+				removedFromReveal++
+			}
+		}
+		if removedFromReveal > 0 {
+			// Build the scrubbed reveal in-place and replace via patch op=replace.
+			scrubbed := make([]interface{}, 0, len(reveal)-removedFromReveal)
+			for _, r := range reveal {
+				if s, _ := r.(string); s == annID {
+					continue
+				}
+				scrubbed = append(scrubbed, r)
+			}
+			patch = patch.Replace(fmt.Sprintf("/slides/%d/reveal", idx), scrubbed)
+		}
+		if _, pf := patch.Send(); pf != nil {
+			return failResult(pf)
+		}
+		return map[string]interface{}{
+			"success":       true,
+			"slide_index":   idx,
+			"annotation_id": annID,
+		}
+	}
+
+	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
+		slides, _ := deck["slides"].([]interface{})
+		if idx < 0 || idx >= len(slides) {
+			return nil, &toolFault{
+				Code: "out_of_range",
+				Msg:  fmt.Sprintf("slide_index %d out of range [0,%d)", idx, len(slides)),
+			}
+		}
+		slide, _ := slides[idx].(map[string]interface{})
+		if slide == nil {
+			return nil, &toolFault{Code: "out_of_range", Msg: "slide is not an object"}
+		}
+		anns, _ := slide["annotations"].([]interface{})
+		if len(anns) == 0 {
+			return nil, &toolFault{Code: "not_found", Msg: "Slide has no annotations"}
+		}
+		annAt := findAnnotationIndex(anns, annID)
+		if annAt < 0 {
+			return nil, &toolFault{
+				Code: "not_found",
+				Msg:  fmt.Sprintf("annotation_id not found on slide %d: %s", idx, annID),
+			}
+		}
+		out := append(anns[:annAt:annAt], anns[annAt+1:]...)
+		if len(out) == 0 {
+			delete(slide, "annotations")
+		} else {
+			slide["annotations"] = out
+		}
+		scrubRevealRefs(slide, annID)
+		return map[string]interface{}{
+			"slide_index":   idx,
+			"annotation_id": annID,
+		}, nil
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Tool: minerva_presentation_set_annotation_resolved
+// ---------------------------------------------------------------------------
+
+func toolSetAnnotationResolved(client *hostClient, rawArgs json.RawMessage) map[string]interface{} {
+	args, fault := parseTargetArgs(rawArgs)
+	if fault != nil {
+		return failResult(fault)
+	}
+	idx, ok := intArg(args, "slide_index", -1)
+	if !ok {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "slide_index is required"})
+	}
+	annID, _ := args["annotation_id"].(string)
+	annID = strings.TrimSpace(annID)
+	if annID == "" {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "annotation_id is required"})
+	}
+
+	// Compute target lifecycle: explicit `lifecycle` arg wins; else `resolved`
+	// bool maps true→"resolved", false→"open".
+	var targetLifecycle string
+	if lc, hasLC := args["lifecycle"].(string); hasLC && lc != "" {
+		if !stringInSlice(lc, annotationLifecyclesValid) {
+			return failResult(&toolFault{
+				Code: "schema_validation_failed",
+				Msg:  fmt.Sprintf("lifecycle must be one of %v", annotationLifecyclesValid),
+			})
+		}
+		targetLifecycle = lc
+	} else if rb, hasRB := args["resolved"].(bool); hasRB {
+		if rb {
+			targetLifecycle = "resolved"
+		} else {
+			targetLifecycle = "open"
+		}
+	} else {
+		return failResult(&toolFault{Code: "schema_validation_failed", Msg: "Provide either resolved (bool) or lifecycle (string)"})
+	}
+
+	note, _ := args["note"].(string)
+
+	applyToEnv := func(env map[string]interface{}) {
+		env["lifecycle"] = targetLifecycle
+		if note != "" {
+			notes, _ := env["resolution_notes"].([]interface{})
+			notes = append(notes, map[string]interface{}{
+				"at":        time.Now().UTC().Format(time.RFC3339),
+				"lifecycle": targetLifecycle,
+				"note":      note,
+			})
+			env["resolution_notes"] = notes
+		}
+	}
+
+	if tabName, _ := args["tab_name"].(string); tabName != "" {
+		_, slideVal, fault := client.GetNode(tabName, fmt.Sprintf("/slides/%d", idx))
+		if fault != nil {
+			return failResult(fault)
+		}
+		slide, _ := slideVal.(map[string]interface{})
+		if slide == nil {
+			return failResult(&toolFault{
+				Code: "out_of_range",
+				Msg:  fmt.Sprintf("slide_index %d not found", idx),
+			})
+		}
+		anns, _ := slide["annotations"].([]interface{})
+		if len(anns) == 0 {
+			return failResult(&toolFault{Code: "not_found", Msg: "Slide has no annotations"})
+		}
+		annAt := findAnnotationIndex(anns, annID)
+		if annAt < 0 {
+			return failResult(&toolFault{
+				Code: "not_found",
+				Msg:  fmt.Sprintf("annotation_id not found on slide %d: %s", idx, annID),
+			})
+		}
+		// Read-modify-write the envelope: pull, mutate, replace.
+		env, _ := anns[annAt].(map[string]interface{})
+		envCopy := map[string]interface{}{}
+		for k, v := range env {
+			envCopy[k] = v
+		}
+		applyToEnv(envCopy)
+		if _, pf := client.Patch(tabName).Replace(fmt.Sprintf("/slides/%d/annotations/%d", idx, annAt), envCopy).Send(); pf != nil {
+			return failResult(pf)
+		}
+		return map[string]interface{}{
+			"success":       true,
+			"slide_index":   idx,
+			"annotation_id": annID,
+			"lifecycle":     targetLifecycle,
+		}
+	}
+
+	return mutateDeck(client, args, func(deck map[string]interface{}) (map[string]interface{}, *toolFault) {
+		slides, _ := deck["slides"].([]interface{})
+		if idx < 0 || idx >= len(slides) {
+			return nil, &toolFault{
+				Code: "out_of_range",
+				Msg:  fmt.Sprintf("slide_index %d out of range [0,%d)", idx, len(slides)),
+			}
+		}
+		slide, _ := slides[idx].(map[string]interface{})
+		if slide == nil {
+			return nil, &toolFault{Code: "out_of_range", Msg: "slide is not an object"}
+		}
+		anns, _ := slide["annotations"].([]interface{})
+		if len(anns) == 0 {
+			return nil, &toolFault{Code: "not_found", Msg: "Slide has no annotations"}
+		}
+		annAt := findAnnotationIndex(anns, annID)
+		if annAt < 0 {
+			return nil, &toolFault{
+				Code: "not_found",
+				Msg:  fmt.Sprintf("annotation_id not found on slide %d: %s", idx, annID),
+			}
+		}
+		env, _ := anns[annAt].(map[string]interface{})
+		applyToEnv(env)
+		return map[string]interface{}{
+			"slide_index":   idx,
+			"annotation_id": annID,
+			"lifecycle":     targetLifecycle,
+		}, nil
+	})
 }
 
 func main() {

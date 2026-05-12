@@ -2204,3 +2204,379 @@ func TestToolListOpenAnnotations_EmptyDeck(t *testing.T) {
 		t.Errorf("expected count=0, got %d", count)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// minerva_presentation_add_annotation (T6 tail R2)
+// ---------------------------------------------------------------------------
+
+// writeBlankDeck writes a minimal deck with one empty slide to a temp file.
+// Returns the path.
+func writeBlankDeck(t *testing.T) string {
+	t.Helper()
+	tmp := t.TempDir()
+	path := tmp + "/ann.mdeck"
+	body := `{"version":1,"aspect":"16:9","slides":[{"id":"s_a","tiles":[],"reveal":[]}]}`
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	return path
+}
+
+// readDeck reads + parses an .mdeck file (helper for post-mutation assertions).
+func readDeck(t *testing.T, path string) map[string]interface{} {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read deck: %v", err)
+	}
+	var deck map[string]interface{}
+	if err := json.Unmarshal(data, &deck); err != nil {
+		t.Fatalf("parse deck: %v", err)
+	}
+	return deck
+}
+
+func TestToolAddAnnotation_CalloutDefaultAnchor(t *testing.T) {
+	path := writeBlankDeck(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":        path,
+		"slide_index": 0,
+		"kind":        "callout",
+		"summary":     "todo: fix this",
+	})
+	out := toolAddAnnotation(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	annID, _ := out["annotation_id"].(string)
+	if annID == "" {
+		t.Fatal("annotation_id missing")
+	}
+
+	deck := readDeck(t, path)
+	slide := deck["slides"].([]interface{})[0].(map[string]interface{})
+	anns := slide["annotations"].([]interface{})
+	if len(anns) != 1 {
+		t.Fatalf("expected 1 annotation, got %d", len(anns))
+	}
+	env := anns[0].(map[string]interface{})
+	if env["id"] != annID {
+		t.Errorf("envelope id mismatch: got %v, want %v", env["id"], annID)
+	}
+	if env["kind"] != "callout" {
+		t.Errorf("kind: %v", env["kind"])
+	}
+	if env["lifecycle"] != "open" {
+		t.Errorf("lifecycle default: %v", env["lifecycle"])
+	}
+	if v := env["schema_version"]; v != float64(2) {
+		t.Errorf("schema_version: %v (%T)", v, v)
+	}
+	anchor := env["anchor"].(map[string]interface{})
+	if anchor["plugin"] != "presentation" {
+		t.Errorf("callout default anchor.plugin = %v, want presentation", anchor["plugin"])
+	}
+	if anchor["id"] != "s_a" {
+		t.Errorf("anchor.id should be slide id: %v", anchor["id"])
+	}
+	// text-bearing: summary mirrored into kind_payload.text
+	kp := env["kind_payload"].(map[string]interface{})
+	if kp["text"] != "todo: fix this" {
+		t.Errorf("callout (text-bearing) should mirror summary into kind_payload.text, got %v", kp["text"])
+	}
+	if env["view_context"] != "presentation:s_a" {
+		t.Errorf("view_context: %v", env["view_context"])
+	}
+}
+
+func TestToolAddAnnotation_2dArrowUsesCoreAnchor(t *testing.T) {
+	path := writeBlankDeck(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":        path,
+		"slide_index": 0,
+		"kind":        "2d_arrow",
+		"summary":     "point here",
+	})
+	out := toolAddAnnotation(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	deck := readDeck(t, path)
+	env := deck["slides"].([]interface{})[0].(map[string]interface{})["annotations"].([]interface{})[0].(map[string]interface{})
+	anchor := env["anchor"].(map[string]interface{})
+	if anchor["plugin"] != "core" {
+		t.Errorf("2d_arrow default anchor.plugin = %v, want core", anchor["plugin"])
+	}
+	// 2d_arrow is NOT text-bearing → kind_payload.text should not be auto-populated
+	kp := env["kind_payload"].(map[string]interface{})
+	if _, has := kp["text"]; has {
+		t.Errorf("2d_arrow kind_payload should not auto-set text, got %v", kp)
+	}
+}
+
+func TestToolAddAnnotation_RejectsInvalidKind(t *testing.T) {
+	path := writeBlankDeck(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":        path,
+		"slide_index": 0,
+		"kind":        "freehand", // NOT in the substrate-valid set
+		"summary":     "should fail",
+	})
+	out := toolAddAnnotation(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected failure on invalid kind, got %+v", out)
+	}
+	if code, _ := out["error_code"].(string); code != "schema_validation_failed" {
+		t.Errorf("expected schema_validation_failed, got %q", code)
+	}
+}
+
+func TestToolAddAnnotation_RejectsEmptySummary(t *testing.T) {
+	path := writeBlankDeck(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":        path,
+		"slide_index": 0,
+		"kind":        "callout",
+		"summary":     "",
+	})
+	out := toolAddAnnotation(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected failure on empty summary, got %+v", out)
+	}
+}
+
+func TestToolAddAnnotation_OutOfRangeSlide(t *testing.T) {
+	path := writeBlankDeck(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":        path,
+		"slide_index": 99,
+		"kind":        "callout",
+		"summary":     "x",
+	})
+	out := toolAddAnnotation(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected out_of_range, got %+v", out)
+	}
+	if code, _ := out["error_code"].(string); code != "out_of_range" {
+		t.Errorf("expected out_of_range, got %q", code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// minerva_presentation_remove_annotation (T6 tail R2)
+// ---------------------------------------------------------------------------
+
+func TestToolRemoveAnnotation_LastOneOmitsKey(t *testing.T) {
+	tmp := t.TempDir()
+	path := tmp + "/rm.mdeck"
+	body := `{
+		"slides": [{
+			"id": "s_a",
+			"annotations": [
+				{"id":"ann_only","kind":"callout","summary":"x","lifecycle":"open"}
+			]
+		}]
+	}`
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":          path,
+		"slide_index":   0,
+		"annotation_id": "ann_only",
+	})
+	out := toolRemoveAnnotation(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	deck := readDeck(t, path)
+	slide := deck["slides"].([]interface{})[0].(map[string]interface{})
+	if _, has := slide["annotations"]; has {
+		t.Errorf("omit-when-default: annotations key should be removed when last one is gone, got %+v", slide["annotations"])
+	}
+}
+
+func TestToolRemoveAnnotation_ScrubsRevealRefs(t *testing.T) {
+	tmp := t.TempDir()
+	path := tmp + "/scrub.mdeck"
+	body := `{
+		"slides": [{
+			"id": "s_a",
+			"annotations": [
+				{"id":"ann_x","kind":"callout","summary":"x","lifecycle":"open"},
+				{"id":"ann_y","kind":"callout","summary":"y","lifecycle":"open"}
+			],
+			"reveal": ["tile_t1", "ann_x", "tile_t2"]
+		}]
+	}`
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":          path,
+		"slide_index":   0,
+		"annotation_id": "ann_x",
+	})
+	out := toolRemoveAnnotation(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	deck := readDeck(t, path)
+	slide := deck["slides"].([]interface{})[0].(map[string]interface{})
+	reveal := slide["reveal"].([]interface{})
+	if len(reveal) != 2 {
+		t.Fatalf("reveal should shrink from 3→2 after scrubbing ann_x, got %d (%+v)", len(reveal), reveal)
+	}
+	for _, r := range reveal {
+		if r == "ann_x" {
+			t.Errorf("ann_x should be scrubbed, still in reveal: %+v", reveal)
+		}
+	}
+	// ann_y still present (we only removed ann_x)
+	anns := slide["annotations"].([]interface{})
+	if len(anns) != 1 {
+		t.Errorf("expected 1 surviving annotation, got %d", len(anns))
+	}
+}
+
+func TestToolRemoveAnnotation_NotFound(t *testing.T) {
+	path := writeBlankDeck(t) // no annotations
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":          path,
+		"slide_index":   0,
+		"annotation_id": "nope",
+	})
+	out := toolRemoveAnnotation(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected failure, got %+v", out)
+	}
+	if code, _ := out["error_code"].(string); code != "not_found" {
+		t.Errorf("expected not_found, got %q", code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// minerva_presentation_set_annotation_resolved (T6 tail R2)
+// ---------------------------------------------------------------------------
+
+func TestToolSetAnnotationResolved_ResolvedBoolTrue(t *testing.T) {
+	tmp := t.TempDir()
+	path := tmp + "/res.mdeck"
+	body := `{
+		"slides": [{
+			"id":"s_a",
+			"annotations": [{"id":"a","kind":"callout","summary":"x","lifecycle":"open"}]
+		}]
+	}`
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":          path,
+		"slide_index":   0,
+		"annotation_id": "a",
+		"resolved":      true,
+	})
+	out := toolSetAnnotationResolved(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	if lc, _ := out["lifecycle"].(string); lc != "resolved" {
+		t.Errorf("response lifecycle: %v", lc)
+	}
+	deck := readDeck(t, path)
+	env := deck["slides"].([]interface{})[0].(map[string]interface{})["annotations"].([]interface{})[0].(map[string]interface{})
+	if env["lifecycle"] != "resolved" {
+		t.Errorf("envelope lifecycle after resolved=true: %v", env["lifecycle"])
+	}
+}
+
+func TestToolSetAnnotationResolved_ExplicitLifecycleAppliesNote(t *testing.T) {
+	tmp := t.TempDir()
+	path := tmp + "/note.mdeck"
+	body := `{
+		"slides": [{
+			"id":"s_a",
+			"annotations": [{"id":"a","kind":"callout","summary":"x","lifecycle":"open"}]
+		}]
+	}`
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":          path,
+		"slide_index":   0,
+		"annotation_id": "a",
+		"lifecycle":     "applied",
+		"note":          "merged in commit abc123",
+	})
+	out := toolSetAnnotationResolved(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	deck := readDeck(t, path)
+	env := deck["slides"].([]interface{})[0].(map[string]interface{})["annotations"].([]interface{})[0].(map[string]interface{})
+	if env["lifecycle"] != "applied" {
+		t.Errorf("explicit lifecycle wins: got %v, want applied", env["lifecycle"])
+	}
+	notes, _ := env["resolution_notes"].([]interface{})
+	if len(notes) != 1 {
+		t.Fatalf("expected 1 resolution note, got %d", len(notes))
+	}
+	rn := notes[0].(map[string]interface{})
+	if rn["lifecycle"] != "applied" {
+		t.Errorf("note.lifecycle: %v", rn["lifecycle"])
+	}
+	if rn["note"] != "merged in commit abc123" {
+		t.Errorf("note.note: %v", rn["note"])
+	}
+	if _, has := rn["at"]; !has {
+		t.Errorf("note.at missing")
+	}
+}
+
+func TestToolSetAnnotationResolved_RequiresOneArg(t *testing.T) {
+	path := writeBlankDeck(t)
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{
+		"path":          path,
+		"slide_index":   0,
+		"annotation_id": "a",
+	})
+	out := toolSetAnnotationResolved(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected schema_validation_failed, got %+v", out)
+	}
+}
