@@ -652,6 +652,14 @@ var toolList = []map[string]interface{}{
 			"required": []string{"slide_index", "x", "y", "w", "h", "content"},
 		},
 	},
+	{
+		"name":        "minerva_presentation_list_open_annotations",
+		"description": "Return all annotations across the deck whose lifecycle is 'open' (not resolved/applied/stale). Each entry includes slide_index, annotation_id, kind, and summary. Use this to find work the LLM still needs to address.",
+		"inputSchema": map[string]interface{}{
+			"type":       "object",
+			"properties": targetSchema,
+		},
+	},
 }
 
 // withProps composes two schema-property maps without mutating either.
@@ -724,6 +732,8 @@ func dispatchTool(client *hostClient, msg *rpcRequest) {
 		respondTool(client.enc, msg.ID, toolResizeSpreadsheet(client, p.Arguments))
 	case "minerva_presentation_create_deck":
 		respondTool(client.enc, msg.ID, toolCreateDeck(client, p.Arguments))
+	case "minerva_presentation_list_open_annotations":
+		respondTool(client.enc, msg.ID, toolListOpenAnnotations(client, p.Arguments))
 	case "minerva_presentation_set_slide_background":
 		respondTool(client.enc, msg.ID, toolSetSlideBackground(client, p.Arguments))
 	default:
@@ -2740,6 +2750,64 @@ func dispatch(client *hostClient, msg *rpcRequest) {
 		}
 		log.Printf("unknown method: %s", msg.Method)
 		send(client.enc, errResponse(msg.ID, -32601, "Method not found: "+msg.Method))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tool: minerva_presentation_list_open_annotations
+// ---------------------------------------------------------------------------
+
+// toolListOpenAnnotations scans every slide in the deck and returns annotations
+// whose lifecycle is "open" (the default for annotations the LLM hasn't yet
+// addressed). Mirrors the contract previously implemented by core
+// MCPPresentationTools._list_open_annotations (T6 tail migration).
+//
+// An annotation envelope without an explicit lifecycle is treated as "open"
+// — matches the core behavior at MCPPresentationTools.gd:1115.
+func toolListOpenAnnotations(client *hostClient, rawArgs json.RawMessage) map[string]interface{} {
+	args, fault := parseTargetArgs(rawArgs)
+	if fault != nil {
+		return failResult(fault)
+	}
+	deck, fault := loadDeck(client, args)
+	if fault != nil {
+		return failResult(fault)
+	}
+	slides, _ := deck["slides"].([]interface{})
+	open := []interface{}{}
+	for i, sv := range slides {
+		slide, _ := sv.(map[string]interface{})
+		if slide == nil {
+			continue
+		}
+		anns, _ := slide["annotations"].([]interface{})
+		for _, a := range anns {
+			env, _ := a.(map[string]interface{})
+			if env == nil {
+				continue
+			}
+			lc, _ := env["lifecycle"].(string)
+			if lc == "" {
+				lc = "open"
+			}
+			if lc != "open" {
+				continue
+			}
+			id, _ := env["id"].(string)
+			kind, _ := env["kind"].(string)
+			summary, _ := env["summary"].(string)
+			open = append(open, map[string]interface{}{
+				"slide_index":   i,
+				"annotation_id": id,
+				"kind":          kind,
+				"summary":       summary,
+			})
+		}
+	}
+	return map[string]interface{}{
+		"success": true,
+		"open":    open,
+		"count":   len(open),
 	}
 }
 

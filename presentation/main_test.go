@@ -2109,3 +2109,98 @@ func TestToolResizeSpreadsheet_TabName_CallsPatchState(t *testing.T) {
 		t.Errorf("expected new_rows=3, got %v", out["new_rows"])
 	}
 }
+
+// ---------------------------------------------------------------------------
+// minerva_presentation_list_open_annotations (T6 tail migration)
+// ---------------------------------------------------------------------------
+
+func TestToolListOpenAnnotations_FiltersByLifecycle(t *testing.T) {
+	tmp := t.TempDir()
+	deckPath := tmp + "/loa.mdeck"
+	body := `{
+		"version": 1,
+		"aspect": "16:9",
+		"slides": [
+			{
+				"id": "s_a",
+				"annotations": [
+					{"id":"ann_open_1","kind":"callout","summary":"todo A","lifecycle":"open"},
+					{"id":"ann_resolved","kind":"callout","summary":"done","lifecycle":"resolved"},
+					{"id":"ann_default","kind":"2d_text","summary":"default lifecycle is open"}
+				]
+			},
+			{
+				"id": "s_b",
+				"annotations": [
+					{"id":"ann_open_2","kind":"2d_arrow","summary":"todo B","lifecycle":"open"},
+					{"id":"ann_applied","kind":"callout","summary":"applied","lifecycle":"applied"}
+				]
+			},
+			{"id":"s_c"}
+		]
+	}`
+	if err := os.WriteFile(deckPath, []byte(body), 0644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{"path": deckPath})
+	out := toolListOpenAnnotations(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	count, _ := out["count"].(int)
+	if count != 3 {
+		t.Errorf("expected count=3 (2 explicit open + 1 default lifecycle), got %d", count)
+	}
+	open, _ := out["open"].([]interface{})
+	if len(open) != 3 {
+		t.Fatalf("expected 3 entries, got %d (%+v)", len(open), open)
+	}
+	// Build a map id → entry to assert content + slide_index without ordering coupling.
+	got := map[string]map[string]interface{}{}
+	for _, raw := range open {
+		entry, _ := raw.(map[string]interface{})
+		id, _ := entry["annotation_id"].(string)
+		got[id] = entry
+	}
+	if got["ann_open_1"] == nil || got["ann_open_1"]["slide_index"] != 0 {
+		t.Errorf("ann_open_1 missing or wrong slide_index: %+v", got["ann_open_1"])
+	}
+	if got["ann_default"] == nil || got["ann_default"]["slide_index"] != 0 {
+		t.Errorf("ann_default (implicit-open) missing or wrong slide_index: %+v", got["ann_default"])
+	}
+	if got["ann_open_2"] == nil || got["ann_open_2"]["slide_index"] != 1 {
+		t.Errorf("ann_open_2 missing or wrong slide_index: %+v", got["ann_open_2"])
+	}
+	if got["ann_resolved"] != nil {
+		t.Errorf("resolved annotation should be filtered out, got %+v", got["ann_resolved"])
+	}
+	if got["ann_applied"] != nil {
+		t.Errorf("applied annotation should be filtered out, got %+v", got["ann_applied"])
+	}
+	// kind + summary propagated.
+	if got["ann_open_1"]["kind"] != "callout" || got["ann_open_1"]["summary"] != "todo A" {
+		t.Errorf("ann_open_1 kind/summary not propagated: %+v", got["ann_open_1"])
+	}
+}
+
+func TestToolListOpenAnnotations_EmptyDeck(t *testing.T) {
+	tmp := t.TempDir()
+	deckPath := tmp + "/empty.mdeck"
+	if err := os.WriteFile(deckPath, []byte(`{"slides":[{"id":"s1"},{"id":"s2"}]}`), 0644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{"path": deckPath})
+	out := toolListOpenAnnotations(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success on empty deck, got %+v", out)
+	}
+	if count, _ := out["count"].(int); count != 0 {
+		t.Errorf("expected count=0, got %d", count)
+	}
+}
