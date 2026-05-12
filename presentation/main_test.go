@@ -3079,6 +3079,113 @@ func TestToolAddImageTile_CoordOutOfRange(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// minerva_presentation_get_state (T6 tail R5)
+// ---------------------------------------------------------------------------
+
+func TestToolGetState_ExtractsSelectedSlideAndTitle(t *testing.T) {
+	// Canned host.documents.get_state response with panel_state including
+	// the _ui_state piggyback key set by SlideEditorPanel after R5.
+	canned := `{"jsonrpc":"2.0","id":"cap-1","result":{"success":true,"result":{"editor_name":"deck.mdeck","kind":"plugin_scene","plugin_id":"presentation","buffer_canonical":false,"panel_state":{"version":1,"aspect":"16:9","slides":[{"id":"s0","title":"Cover"},{"id":"s1","title":"Agenda"},{"id":"s2","title":"Conclusion"}],"_ui_state":{"selected_slide_index":1}}}}}` + "\n"
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{"tab_name": "deck.mdeck"})
+	out := toolGetState(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	if v := out["selected_slide_index"]; v != 1 {
+		t.Errorf("selected_slide_index: got %v (%T), want 1", v, v)
+	}
+	if v := out["slide_count"]; v != 3 {
+		t.Errorf("slide_count: %v", v)
+	}
+	if v := out["slide_title"]; v != "Agenda" {
+		t.Errorf("slide_title: %v", v)
+	}
+}
+
+func TestToolGetState_NoUiStateReturnsMinusOne(t *testing.T) {
+	// If the panel returns state without _ui_state (e.g. older plugin version),
+	// selected_slide_index should be -1 so the LLM can detect the gap.
+	canned := `{"jsonrpc":"2.0","id":"cap-1","result":{"success":true,"result":{"editor_name":"deck.mdeck","kind":"plugin_scene","plugin_id":"presentation","panel_state":{"version":1,"slides":[{"id":"s0","title":"Only"}]}}}}` + "\n"
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{"tab_name": "deck.mdeck"})
+	out := toolGetState(client, rawArgs)
+	if success, _ := out["success"].(bool); !success {
+		t.Fatalf("expected success, got %+v", out)
+	}
+	if v := out["selected_slide_index"]; v != -1 {
+		t.Errorf("selected_slide_index for missing _ui_state: got %v, want -1", v)
+	}
+	if v := out["slide_count"]; v != 1 {
+		t.Errorf("slide_count: %v", v)
+	}
+	// slide_title should be "" when selected_slide_index is out of range.
+	if v := out["slide_title"]; v != "" {
+		t.Errorf("slide_title for unknown selection: %v", v)
+	}
+}
+
+func TestToolGetState_RequiresTabName(t *testing.T) {
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(""), &stdout)
+
+	// Empty tab_name.
+	rawArgs, _ := json.Marshal(map[string]interface{}{"tab_name": ""})
+	out := toolGetState(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected schema_validation_failed for empty tab_name, got %+v", out)
+	}
+
+	// Path arg present — explicitly rejected (no UI state for path mode).
+	rawArgs, _ = json.Marshal(map[string]interface{}{"path": "/tmp/x.mdeck"})
+	out = toolGetState(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected reject for path mode, got %+v", out)
+	}
+}
+
+func TestToolGetState_PropagatesEditorNotFound(t *testing.T) {
+	canned := `{"jsonrpc":"2.0","id":"cap-1","result":{"success":false,"error_code":"editor_not_found","error_message":"Editor 'nope.mdeck' not found"}}` + "\n"
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{"tab_name": "nope.mdeck"})
+	out := toolGetState(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected failure, got %+v", out)
+	}
+	if code, _ := out["error_code"].(string); code != "editor_not_found" {
+		t.Errorf("expected editor_not_found, got %q", code)
+	}
+}
+
+func TestToolGetState_BufferCanonicalReturnsPanelStateUnavailable(t *testing.T) {
+	// For buffer-canonical editors (paired_dsl), panel_state isn't in the
+	// response — broker returns buffer_text + version + dirty instead.
+	// get_state should surface a clean error rather than crash.
+	canned := `{"jsonrpc":"2.0","id":"cap-1","result":{"success":true,"result":{"editor_name":"x.mdeck","kind":"plugin_scene","buffer_canonical":true,"buffer_text":"deck text","version":3,"dirty":false}}}` + "\n"
+	var stdout bytes.Buffer
+	client := newMockClient(strings.NewReader(canned), &stdout)
+
+	rawArgs, _ := json.Marshal(map[string]interface{}{"tab_name": "x.mdeck"})
+	out := toolGetState(client, rawArgs)
+	if success, _ := out["success"].(bool); success {
+		t.Fatalf("expected failure, got %+v", out)
+	}
+	if code, _ := out["error_code"].(string); code != "panel_state_unavailable" {
+		t.Errorf("expected panel_state_unavailable, got %q", code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// add_image_tile out-of-range slide (continued)
+// ---------------------------------------------------------------------------
+
 func TestToolAddImageTile_OutOfRangeSlide(t *testing.T) {
 	path := writeBlankDeck(t)
 	var stdout bytes.Buffer

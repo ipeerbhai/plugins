@@ -818,10 +818,19 @@ func _handle_host_owned_save_get(payload: Dictionary) -> void:
 	if request_id.is_empty():
 		push_warning("[Presentation_SlideEditorPanel] host_owned_save.get_request missing request_id")
 		return
+	# Transient UI state piggybacks on the get response under "_ui_state" — the
+	# underscore prefix flags it as not-for-persistence. _handle_host_owned_save_set
+	# strips this key before applying state to _deck (so set_state callers can
+	# safely round-trip the get response).  T6 tail R5 — surfaces
+	# selected_slide_index to minerva_presentation_get_state in the plugin.
+	var state := _deck.duplicate(true)
+	state["_ui_state"] = {
+		"selected_slide_index": _selected_slide_index,
+	}
 	request.emit("host_owned_save.response", {
 		"request_id": request_id,
 		"success": true,
-		"state": _deck.duplicate(true),
+		"state": state,
 	}, "")
 
 
@@ -839,7 +848,11 @@ func _handle_host_owned_save_set(payload: Dictionary) -> void:
 			"error_message": "state must be a Dictionary",
 		}, "")
 		return
-	set_deck((state_v as Dictionary).duplicate(true))
+	# Strip transient UI fields (set by _handle_host_owned_save_get) so a
+	# round-tripped state doesn't persist them. See T6 tail R5.
+	var state_dict: Dictionary = (state_v as Dictionary).duplicate(true)
+	state_dict.erase("_ui_state")
+	set_deck(state_dict)
 	# Mark the tab dirty so host saves on next checkpoint — same contract as
 	# the legacy MCP mutator path (panel.emit_signal("content_changed")).
 	emit_signal("content_changed")

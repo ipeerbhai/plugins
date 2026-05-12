@@ -295,6 +295,37 @@ func (c *hostClient) PutBlob(editorName, contentType string, data []byte) (blobH
 	return resp.Result.BlobHandle, nil
 }
 
+// GetState calls host.documents.get_state and returns the parsed result dict
+// (the panel_state envelope for plugin-scene panels). Plugin code reads
+// nested keys from it.
+func (c *hostClient) GetState(editorName string) (map[string]interface{}, *toolFault) {
+	raw, capErr := c.callCapability("host.documents.get_state", map[string]interface{}{
+		"editor_name": editorName,
+	})
+	if capErr != nil {
+		return nil, &toolFault{
+			Code: fmt.Sprintf("rpc_error_%d", capErr.Code),
+			Msg:  capErr.Message,
+		}
+	}
+	var resp struct {
+		Success      bool                   `json:"success"`
+		ErrorCode    string                 `json:"error_code,omitempty"`
+		ErrorMessage string                 `json:"error_message,omitempty"`
+		Result       map[string]interface{} `json:"result,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, &toolFault{Code: "parse_error", Msg: "parse host.documents.get_state response: " + err.Error()}
+	}
+	if !resp.Success {
+		return nil, &toolFault{Code: resp.ErrorCode, Msg: resp.ErrorMessage}
+	}
+	if resp.Result == nil {
+		return nil, &toolFault{Code: "parse_error", Msg: "host.documents.get_state returned success but no result"}
+	}
+	return resp.Result, nil
+}
+
 // ExportEditor pulls a rendered representation of an editor via the
 // host.editors.export capability. Returns the (mime, raw bytes) of the export
 // — the host base64-decodes the wire payload for us.
@@ -739,6 +770,17 @@ var toolList = []map[string]interface{}{
 		},
 	},
 	{
+		"name":        "minerva_presentation_get_state",
+		"description": "Read the live UI state of an open presentation tab — useful for HITL (\"what slide is the user on?\"). Returns selected_slide_index plus slide_count and the title of the selected slide. Tab must be open; this tool does NOT accept a path because state only exists in a live editor.",
+		"inputSchema": map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"tab_name": map[string]interface{}{"type": "string", "description": "Tab title of an open .mdeck editor."},
+			},
+			"required": []string{"tab_name"},
+		},
+	},
+	{
 		"name":        "minerva_presentation_add_image_tile",
 		"description": "Add an image tile to a slide. Coords x/y/w/h are 0..1 normalized. Provide exactly one image source: image_path (read from disk), image_base64 (bare base64 PNG/JPEG), solid_color (hex; generates aspect-correct solid PNG sized to the tile's rendered rect), or source_graphics_editor (name of an open graphics editor — pulls its PNG via host.editors.export). Optional rotation in radians.",
 		"inputSchema": map[string]interface{}{
@@ -915,6 +957,8 @@ func dispatchTool(client *hostClient, msg *rpcRequest) {
 		respondTool(client.enc, msg.ID, toolModifyTile(client, p.Arguments))
 	case "minerva_presentation_add_image_tile":
 		respondTool(client.enc, msg.ID, toolAddImageTile(client, p.Arguments))
+	case "minerva_presentation_get_state":
+		respondTool(client.enc, msg.ID, toolGetState(client, p.Arguments))
 	case "minerva_presentation_set_slide_background":
 		respondTool(client.enc, msg.ID, toolSetSlideBackground(client, p.Arguments))
 	default:
@@ -4147,6 +4191,84 @@ func toolAddImageTile(client *hostClient, rawArgs json.RawMessage) map[string]in
 		slide["tiles"] = append(tiles, tile)
 		return map[string]interface{}{"tile_id": tileID}, nil
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Tool: minerva_presentation_get_state  (T6 tail R5)
+// ---------------------------------------------------------------------------
+
+// toolGetState reads the live UI state of an open presentation tab. Returns
+// selected_slide_index, slide_count, and the title of the selected slide.
+//
+// Tab-only: there is no "selected slide" concept for an on-disk file.
+//
+// Wire path: host.documents.get_state → broker IPC's the panel via
+// PluginScenePanelBroker.request_panel_state → SlideEditorPanel.
+// _handle_host_owned_save_get emits state with a transient sibling key
+// `_ui_state.selected_slide_index` (set at the panel-script level).
+// See nudge minerva-plugin-platform/host-owned-save-ui-state-piggyback-pattern.
+func toolGetState(client *hostClient, rawArgs json.RawMessage) map[string]interface{} {
+	var args map[string]interface{}
+	if len(rawArgs) > 0 && string(rawArgs) != "null" {
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return failResult(&toolFault{Code: "schema_validation_failed", Msg: err.Error()})
+		}
+	}
+	tabName, _ := args["tab_name"].(string)
+	tabName = strings.TrimSpace(tabName)
+	if tabName == "" {
+		return failResult(&toolFault{
+			Code: "schema_validation_failed",
+			Msg:  "tab_name is required (no live state for path mode)",
+		})
+	}
+
+	result, fault := client.GetState(tabName)
+	if fault != nil {
+		return failResult(fault)
+	}
+
+	// For plugin-scene panels with no canonical buffer (host_owned_save),
+	// the broker returns the panel's state under `panel_state`.
+	panelState, _ := result["panel_state"].(map[string]interface{})
+	if panelState == nil {
+		return failResult(&toolFault{
+			Code: "panel_state_unavailable",
+			Msg:  "get_state did not return panel_state (editor may not be a presentation tab)",
+		})
+	}
+
+	// Extract selected_slide_index from the piggyback _ui_state key.
+	selected := -1
+	if uiState, ok := panelState["_ui_state"].(map[string]interface{}); ok {
+		if v, ok := uiState["selected_slide_index"]; ok {
+			switch tv := v.(type) {
+			case float64:
+				selected = int(tv)
+			case int:
+				selected = tv
+			}
+		}
+	}
+
+	slides, _ := panelState["slides"].([]interface{})
+	slideCount := len(slides)
+	slideTitle := ""
+	if selected >= 0 && selected < slideCount {
+		if slide, ok := slides[selected].(map[string]interface{}); ok {
+			slideTitle, _ = slide["title"].(string)
+		}
+	}
+
+	out := map[string]interface{}{
+		"success":     true,
+		"slide_count": slideCount,
+		"slide_title": slideTitle,
+	}
+	// Emit selected_slide_index even when unknown (-1) — the LLM can detect
+	// "panel doesn't expose selection" without inspecting key presence.
+	out["selected_slide_index"] = selected
+	return out
 }
 
 func main() {
