@@ -234,8 +234,10 @@ fn handle_verify_password(params: &Value, id: Value) -> RpcResponse {
         return ok_response(id, tool_err("path is required"));
     }
     match crypto::verify_password(path, password) {
-        // Mismatch is a valid result, not an error
-        Ok(ok) => ok_response(id, tool_ok(json!({"ok": ok}))),
+        // Transport "ok" always true on dispatch success; verification result
+        // lives in the domain field "verified" so panel callers can distinguish
+        // a tool-level error from a wrong-password outcome.
+        Ok(verified) => ok_response(id, tool_ok(json!({"ok": true, "verified": verified}))),
         // I/O or structural failures are errors
         Err(e) => ok_response(id, tool_err(&e.message)),
     }
