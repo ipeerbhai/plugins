@@ -11,6 +11,8 @@ extends MinervaPluginPanel
 ##
 ## R7: Internal toolbar removed. A "File" MenuButton is injected into the
 ## editor chrome bar via get_editor_actions().
+## R8: Settings dialog dropped. Model selection for classify calls inherited
+##     from Minerva's Chat panel quick-select via _resolve_chat_model_for_classify().
 ##
 ## Open-vault flow (R1):
 ##   1. User clicks File → "Open Vault…"
@@ -53,9 +55,8 @@ const _AddDocumentDialog: Script = preload("add_document_dialog.gd")
 const _EditDetailsDialog: Script  = preload("edit_details_dialog.gd")
 const _RulesEditorDialog: Script  = preload("rules_editor_dialog.gd")
 
-## R5: vault registry and settings dialogs (off-tree: no class_name).
+## R5: vault registry dialog (off-tree: no class_name).
 const _VaultRegistryDialog: Script = preload("vault_registry_dialog.gd")
-const _SettingsDialog: Script      = preload("settings_dialog.gd")
 
 ## R6: checklist dialog (off-tree: no class_name).
 const _ChecklistDialog: Script = preload("checklist_dialog.gd")
@@ -92,12 +93,6 @@ var _vault_password: String = ""
 
 ## R3: FileDialog for picking a document to ingest (separate from vault picker).
 var _doc_file_dialog: FileDialog = null
-
-## R5: per-vault plugin settings cache.
-## Loaded from defaults on vault_opened (no get_project_key tool exists).
-## Updated when SettingsDialog emits settings_changed.
-## Keys: text_model_id, vision_model_id, max_text_chars, default_category.
-var _settings: Dictionary = {}
 
 ## R7 polish: cached reference to the chrome MenuButton's popup so we can
 ## enable/disable vault-required items as the vault state changes. Lifetime
@@ -226,7 +221,6 @@ func _on_file_menu_id_pressed(id: int) -> void:
 		3: _on_add_document_pressed()
 		4: _on_rules_editor_pressed()
 		5: _on_vault_registry_pressed()
-		6: _on_settings_pressed()
 		7: _on_checklist_pressed()
 
 
@@ -432,8 +426,6 @@ func _do_open_vault(path: String) -> void:
 	var vault_name: String = vault_info.get("name", path.get_file())
 	set_status("Vault open: %s" % vault_name)
 	_refresh_chrome_menu_state()
-	# R5: reset settings to defaults on each new vault open.
-	_load_settings_defaults()
 	vault_opened.emit(path, open_result)
 	# R2: populate views.
 	_on_vault_opened_r2(path, open_result)
@@ -590,10 +582,15 @@ func _ingest_pipeline(file_path: String) -> void:
 	if _status_panel != null and is_instance_valid(_status_panel):
 		_status_panel.set_status("Classifying…")
 
+	# R8: inherit model from chat panel; hardcoded max_chars (no longer configurable).
+	const MAX_CLASSIFY_CHARS := 4000
+	var model_desc: Dictionary = _resolve_chat_model_for_classify()
 	var classify_args: Dictionary = {
 		"vault_path": _active_vault_path,
-		"model_id":   _settings.get("text_model_id", "claude-opus-4-7"),  # R5: from _settings
+		"model_id":   model_desc["model_name"],
 	}
+	if not str(model_desc.get("provider", "")).is_empty():
+		classify_args["provider"] = model_desc["provider"]
 	# Use password only if set (never log it).
 	if not _vault_password.is_empty():
 		classify_args["password"] = _vault_password
@@ -602,10 +599,8 @@ func _ingest_pipeline(file_path: String) -> void:
 	if char_count >= VISION_THRESHOLD:
 		classify_args["mode"]          = "text"
 		classify_args["document_text"] = full_text
-		# max_text_chars from settings (R5).
-		var max_chars: int = _settings.get("max_text_chars", 4000)
-		if max_chars > 0:
-			classify_args["max_text_chars"] = max_chars
+		if MAX_CLASSIFY_CHARS > 0:
+			classify_args["max_text_chars"] = MAX_CLASSIFY_CHARS
 	else:
 		# Vision mode — render pages first.
 		var render_res: Dictionary = await conn.call_tool(
@@ -618,8 +613,6 @@ func _ingest_pipeline(file_path: String) -> void:
 			return
 		classify_args["mode"]        = "vision"
 		classify_args["page_images"] = render_res.get("pages", [])
-		# Switch to vision model_id for image-based classification (R5).
-		classify_args["model_id"] = _settings.get("vision_model_id", "claude-opus-4-7")
 
 	var classify_res: Dictionary = await conn.call_tool(
 		"minerva_scansort_classify_document",
@@ -879,40 +872,23 @@ func _on_vault_registry_pressed() -> void:
 
 
 # ---------------------------------------------------------------------------
-# R5: Settings flow
+# R8: Chat model inheritance
 # ---------------------------------------------------------------------------
 
-## Called when user picks "Settings…" from the File menu.
-func _on_settings_pressed() -> void:
-	var conn = _get_connection()
-	if conn == null:
-		set_status("ERROR: scansort plugin not running.")
-		return
-
-	var dlg = _SettingsDialog.new()
-	add_child(dlg)
-	dlg.init(conn, _active_vault_path, _vault_password, _settings)
-	dlg.settings_changed.connect(
-		func(new_settings: Dictionary) -> void:
-			_settings = new_settings
-	)
-	dlg.closed.connect(
-		func() -> void:
-			dlg.queue_free()
-	)
-	dlg.popup_centered(Vector2i(540, 340))
-
-
-## Initialize _settings to defaults.  Called on vault_opened.
-## There is no get_project_key MCP tool, so we fall back to hard defaults.
-## Existing per-vault settings would require a future get_project_key tool.
-func _load_settings_defaults() -> void:
-	_settings = {
-		"text_model_id":    "claude-opus-4-7",
-		"vision_model_id":  "claude-opus-4-7",
-		"max_text_chars":   4000,
-		"default_category": "",
-	}
+## Inherit chat's currently-selected model for classify_document calls.
+## Returns the model string + provider hint to pass to host.providers.chat.
+## Falls back to "default" (Core/TurnRock) if no chat selection is available.
+func _resolve_chat_model_for_classify() -> Dictionary:
+	var so = Engine.get_main_loop().root.get_node_or_null("SingletonObject")
+	if so == null or so.get("Chats") == null:
+		return {"model_name": "default", "provider": ""}
+	var chats = so.Chats
+	if not chats.has_method("get_active_model_descriptor"):
+		return {"model_name": "default", "provider": ""}
+	var desc: Dictionary = chats.get_active_model_descriptor()
+	if desc.is_empty() or str(desc.get("model_name", "")).is_empty():
+		return {"model_name": "default", "provider": ""}
+	return {"model_name": desc.get("model_name"), "provider": desc.get("provider", "")}
 
 
 # ---------------------------------------------------------------------------
@@ -984,7 +960,6 @@ func get_editor_actions() -> Array:
 	popup.add_item("Rules Editor...", 4)
 	popup.add_separator()
 	popup.add_item("Vault Registry...", 5)
-	popup.add_item("Settings...", 6)
 	popup.add_item("Checklist...", 7)
 	popup.add_separator()
 	popup.add_item("Close Vault", 2)
@@ -997,12 +972,11 @@ func get_editor_actions() -> Array:
 
 ## Disable File-menu items that require an open vault when no vault is open.
 ## Always enabled: New Vault (0), Open Vault (1), Vault Registry (5).
-## Vault-gated: Close (2), Add Document (3), Rules Editor (4), Settings (6),
-## Checklist (7).
+## Vault-gated: Close (2), Add Document (3), Rules Editor (4), Checklist (7).
 func _refresh_chrome_menu_state() -> void:
 	if _chrome_popup == null or not is_instance_valid(_chrome_popup):
 		return
-	var vault_gated: Array[int] = [2, 3, 4, 6, 7]
+	var vault_gated: Array[int] = [2, 3, 4, 7]
 	for item_id in vault_gated:
 		var idx: int = _chrome_popup.get_item_index(item_id)
 		if idx >= 0:
