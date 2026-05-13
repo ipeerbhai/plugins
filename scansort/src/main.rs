@@ -1,9 +1,11 @@
 // scansort-plugin is the Scansort plugin MCP server for Minerva.
 //
-// Skeleton for broker T4: establishes the bidirectional host capability client
+// T4: establishes the bidirectional host capability client
 // (synchronous request/response over stdio, correlated by JSON-RPC id) and the
-// single smoke-test tool — minerva_scansort_probe. Business logic from
-// ~/gitlab/ccsandbox/experiments/scansort migrates in T5+.
+// single smoke-test tool — minerva_scansort_probe.
+//
+// T5 R1: vault creation, opening, password set/verify, project KV ops.
+// Adds 6 new tools backed by the ported vault_lifecycle + crypto modules.
 //
 // Outer protocol: JSON-RPC 2.0 over stdin/stdout, one message per line.
 // Logging goes to stderr; stdout carries only JSON-RPC traffic.
@@ -18,6 +20,12 @@
 //   (b) stdin EOF.
 //
 // The synchronous read pattern below is safe under that guarantee.
+
+mod crypto;
+mod db;
+mod schema;
+mod types;
+mod vault_lifecycle;
 
 use std::io::{self, BufRead, Write};
 use serde::{Deserialize, Serialize};
@@ -126,6 +134,27 @@ fn request_capability(
     Err("stdin closed waiting for capability response".into())
 }
 
+// ---------------------------------------------------------------------------
+// Tool content helpers
+// ---------------------------------------------------------------------------
+
+/// Wrap a JSON value as a text content MCP tool result.
+fn tool_ok(payload: Value) -> Value {
+    let text = serde_json::to_string(&payload).unwrap_or_else(|_| r#"{"ok":false}"#.into());
+    json!({ "content": [{"type": "text", "text": text}] })
+}
+
+/// Return an MCP isError tool result with a message string.
+fn tool_err(message: &str) -> Value {
+    let text = serde_json::to_string(&json!({"error": message}))
+        .unwrap_or_else(|_| r#"{"error":"serialisation failed"}"#.into());
+    json!({ "isError": true, "content": [{"type": "text", "text": text}] })
+}
+
+// ---------------------------------------------------------------------------
+// Tool handlers
+// ---------------------------------------------------------------------------
+
 fn handle_probe(
     out: &mut impl Write,
     lines: &mut impl Iterator<Item = Result<String, io::Error>>,
@@ -157,6 +186,94 @@ fn handle_probe(
     ok_response(id, json!({
         "content": [{"type": "text", "text": text}]
     }))
+}
+
+fn handle_create_vault(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    if path.is_empty() {
+        return ok_response(id, tool_err("path is required"));
+    }
+    if name.is_empty() {
+        return ok_response(id, tool_err("name is required"));
+    }
+    match vault_lifecycle::create_vault(path, name) {
+        Ok(()) => ok_response(id, tool_ok(json!({"ok": true, "path": path}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_set_password(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
+    if path.is_empty() {
+        return ok_response(id, tool_err("path is required"));
+    }
+    match crypto::set_password(path, password) {
+        Ok(()) => ok_response(id, tool_ok(json!({"ok": true}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_verify_password(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
+    if path.is_empty() {
+        return ok_response(id, tool_err("path is required"));
+    }
+    match crypto::verify_password(path, password) {
+        // Mismatch is a valid result, not an error
+        Ok(ok) => ok_response(id, tool_ok(json!({"ok": ok}))),
+        // I/O or structural failures are errors
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_check_vault_has_password(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    if path.is_empty() {
+        return ok_response(id, tool_err("path is required"));
+    }
+    match crypto::check_vault_has_password(path) {
+        Ok((has_password, hint)) => ok_response(
+            id,
+            tool_ok(json!({"has_password": has_password, "hint": hint})),
+        ),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_open_vault(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    if path.is_empty() {
+        return ok_response(id, tool_err("path is required"));
+    }
+    match vault_lifecycle::open_vault(path) {
+        Ok(info) => match serde_json::to_value(&info) {
+            Ok(v) => ok_response(id, tool_ok(json!({"ok": true, "info": v}))),
+            Err(e) => ok_response(id, tool_err(&e.to_string())),
+        },
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_update_project_key(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
+    let value = args.get("value").and_then(|v| v.as_str()).unwrap_or("");
+    if path.is_empty() {
+        return ok_response(id, tool_err("path is required"));
+    }
+    match vault_lifecycle::update_project_key(path, key, value) {
+        Ok(()) => ok_response(id, tool_ok(json!({"ok": true}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
 }
 
 fn main() {
@@ -205,11 +322,84 @@ fn main() {
             })),
 
             "tools/list" => ok_response(req.id, json!({
-                "tools": [{
-                    "name": "minerva_scansort_probe",
-                    "description": "Returns plugin version + a host.echo round-trip result; smoke-test only.",
-                    "inputSchema": {"type": "object", "properties": {}, "required": []},
-                }]
+                "tools": [
+                    {
+                        "name": "minerva_scansort_probe",
+                        "description": "Returns plugin version + a host.echo round-trip result; smoke-test only.",
+                        "inputSchema": {"type": "object", "properties": {}, "required": []},
+                    },
+                    {
+                        "name": "minerva_scansort_create_vault",
+                        "description": "Create a new .ssort vault at the given path with the given display name.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "Absolute filesystem path for the new vault file (must end in .ssort)."},
+                                "name": {"type": "string", "description": "Human-readable display name for the vault."},
+                            },
+                            "required": ["path", "name"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_set_password",
+                        "description": "Set the encryption password on a vault; writes verifier to project table.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "Absolute path to the vault file."},
+                                "password": {"type": "string", "description": "Password to set on the vault."},
+                            },
+                            "required": ["path", "password"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_verify_password",
+                        "description": "Verify a password against the stored verifier. Returns {ok: bool}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "Absolute path to the vault file."},
+                                "password": {"type": "string", "description": "Password to verify."},
+                            },
+                            "required": ["path", "password"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_check_vault_has_password",
+                        "description": "Check whether a vault has a password set. Returns {has_password: bool}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "Absolute path to the vault file."},
+                            },
+                            "required": ["path"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_open_vault",
+                        "description": "Open an existing vault and return vault_info.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "Absolute path to the vault file."},
+                            },
+                            "required": ["path"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_update_project_key",
+                        "description": "Update a key/value pair in the project metadata table.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "Absolute path to the vault file."},
+                                "key": {"type": "string", "description": "Metadata key to set."},
+                                "value": {"type": "string", "description": "Value to store."},
+                            },
+                            "required": ["path", "key", "value"],
+                        },
+                    },
+                ]
             })),
 
             "tools/call" => {
@@ -217,6 +407,24 @@ fn main() {
                 match name {
                     "minerva_scansort_probe" => {
                         handle_probe(&mut out, &mut lines, &mut next_id, req.id)
+                    }
+                    "minerva_scansort_create_vault" => {
+                        handle_create_vault(&req.params, req.id)
+                    }
+                    "minerva_scansort_set_password" => {
+                        handle_set_password(&req.params, req.id)
+                    }
+                    "minerva_scansort_verify_password" => {
+                        handle_verify_password(&req.params, req.id)
+                    }
+                    "minerva_scansort_check_vault_has_password" => {
+                        handle_check_vault_has_password(&req.params, req.id)
+                    }
+                    "minerva_scansort_open_vault" => {
+                        handle_open_vault(&req.params, req.id)
+                    }
+                    "minerva_scansort_update_project_key" => {
+                        handle_update_project_key(&req.params, req.id)
                     }
                     other => err_response(req.id, -32601, format!("unknown tool: {other}")),
                 }

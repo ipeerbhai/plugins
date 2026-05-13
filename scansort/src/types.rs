@@ -1,0 +1,102 @@
+//! Shared types used by scansort-plugin vault modules (R1 subset).
+//!
+//! Includes VaultError, VaultResult, VaultInfo, and utility functions needed
+//! by the R1 vault lifecycle, db, crypto, and schema modules.
+//! Document/Rule/ChecklistItem/WatchFolder structs are omitted (R2+).
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
+
+// ---------------------------------------------------------------------------
+// Error handling
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VaultError {
+    pub message: String,
+}
+
+impl VaultError {
+    pub fn new(msg: impl Into<String>) -> Self {
+        Self {
+            message: msg.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for VaultError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for VaultError {}
+
+impl From<rusqlite::Error> for VaultError {
+    fn from(e: rusqlite::Error) -> Self {
+        VaultError::new(format!("Database error: {e}"))
+    }
+}
+
+impl From<std::io::Error> for VaultError {
+    fn from(e: std::io::Error) -> Self {
+        VaultError::new(format!("IO error: {e}"))
+    }
+}
+
+impl From<serde_json::Error> for VaultError {
+    fn from(e: serde_json::Error) -> Self {
+        VaultError::new(format!("JSON error: {e}"))
+    }
+}
+
+pub type VaultResult<T> = Result<T, VaultError>;
+
+// ---------------------------------------------------------------------------
+// VaultInfo — returned by open_vault
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultInfo {
+    pub name: String,
+    pub version: String,
+    pub created_at: String,
+    pub doc_count: i64,
+    pub category_counts: HashMap<String, i64>,
+    pub rule_count: i64,
+    pub log_count: i64,
+    pub total_file_size: i64,
+    pub emergency_contact_name: String,
+    pub emergency_contact_email: String,
+    pub emergency_contact_phone: String,
+    pub software_url: String,
+    pub password_hint: String,
+}
+
+// ---------------------------------------------------------------------------
+// Utility functions
+// ---------------------------------------------------------------------------
+
+/// Compute SHA-256 hash of a file.
+pub fn compute_sha256(path: &Path) -> VaultResult<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Get current time as ISO8601 UTC string.
+pub fn now_iso() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
