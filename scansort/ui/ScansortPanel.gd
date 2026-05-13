@@ -40,6 +40,11 @@ extends MinervaPluginPanel
 ## Preload the password dialog script (off-tree: no class_name).
 const _PasswordDialog: Script = preload("password_dialog.gd")
 
+## R2 view scripts (off-tree: no class_name on any of these).
+const _FileTree:    Script = preload("file_tree.gd")
+const _VaultView:   Script = preload("vault_view.gd")
+const _StatusPanel: Script = preload("status_panel.gd")
+
 # ---------------------------------------------------------------------------
 # Signals
 # ---------------------------------------------------------------------------
@@ -78,6 +83,11 @@ var _left_pane: Panel = null
 var _right_pane: Panel = null
 
 ## File dialog (reused for open and create).
+## R2 view instances (created in _build_ui, populated on vault_opened).
+var _file_tree:    Tree        = null
+var _vault_view:   Control     = null
+var _status_panel: HBoxContainer = null
+
 var _file_dialog: FileDialog = null
 
 ## Password dialog instance (created once, reused).
@@ -172,6 +182,28 @@ func _build_ui() -> void:
 
 	vbox.add_child(_split)
 
+	# --- R2: file tree in LeftPane ---
+	_file_tree = _FileTree.new()
+	_file_tree.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_file_tree.size_flags_vertical  = Control.SIZE_EXPAND_FILL
+	_file_tree.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_left_pane.add_child(_file_tree)
+
+	# --- R2: vault view in RightPane ---
+	_vault_view = _VaultView.new()
+	_vault_view.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_vault_view.size_flags_vertical  = Control.SIZE_EXPAND_FILL
+	_vault_view.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_right_pane.add_child(_vault_view)
+
+	# --- R2: status bar at bottom of vbox ---
+	_status_panel = _StatusPanel.new()
+	_status_panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	vbox.add_child(_status_panel)
+
+	# Wire file_tree selection → vault_view detail.
+	_file_tree.document_selected.connect(_vault_view.on_document_selected)
+
 # ---------------------------------------------------------------------------
 # Menu handling
 # ---------------------------------------------------------------------------
@@ -201,6 +233,8 @@ func _on_close_vault_pressed() -> void:
 	_vault_is_open = false
 	set_status("Vault closed.")
 	vault_closed.emit()
+	# R2: clear views.
+	_on_vault_closed_r2()
 
 # ---------------------------------------------------------------------------
 # File dialog
@@ -370,8 +404,10 @@ func _do_open_vault(path: String) -> void:
 	_active_vault_path = path
 	_vault_is_open = true
 	var vault_name: String = open_result.get("name", path.get_file())
-	set_status("Vault open: %s — awaiting R2 view." % vault_name)
+	set_status("Vault open: %s" % vault_name)
 	vault_opened.emit(path, open_result)
+	# R2: populate views.
+	_on_vault_opened_r2(path, open_result)
 
 # ---------------------------------------------------------------------------
 # Password dialog helpers
@@ -403,6 +439,37 @@ func _show_password_dialog_enter(hint: String) -> void:
 		_password_dialog.password_submitted.disconnect(_on_create_vault_password_submitted)
 	_password_dialog.password_submitted.connect(_on_open_vault_password_submitted)
 	_password_dialog.show_enter_password(hint)
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# R2 view coordination
+# ---------------------------------------------------------------------------
+
+func _on_vault_opened_r2(path: String, open_result: Dictionary) -> void:
+	var conn := _get_connection()
+	var vault_name: String = open_result.get("name", path.get_file())
+	# Init views — each will call refresh() internally.
+	if _file_tree != null and is_instance_valid(_file_tree):
+		_file_tree.init(conn, path, "")
+	if _vault_view != null and is_instance_valid(_vault_view):
+		_vault_view.init(conn, path, "")
+	if _status_panel != null and is_instance_valid(_status_panel):
+		_status_panel.init(conn)
+		_status_panel.set_vault(vault_name, 0)
+		_status_panel.set_status("Loading…")
+
+
+func _on_vault_closed_r2() -> void:
+	if _file_tree != null and is_instance_valid(_file_tree):
+		_file_tree.clear_vault()
+	if _vault_view != null and is_instance_valid(_vault_view):
+		_vault_view.clear()
+	if _status_panel != null and is_instance_valid(_status_panel):
+		_status_panel.clear()
+
 
 # ---------------------------------------------------------------------------
 # Utilities
