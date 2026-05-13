@@ -487,6 +487,7 @@ func _on_save_pressed() -> void:
 func _on_import_pressed() -> void:
 	if _import_dialog == null:
 		_import_dialog = FileDialog.new()
+		_import_dialog.access = FileDialog.ACCESS_FILESYSTEM
 		_import_dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILE
 		_import_dialog.title = "Import Rules from JSON"
 		_import_dialog.filters = PackedStringArray(["*.json ; JSON files"])
@@ -532,6 +533,7 @@ func _on_import_file_selected(file_path: String) -> void:
 func _on_export_pressed() -> void:
 	if _export_dialog == null:
 		_export_dialog = FileDialog.new()
+		_export_dialog.access = FileDialog.ACCESS_FILESYSTEM
 		_export_dialog.file_mode = FileDialog.FILE_MODE_SAVE_FILE
 		_export_dialog.title = "Export Rules to JSON"
 		_export_dialog.filters = PackedStringArray(["*.json ; JSON files"])

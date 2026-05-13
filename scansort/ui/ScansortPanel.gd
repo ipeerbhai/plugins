@@ -254,6 +254,8 @@ func _on_close_vault_pressed() -> void:
 func _open_file_dialog(mode: FileDialog.FileMode, dialog_title: String) -> void:
 	if _file_dialog == null:
 		_file_dialog = FileDialog.new()
+		# Browse the real filesystem, not Godot's res:// resource view.
+		_file_dialog.access = FileDialog.ACCESS_FILESYSTEM
 		_file_dialog.file_selected.connect(_on_file_selected)
 		_file_dialog.canceled.connect(_on_file_dialog_cancelled)
 		add_child(_file_dialog)
@@ -510,6 +512,8 @@ func _on_add_document_pressed() -> void:
 	# Show a document-picker FileDialog (separate from the vault picker).
 	if _doc_file_dialog == null:
 		_doc_file_dialog = FileDialog.new()
+		# Browse the real filesystem, not Godot's res:// resource view.
+		_doc_file_dialog.access     = FileDialog.ACCESS_FILESYSTEM
 		_doc_file_dialog.file_mode  = FileDialog.FILE_MODE_OPEN_FILE
 		_doc_file_dialog.title      = "Add Document to Vault"
 		_doc_file_dialog.file_selected.connect(_on_doc_file_selected)
