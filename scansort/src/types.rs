@@ -154,3 +154,99 @@ pub fn hamming_distance_hex(a: &str, b: &str) -> VaultResult<u32> {
         .map_err(|e| VaultError::new(format!("Invalid hex hash b: {e}")))?;
     Ok((a_val ^ b_val).count_ones())
 }
+
+// ---------------------------------------------------------------------------
+// R2: extract / render types
+// ---------------------------------------------------------------------------
+
+/// Result of a text extraction operation (R2+).
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ExtractionResult {
+    pub success: bool,
+    pub file_type: String,
+    pub sha256: String,
+    pub simhash: String,
+    pub dhash: String,
+    pub page_count: i32,
+    pub pages: Vec<PageInfo>,
+    pub full_text: String,
+    pub char_count: i64,
+    pub image_only_pages: Vec<i32>,
+}
+
+/// Per-page extraction info (R2+).
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PageInfo {
+    pub page_num: i32,
+    pub has_text: bool,
+    pub text: String,
+    pub char_count: i64,
+}
+
+/// Result of a page rendering operation (R2+).
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct RenderResult {
+    pub success: bool,
+    pub pages: Vec<RenderedPage>,
+    pub page_count: i32,
+}
+
+/// A single rendered page (base64-encoded PNG) (R2+).
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct RenderedPage {
+    pub page_num: i32,
+    pub base64: String,
+}
+
+// ---------------------------------------------------------------------------
+// R2: SimHash utility
+// ---------------------------------------------------------------------------
+
+/// Compute 64-bit SimHash from text using word 3-grams and MD5.
+pub fn compute_simhash(text: &str) -> u64 {
+    use md5::{Digest as Md5Digest, Md5};
+
+    let normalized = normalize_text(text);
+    if normalized.len() < 50 {
+        return 0;
+    }
+
+    let words: Vec<&str> = normalized.split_whitespace().collect();
+    if words.len() < 3 {
+        return 0;
+    }
+
+    let mut v = [0i32; 64];
+
+    for ngram in words.windows(3) {
+        let gram = ngram.join(" ");
+        let hash = Md5::digest(gram.as_bytes());
+        let hash_val = u64::from_be_bytes(hash[..8].try_into().unwrap());
+
+        for i in 0..64 {
+            if hash_val & (1u64 << i) != 0 {
+                v[i] += 1;
+            } else {
+                v[i] -= 1;
+            }
+        }
+    }
+
+    let mut fingerprint = 0u64;
+    for i in 0..64 {
+        if v[i] > 0 {
+            fingerprint |= 1u64 << i;
+        }
+    }
+    fingerprint
+}
+
+/// Normalize text for SimHash: lowercase, strip punctuation, collapse whitespace.
+fn normalize_text(text: &str) -> String {
+    let lower = text.to_lowercase();
+    let cleaned: String = lower
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+        .collect();
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}

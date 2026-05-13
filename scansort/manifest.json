@@ -80,6 +80,14 @@
     {
       "name": "minerva_scansort_vault_inventory",
       "description": "List all documents in a vault with metadata (no file data blob)."
+    },
+    {
+      "name": "minerva_scansort_extract_text",
+      "description": "Extract text and compute fingerprints from a file (PDF, Excel, Word, PPTX, text, image)."
+    },
+    {
+      "name": "minerva_scansort_render_pages",
+      "description": "Render PDF or image file pages to base64-encoded PNGs for vision classification."
     }
   ],
   "ui": {

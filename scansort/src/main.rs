@@ -24,8 +24,10 @@
 mod crypto;
 mod db;
 mod documents;
+mod extract;
 mod fingerprints;
 mod registry;
+mod render;
 mod schema;
 mod types;
 mod vault_lifecycle;
@@ -484,6 +486,44 @@ fn handle_vault_inventory(params: &Value, id: Value) -> RpcResponse {
     }
 }
 
+fn handle_extract_text(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let file_path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+    if file_path.is_empty() {
+        return ok_response(id, tool_err("file_path is required"));
+    }
+    match extract::extract_file(file_path) {
+        Ok(result) => match serde_json::to_value(&result) {
+            Ok(v) => ok_response(id, tool_ok(v)),
+            Err(e) => ok_response(id, tool_err(&e.to_string())),
+        },
+        Err(e) => ok_response(id, tool_ok(json!({
+            "success": false,
+            "error": e.message,
+        }))),
+    }
+}
+
+fn handle_render_pages(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let file_path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+    if file_path.is_empty() {
+        return ok_response(id, tool_err("file_path is required"));
+    }
+    let max_pages = args.get("max_pages").and_then(|v| v.as_i64()).unwrap_or(2) as i32;
+    let dpi = args.get("dpi").and_then(|v| v.as_i64()).unwrap_or(96) as i32;
+    match render::render_pages(file_path, max_pages, dpi) {
+        Ok(result) => match serde_json::to_value(&result) {
+            Ok(v) => ok_response(id, tool_ok(v)),
+            Err(e) => ok_response(id, tool_err(&e.to_string())),
+        },
+        Err(e) => ok_response(id, tool_ok(json!({
+            "success": false,
+            "error": e.message,
+        }))),
+    }
+}
+
 fn main() {
     // Logging goes to stderr so it never pollutes the JSON-RPC stdout channel.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -756,6 +796,30 @@ fn main() {
                             "required": ["vault_path"],
                         },
                     },
+                    {
+                        "name": "minerva_scansort_extract_text",
+                        "description": "Extract text and compute fingerprints (sha256, simhash) from a file. Supports PDF, Excel (.xlsx/.xls), Word (.docx), PPTX, plain text, and images. Returns full_text, per-page breakdown, char_count, page_count, and file_type.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "file_path": {"type": "string", "description": "Absolute path to the file to extract text from."},
+                            },
+                            "required": ["file_path"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_render_pages",
+                        "description": "Render PDF or image file pages to base64-encoded PNGs for vision model classification. Returns an array of {page_num, base64} objects.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "file_path": {"type": "string", "description": "Absolute path to the PDF or image file to render."},
+                                "max_pages": {"type": "integer", "description": "Maximum number of pages to render (default: 2)."},
+                                "dpi": {"type": "integer", "description": "Rendering resolution in dots per inch (default: 96)."},
+                            },
+                            "required": ["file_path"],
+                        },
+                    },
                 ]
             })),
 
@@ -815,6 +879,12 @@ fn main() {
                     }
                     "minerva_scansort_vault_inventory" => {
                         handle_vault_inventory(&req.params, req.id)
+                    }
+                    "minerva_scansort_extract_text" => {
+                        handle_extract_text(&req.params, req.id)
+                    }
+                    "minerva_scansort_render_pages" => {
+                        handle_render_pages(&req.params, req.id)
                     }
                     other => err_response(req.id, -32601, format!("unknown tool: {other}")),
                 }
