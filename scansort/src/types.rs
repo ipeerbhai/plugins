@@ -1,8 +1,7 @@
-//! Shared types used by scansort-plugin vault modules (R1 subset).
+//! Shared types used by scansort-plugin vault modules.
 //!
-//! Includes VaultError, VaultResult, VaultInfo, and utility functions needed
-//! by the R1 vault lifecycle, db, crypto, and schema modules.
-//! Document/Rule/ChecklistItem/WatchFolder structs are omitted (R2+).
+//! Includes VaultError, VaultResult, VaultInfo, Document, Rule, Classification,
+//! and utility functions needed by all vault modules.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -153,6 +152,42 @@ pub fn hamming_distance_hex(a: &str, b: &str) -> VaultResult<u32> {
     let b_val = u64::from_str_radix(b, 16)
         .map_err(|e| VaultError::new(format!("Invalid hex hash b: {e}")))?;
     Ok((a_val ^ b_val).count_ones())
+}
+
+// ---------------------------------------------------------------------------
+// Rule — classification rule stored in the rules table (T6 R3+)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Rule {
+    pub rule_id: i64,
+    pub label: String,
+    pub name: String,
+    pub instruction: String,
+    pub signals: Vec<String>,
+    pub subfolder: String,
+    pub rename_pattern: String,
+    pub confidence_threshold: f64,
+    pub encrypt: bool,
+    pub enabled: bool,
+    pub is_default: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Classification — result of classify_document (T6 R3+)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Classification {
+    pub category: String,
+    pub confidence: f64,
+    pub sender: String,
+    pub description: String,
+    pub doc_date: String,
+    pub tags: Vec<String>,
+    pub raw_response: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

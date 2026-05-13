@@ -21,6 +21,7 @@
 //
 // The synchronous read pattern below is safe under that guarantee.
 
+mod classifier;
 mod crypto;
 mod db;
 mod documents;
@@ -28,6 +29,7 @@ mod extract;
 mod fingerprints;
 mod registry;
 mod render;
+mod rules;
 mod schema;
 mod types;
 mod vault_lifecycle;
@@ -524,6 +526,233 @@ fn handle_render_pages(params: &Value, id: Value) -> RpcResponse {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Rules tool handlers (T6 R3)
+// ---------------------------------------------------------------------------
+
+fn handle_insert_rule(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
+    if path.is_empty() {
+        return ok_response(id, tool_err("path is required"));
+    }
+    let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
+    if label.is_empty() {
+        return ok_response(id, tool_err("label is required"));
+    }
+    let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let instruction = args.get("instruction").and_then(|v| v.as_str()).unwrap_or("");
+    let signals: Vec<String> = args.get("signals")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let subfolder = args.get("subfolder").and_then(|v| v.as_str()).unwrap_or("");
+    let confidence_threshold = args.get("confidence_threshold").and_then(|v| v.as_f64()).unwrap_or(0.6);
+    let encrypt = args.get("encrypt").and_then(|v| v.as_bool()).unwrap_or(false);
+    let enabled = args.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    match rules::insert_rule(path, password, label, name, instruction, &signals, subfolder, confidence_threshold, encrypt, enabled) {
+        Ok(rule_id) => ok_response(id, tool_ok(json!({"ok": true, "rule_id": rule_id}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_list_rules(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
+    if path.is_empty() {
+        return ok_response(id, tool_err("path is required"));
+    }
+    match rules::list_rules(path, password) {
+        Ok(r) => match serde_json::to_value(&r) {
+            Ok(v) => ok_response(id, tool_ok(json!({"ok": true, "rules": v, "count": r.len()}))),
+            Err(e) => ok_response(id, tool_err(&e.to_string())),
+        },
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_get_rule(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
+    if path.is_empty() {
+        return ok_response(id, tool_err("path is required"));
+    }
+    // Accept either label (string) or rule_id (integer)
+    if let Some(label) = args.get("label").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        match rules::get_rule_by_label(path, password, label) {
+            Ok(Some(r)) => match serde_json::to_value(&r) {
+                Ok(v) => ok_response(id, tool_ok(json!({"ok": true, "rule": v}))),
+                Err(e) => ok_response(id, tool_err(&e.to_string())),
+            },
+            Ok(None) => ok_response(id, tool_err(&format!("Rule not found: {label}"))),
+            Err(e) => ok_response(id, tool_err(&e.message)),
+        }
+    } else if let Some(rule_id) = args.get("rule_id").and_then(|v| v.as_i64()) {
+        match rules::get_rule_by_id(path, password, rule_id) {
+            Ok(Some(r)) => match serde_json::to_value(&r) {
+                Ok(v) => ok_response(id, tool_ok(json!({"ok": true, "rule": v}))),
+                Err(e) => ok_response(id, tool_err(&e.to_string())),
+            },
+            Ok(None) => ok_response(id, tool_err(&format!("Rule not found: {rule_id}"))),
+            Err(e) => ok_response(id, tool_err(&e.message)),
+        }
+    } else {
+        ok_response(id, tool_err("label or rule_id is required"))
+    }
+}
+
+fn handle_update_rule(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
+    if path.is_empty() {
+        return ok_response(id, tool_err("path is required"));
+    }
+    let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
+    if label.is_empty() {
+        return ok_response(id, tool_err("label is required"));
+    }
+    let updates_val = args.get("updates").cloned().unwrap_or(Value::Object(Default::default()));
+    let updates: std::collections::HashMap<String, Value> = match updates_val {
+        Value::Object(map) => map.into_iter().collect(),
+        _ => return ok_response(id, tool_err("updates must be an object")),
+    };
+    match rules::update_rule(path, password, label, &updates) {
+        Ok(()) => ok_response(id, tool_ok(json!({"ok": true}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_delete_rule(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
+    if path.is_empty() {
+        return ok_response(id, tool_err("path is required"));
+    }
+    let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
+    if label.is_empty() {
+        return ok_response(id, tool_err("label is required"));
+    }
+    match rules::delete_rule(path, password, label) {
+        Ok(()) => ok_response(id, tool_ok(json!({"ok": true}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_import_rules_from_json(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
+    if path.is_empty() {
+        return ok_response(id, tool_err("path is required"));
+    }
+    let json_text = args.get("json_text").and_then(|v| v.as_str()).unwrap_or("");
+    if json_text.is_empty() {
+        return ok_response(id, tool_err("json_text is required"));
+    }
+    match rules::import_rules_from_json(path, password, json_text) {
+        Ok(count) => ok_response(id, tool_ok(json!({"ok": true, "count": count}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_classify_document(
+    params: &Value,
+    id: Value,
+    out: &mut impl std::io::Write,
+    lines: &mut impl Iterator<Item = Result<String, std::io::Error>>,
+    next_id: &mut u64,
+) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let vault_path = args.get("vault_path").and_then(|v| v.as_str()).unwrap_or("");
+    let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
+    if vault_path.is_empty() {
+        return ok_response(id, tool_err("vault_path is required"));
+    }
+
+    let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("text");
+    let max_chars = args.get("max_chars").and_then(|v| v.as_u64()).unwrap_or(4000) as usize;
+    let model_id = args.get("model_id").and_then(|v| v.as_str()).unwrap_or("");
+    let vault_id = args.get("vault_id").and_then(|v| v.as_str());
+
+    // 1. Load rules
+    let rule_list = match rules::list_rules(vault_path, password) {
+        Ok(r) => r,
+        Err(e) => return ok_response(id, tool_err(&format!("Failed to load rules: {}", e.message))),
+    };
+
+    // 2. Build messages
+    let messages: Vec<Value> = match mode {
+        "vision" => {
+            let page_images: Vec<Value> = args.get("page_images")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if page_images.is_empty() {
+                return ok_response(id, tool_err("page_images is required and must be non-empty for vision mode"));
+            }
+            classifier::build_vision_messages(&page_images, &rule_list)
+        }
+        _ => {
+            // text mode
+            let document_text = args.get("document_text").and_then(|v| v.as_str()).unwrap_or("");
+            if document_text.is_empty() {
+                return ok_response(id, tool_err("document_text is required and must be non-empty for text mode"));
+            }
+            classifier::build_messages(document_text, max_chars, &rule_list)
+        }
+    };
+
+    // 3. Issue host.providers.chat capability request
+    let mut chat_args = json!({
+        "messages": messages,
+        "model_id": model_id,
+    });
+    if let Some(vid) = vault_id {
+        chat_args["vault_id"] = json!(vid);
+    }
+
+    let chat_result = request_capability(out, lines, next_id, "host.providers.chat", chat_args);
+    let chat_response = match chat_result {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("host.providers.chat failed: {e}");
+            return ok_response(id, tool_err(&format!("host.providers.chat error: {e}")));
+        }
+    };
+
+    // 4. Extract content from OpenAI-format response
+    let response_text = chat_response
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+
+    if response_text.is_empty() {
+        // If the broker returned an error envelope, pass it through
+        if let Some(err_val) = chat_response.get("error") {
+            let err_str = err_val.as_str().map(String::from).unwrap_or_else(|| err_val.to_string());
+            return ok_response(id, tool_err(&format!("LLM error: {err_str}")));
+        }
+        return ok_response(id, tool_err("Empty response from LLM"));
+    }
+
+    // 5. Parse and return
+    let classification = classifier::parse_response(response_text, &rule_list);
+    match serde_json::to_value(&classification) {
+        Ok(v) => ok_response(id, tool_ok(json!({"ok": true, "classification": v}))),
+        Err(e) => ok_response(id, tool_err(&e.to_string())),
+    }
+}
+
 fn main() {
     // Logging goes to stderr so it never pollutes the JSON-RPC stdout channel.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -820,6 +1049,110 @@ fn main() {
                             "required": ["file_path"],
                         },
                     },
+                    {
+                        "name": "minerva_scansort_insert_rule",
+                        "description": "Insert a classification rule into a vault. Returns {ok, rule_id}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "Absolute path to the vault file."},
+                                "password": {"type": "string", "description": "Vault password (optional, for API consistency)."},
+                                "label": {"type": "string", "description": "Unique label for the rule (used as category key)."},
+                                "name": {"type": "string", "description": "Human-readable rule name."},
+                                "instruction": {"type": "string", "description": "LLM instruction for classifying documents into this category."},
+                                "signals": {"type": "array", "items": {"type": "string"}, "description": "Keywords/signals that hint at this category."},
+                                "subfolder": {"type": "string", "description": "Subfolder to place classified documents."},
+                                "confidence_threshold": {"type": "number", "description": "Minimum confidence for auto-classification (default: 0.6)."},
+                                "encrypt": {"type": "boolean", "description": "Whether documents in this category should be encrypted."},
+                                "enabled": {"type": "boolean", "description": "Whether this rule is active (default: true)."},
+                            },
+                            "required": ["path", "label"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_list_rules",
+                        "description": "List all classification rules in a vault. Returns {ok, rules, count}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "Absolute path to the vault file."},
+                                "password": {"type": "string", "description": "Vault password (optional)."},
+                            },
+                            "required": ["path"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_get_rule",
+                        "description": "Get a single classification rule by label or rule_id. Returns {ok, rule}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "Absolute path to the vault file."},
+                                "password": {"type": "string", "description": "Vault password (optional)."},
+                                "label": {"type": "string", "description": "Rule label to look up (mutually exclusive with rule_id)."},
+                                "rule_id": {"type": "integer", "description": "Rule ID to look up (mutually exclusive with label)."},
+                            },
+                            "required": ["path"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_update_rule",
+                        "description": "Update fields of an existing classification rule by label. Returns {ok}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "Absolute path to the vault file."},
+                                "password": {"type": "string", "description": "Vault password (optional)."},
+                                "label": {"type": "string", "description": "Label of the rule to update."},
+                                "updates": {"type": "object", "description": "Map of field names to new values. Allowed: name, instruction, signals, subfolder, rename_pattern, confidence_threshold, encrypt, enabled, is_default, label."},
+                            },
+                            "required": ["path", "label", "updates"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_delete_rule",
+                        "description": "Delete a classification rule by label. Refuses to delete default rules. Returns {ok}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "Absolute path to the vault file."},
+                                "password": {"type": "string", "description": "Vault password (optional)."},
+                                "label": {"type": "string", "description": "Label of the rule to delete."},
+                            },
+                            "required": ["path", "label"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_import_rules_from_json",
+                        "description": "Bulk-import classification rules from a JSON array string (or object with 'rules' key). Uses INSERT OR REPLACE. Returns {ok, count}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "Absolute path to the vault file."},
+                                "password": {"type": "string", "description": "Vault password (optional)."},
+                                "json_text": {"type": "string", "description": "JSON string containing a rules array or object with 'rules' key."},
+                            },
+                            "required": ["path", "json_text"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_classify_document",
+                        "description": "Classify a document using LLM via host.providers.chat. Loads rules from the vault, builds classification messages, calls the LLM, and returns a Classification result with category, confidence, sender, description, doc_date, and tags.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "vault_path": {"type": "string", "description": "Absolute path to the vault file (for loading rules)."},
+                                "password": {"type": "string", "description": "Vault password (optional)."},
+                                "mode": {"type": "string", "description": "'text' (default) or 'vision'."},
+                                "document_text": {"type": "string", "description": "Extracted document text (required for text mode)."},
+                                "page_images": {"type": "array", "description": "Array of {page_num, base64} objects (required for vision mode).", "items": {"type": "object"}},
+                                "max_chars": {"type": "integer", "description": "Maximum characters of text to send to LLM (default: 4000)."},
+                                "model_id": {"type": "string", "description": "Model identifier to pass to host.providers.chat."},
+                                "vault_id": {"type": "string", "description": "Optional vault_id context for host.providers.chat."},
+                            },
+                            "required": ["vault_path", "model_id"],
+                        },
+                    },
                 ]
             })),
 
@@ -885,6 +1218,27 @@ fn main() {
                     }
                     "minerva_scansort_render_pages" => {
                         handle_render_pages(&req.params, req.id)
+                    }
+                    "minerva_scansort_insert_rule" => {
+                        handle_insert_rule(&req.params, req.id)
+                    }
+                    "minerva_scansort_list_rules" => {
+                        handle_list_rules(&req.params, req.id)
+                    }
+                    "minerva_scansort_get_rule" => {
+                        handle_get_rule(&req.params, req.id)
+                    }
+                    "minerva_scansort_update_rule" => {
+                        handle_update_rule(&req.params, req.id)
+                    }
+                    "minerva_scansort_delete_rule" => {
+                        handle_delete_rule(&req.params, req.id)
+                    }
+                    "minerva_scansort_import_rules_from_json" => {
+                        handle_import_rules_from_json(&req.params, req.id)
+                    }
+                    "minerva_scansort_classify_document" => {
+                        handle_classify_document(&req.params, req.id, &mut out, &mut lines, &mut next_id)
                     }
                     other => err_response(req.id, -32601, format!("unknown tool: {other}")),
                 }

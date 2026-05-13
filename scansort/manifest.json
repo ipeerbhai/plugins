@@ -88,6 +88,34 @@
     {
       "name": "minerva_scansort_render_pages",
       "description": "Render PDF or image file pages to base64-encoded PNGs for vision classification."
+    },
+    {
+      "name": "minerva_scansort_insert_rule",
+      "description": "Insert a classification rule into a vault. Returns {ok, rule_id}."
+    },
+    {
+      "name": "minerva_scansort_list_rules",
+      "description": "List all classification rules in a vault. Returns {ok, rules, count}."
+    },
+    {
+      "name": "minerva_scansort_get_rule",
+      "description": "Get a single classification rule by label or rule_id. Returns {ok, rule}."
+    },
+    {
+      "name": "minerva_scansort_update_rule",
+      "description": "Update fields of an existing classification rule by label. Returns {ok}."
+    },
+    {
+      "name": "minerva_scansort_delete_rule",
+      "description": "Delete a classification rule by label. Returns {ok}."
+    },
+    {
+      "name": "minerva_scansort_import_rules_from_json",
+      "description": "Bulk-import classification rules from a JSON array string. Returns {ok, count}."
+    },
+    {
+      "name": "minerva_scansort_classify_document",
+      "description": "Classify a document using LLM via host.providers.chat. Returns {ok, classification}."
     }
   ],
   "ui": {
