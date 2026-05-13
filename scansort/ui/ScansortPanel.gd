@@ -99,6 +99,11 @@ var _doc_file_dialog: FileDialog = null
 ## Keys: text_model_id, vision_model_id, max_text_chars, default_category.
 var _settings: Dictionary = {}
 
+## R7 polish: cached reference to the chrome MenuButton's popup so we can
+## enable/disable vault-required items as the vault state changes. Lifetime
+## is the editor's — guarded with is_instance_valid before every access.
+var _chrome_popup: PopupMenu = null
+
 # ---------------------------------------------------------------------------
 # UI widgets
 # ---------------------------------------------------------------------------
@@ -246,6 +251,7 @@ func _on_close_vault_pressed() -> void:
 	vault_closed.emit()
 	# R2: clear views.
 	_on_vault_closed_r2()
+	_refresh_chrome_menu_state()
 
 # ---------------------------------------------------------------------------
 # File dialog
@@ -425,6 +431,7 @@ func _do_open_vault(path: String) -> void:
 	var vault_info: Dictionary = open_result.get("info", {})
 	var vault_name: String = vault_info.get("name", path.get_file())
 	set_status("Vault open: %s" % vault_name)
+	_refresh_chrome_menu_state()
 	# R5: reset settings to defaults on each new vault open.
 	_load_settings_defaults()
 	vault_opened.emit(path, open_result)
@@ -982,7 +989,24 @@ func get_editor_actions() -> Array:
 	popup.add_separator()
 	popup.add_item("Close Vault", 2)
 	popup.id_pressed.connect(_on_file_menu_id_pressed)
+	# Cache the popup so vault state changes can grey out gated items.
+	_chrome_popup = popup
+	_refresh_chrome_menu_state()
 	return [menu]
+
+
+## Disable File-menu items that require an open vault when no vault is open.
+## Always enabled: New Vault (0), Open Vault (1), Vault Registry (5).
+## Vault-gated: Close (2), Add Document (3), Rules Editor (4), Settings (6),
+## Checklist (7).
+func _refresh_chrome_menu_state() -> void:
+	if _chrome_popup == null or not is_instance_valid(_chrome_popup):
+		return
+	var vault_gated: Array[int] = [2, 3, 4, 6, 7]
+	for item_id in vault_gated:
+		var idx: int = _chrome_popup.get_item_index(item_id)
+		if idx >= 0:
+			_chrome_popup.set_item_disabled(idx, not _vault_is_open)
 
 
 func set_status(text: String) -> void:
