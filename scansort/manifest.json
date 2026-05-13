@@ -1,0 +1,44 @@
+{
+  "id": "scansort",
+  "name": "Scansort",
+  "version": "0.0.1",
+  "host_api_version": "1",
+  "backend": {
+    "transport": "stdio",
+    "entrypoint": "./scansort-plugin",
+    "args": []
+  },
+  "tools": [
+    {
+      "name": "minerva_scansort_probe",
+      "description": "Returns plugin version + a host.echo round-trip result; smoke-test only."
+    }
+  ],
+  "ui": {
+    "panels": [
+      {
+        "name": "scansort_panel",
+        "kind": "godot_scene",
+        "entry_scene": "ui/ScansortPanel.tscn",
+        "scripts": ["ui/ScansortPanel.gd"],
+        "file_extensions": [],
+        "ipc_channels": [],
+        "save_mode": "none"
+      }
+    ],
+    "ipc_messages": []
+  },
+  "editor_items": [],
+  "permissions": {
+    "host_capabilities": [
+      "host.echo",
+      "host.providers.chat"
+    ],
+    "filesystem": {
+      "mode": "none",
+      "paths": []
+    }
+  },
+  "autostart": false,
+  "auto_reload": true
+}
