@@ -100,3 +100,14 @@ pub fn compute_sha256(path: &Path) -> VaultResult<String> {
 pub fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
 }
+
+/// Compute Hamming distance between two 16-hex-digit SimHash strings.
+///
+/// Returns the number of differing bits (0–64).
+pub fn hamming_distance_hex(a: &str, b: &str) -> VaultResult<u32> {
+    let a_val = u64::from_str_radix(a, 16)
+        .map_err(|e| VaultError::new(format!("Invalid hex hash a: {e}")))?;
+    let b_val = u64::from_str_radix(b, 16)
+        .map_err(|e| VaultError::new(format!("Invalid hex hash b: {e}")))?;
+    Ok((a_val ^ b_val).count_ones())
+}

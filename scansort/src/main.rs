@@ -23,6 +23,8 @@
 
 mod crypto;
 mod db;
+mod fingerprints;
+mod registry;
 mod schema;
 mod types;
 mod vault_lifecycle;
@@ -276,6 +278,82 @@ fn handle_update_project_key(params: &Value, id: Value) -> RpcResponse {
     }
 }
 
+fn handle_registry_list(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let registry_path = args.get("registry_path").and_then(|v| v.as_str());
+    let rp: Option<&str> = registry_path.filter(|s| !s.is_empty());
+    match registry::registry_list(rp) {
+        Ok(entries) => ok_response(id, tool_ok(json!({"entries": entries}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_registry_add(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let vault_path = args.get("vault_path").and_then(|v| v.as_str()).unwrap_or("");
+    if vault_path.is_empty() {
+        return ok_response(id, tool_err("vault_path is required"));
+    }
+    let registry_path = args.get("registry_path").and_then(|v| v.as_str());
+    let rp: Option<&str> = registry_path.filter(|s| !s.is_empty());
+    match registry::registry_add(vault_path, rp) {
+        Ok(added) => ok_response(id, tool_ok(json!({"ok": true, "added": added}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_registry_remove(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let vault_path = args.get("vault_path").and_then(|v| v.as_str()).unwrap_or("");
+    if vault_path.is_empty() {
+        return ok_response(id, tool_err("vault_path is required"));
+    }
+    let registry_path = args.get("registry_path").and_then(|v| v.as_str());
+    let rp: Option<&str> = registry_path.filter(|s| !s.is_empty());
+    match registry::registry_remove(vault_path, rp) {
+        Ok(removed) => ok_response(id, tool_ok(json!({"ok": true, "removed": removed}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_check_sha256(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let vault_path = args.get("vault_path").and_then(|v| v.as_str()).unwrap_or("");
+    let sha256 = args.get("sha256").and_then(|v| v.as_str()).unwrap_or("");
+    if vault_path.is_empty() {
+        return ok_response(id, tool_err("vault_path is required"));
+    }
+    if sha256.is_empty() {
+        return ok_response(id, tool_err("sha256 is required"));
+    }
+    match fingerprints::check_sha256(vault_path, sha256) {
+        Ok(Some(doc_id)) => ok_response(id, tool_ok(json!({"found": true, "doc_id": doc_id}))),
+        Ok(None) => ok_response(id, tool_ok(json!({"found": false, "doc_id": null}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_check_sha256_all_vaults(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let sha256 = args.get("sha256").and_then(|v| v.as_str()).unwrap_or("");
+    if sha256.is_empty() {
+        return ok_response(id, tool_err("sha256 is required"));
+    }
+    let registry_path = args.get("registry_path").and_then(|v| v.as_str());
+    let rp: Option<&str> = registry_path.filter(|s| !s.is_empty());
+    match registry::check_sha256_all_vaults(sha256, rp, None) {
+        Ok(Some((vault_path, _vault_name, doc_id))) => ok_response(
+            id,
+            tool_ok(json!({"found": true, "vault_path": vault_path, "doc_id": doc_id})),
+        ),
+        Ok(None) => ok_response(
+            id,
+            tool_ok(json!({"found": false, "vault_path": null, "doc_id": null})),
+        ),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
 fn main() {
     // Logging goes to stderr so it never pollutes the JSON-RPC stdout channel.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -399,6 +477,65 @@ fn main() {
                             "required": ["path", "key", "value"],
                         },
                     },
+                    {
+                        "name": "minerva_scansort_registry_list",
+                        "description": "List entries in a vault registry.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "registry_path": {"type": "string", "description": "Optional path to the registry JSON file. Defaults to ~/.config/scansort/vault_registry.json or $SCANSORT_REGISTRY."},
+                            },
+                            "required": [],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_registry_add",
+                        "description": "Add a vault to a registry (reads the vault for its name).",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "vault_path": {"type": "string", "description": "Absolute path to the vault file to register."},
+                                "registry_path": {"type": "string", "description": "Optional path to the registry JSON file."},
+                            },
+                            "required": ["vault_path"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_registry_remove",
+                        "description": "Remove a vault from a registry.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "vault_path": {"type": "string", "description": "Absolute path to the vault file to remove."},
+                                "registry_path": {"type": "string", "description": "Optional path to the registry JSON file."},
+                            },
+                            "required": ["vault_path"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_check_sha256",
+                        "description": "Check whether a sha256 exists in a single vault's fingerprints table.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "vault_path": {"type": "string", "description": "Absolute path to the vault file."},
+                                "sha256": {"type": "string", "description": "SHA-256 hex string to look up."},
+                            },
+                            "required": ["vault_path", "sha256"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_check_sha256_all_vaults",
+                        "description": "Check whether a sha256 exists in any registered vault.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "sha256": {"type": "string", "description": "SHA-256 hex string to look up."},
+                                "registry_path": {"type": "string", "description": "Optional path to the registry JSON file."},
+                            },
+                            "required": ["sha256"],
+                        },
+                    },
                 ]
             })),
 
@@ -425,6 +562,21 @@ fn main() {
                     }
                     "minerva_scansort_update_project_key" => {
                         handle_update_project_key(&req.params, req.id)
+                    }
+                    "minerva_scansort_registry_list" => {
+                        handle_registry_list(&req.params, req.id)
+                    }
+                    "minerva_scansort_registry_add" => {
+                        handle_registry_add(&req.params, req.id)
+                    }
+                    "minerva_scansort_registry_remove" => {
+                        handle_registry_remove(&req.params, req.id)
+                    }
+                    "minerva_scansort_check_sha256" => {
+                        handle_check_sha256(&req.params, req.id)
+                    }
+                    "minerva_scansort_check_sha256_all_vaults" => {
+                        handle_check_sha256_all_vaults(&req.params, req.id)
                     }
                     other => err_response(req.id, -32601, format!("unknown tool: {other}")),
                 }

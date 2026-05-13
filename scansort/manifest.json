@@ -36,6 +36,26 @@
     {
       "name": "minerva_scansort_update_project_key",
       "description": "Update a key/value pair in the project metadata table."
+    },
+    {
+      "name": "minerva_scansort_registry_list",
+      "description": "List entries in a vault registry."
+    },
+    {
+      "name": "minerva_scansort_registry_add",
+      "description": "Add a vault to a registry (reads the vault for its name)."
+    },
+    {
+      "name": "minerva_scansort_registry_remove",
+      "description": "Remove a vault from a registry."
+    },
+    {
+      "name": "minerva_scansort_check_sha256",
+      "description": "Check whether a sha256 exists in a single vault's fingerprints table."
+    },
+    {
+      "name": "minerva_scansort_check_sha256_all_vaults",
+      "description": "Check whether a sha256 exists in any registered vault."
     }
   ],
   "ui": {
