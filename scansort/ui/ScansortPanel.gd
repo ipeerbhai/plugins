@@ -52,6 +52,10 @@ const _AddDocumentDialog: Script = preload("add_document_dialog.gd")
 const _EditDetailsDialog: Script  = preload("edit_details_dialog.gd")
 const _RulesEditorDialog: Script  = preload("rules_editor_dialog.gd")
 
+## R5: vault registry and settings dialogs (off-tree: no class_name).
+const _VaultRegistryDialog: Script = preload("vault_registry_dialog.gd")
+const _SettingsDialog: Script      = preload("settings_dialog.gd")
+
 # ---------------------------------------------------------------------------
 # Signals
 # ---------------------------------------------------------------------------
@@ -84,6 +88,12 @@ var _vault_password: String = ""
 
 ## R3: FileDialog for picking a document to ingest (separate from vault picker).
 var _doc_file_dialog: FileDialog = null
+
+## R5: per-vault plugin settings cache.
+## Loaded from defaults on vault_opened (no get_project_key tool exists).
+## Updated when SettingsDialog emits settings_changed.
+## Keys: text_model_id, vision_model_id, max_text_chars, default_category.
+var _settings: Dictionary = {}
 
 # ---------------------------------------------------------------------------
 # UI widgets
@@ -164,6 +174,9 @@ func _build_ui() -> void:
 	popup.add_item("Add Document...", 3)
 	popup.add_item("Rules Editor...", 4)
 	popup.add_separator()
+	popup.add_item("Vault Registry...", 5)
+	popup.add_item("Settings...", 6)
+	popup.add_separator()
 	popup.add_item("Close Vault", 2)
 	popup.id_pressed.connect(_on_file_menu_id_pressed)
 	_toolbar.add_child(_file_menu_btn)
@@ -235,6 +248,8 @@ func _on_file_menu_id_pressed(id: int) -> void:
 		2: _on_close_vault_pressed()
 		3: _on_add_document_pressed()
 		4: _on_rules_editor_pressed()
+		5: _on_vault_registry_pressed()
+		6: _on_settings_pressed()
 
 
 func _on_new_vault_pressed() -> void:
@@ -431,8 +446,12 @@ func _do_open_vault(path: String) -> void:
 
 	_active_vault_path = path
 	_vault_is_open = true
-	var vault_name: String = open_result.get("name", path.get_file())
+	# open_vault returns {ok, info: {name, ...}} — name is nested, not flat.
+	var vault_info: Dictionary = open_result.get("info", {})
+	var vault_name: String = vault_info.get("name", path.get_file())
 	set_status("Vault open: %s" % vault_name)
+	# R5: reset settings to defaults on each new vault open.
+	_load_settings_defaults()
 	vault_opened.emit(path, open_result)
 	# R2: populate views.
 	_on_vault_opened_r2(path, open_result)
@@ -478,7 +497,9 @@ func _show_password_dialog_enter(hint: String) -> void:
 
 func _on_vault_opened_r2(path: String, open_result: Dictionary) -> void:
 	var conn := _get_connection()
-	var vault_name: String = open_result.get("name", path.get_file())
+	# open_vault returns {ok, info: {name, ...}} — name is nested, not flat.
+	var vault_info: Dictionary = open_result.get("info", {})
+	var vault_name: String = vault_info.get("name", path.get_file())
 	# Init views — each will call refresh() internally.
 	if _file_tree != null and is_instance_valid(_file_tree):
 		_file_tree.init(conn, path, "")
@@ -587,7 +608,7 @@ func _ingest_pipeline(file_path: String) -> void:
 
 	var classify_args: Dictionary = {
 		"vault_path": _active_vault_path,
-		"model_id":   "claude-opus-4-7",  # R3: hardcoded; R5 wires settings
+		"model_id":   _settings.get("text_model_id", "claude-opus-4-7"),  # R5: from _settings
 	}
 	# Use password only if set (never log it).
 	if not _vault_password.is_empty():
@@ -597,6 +618,10 @@ func _ingest_pipeline(file_path: String) -> void:
 	if char_count >= VISION_THRESHOLD:
 		classify_args["mode"]          = "text"
 		classify_args["document_text"] = full_text
+		# max_text_chars from settings (R5).
+		var max_chars: int = _settings.get("max_text_chars", 4000)
+		if max_chars > 0:
+			classify_args["max_text_chars"] = max_chars
 	else:
 		# Vision mode — render pages first.
 		var render_res: Dictionary = await conn.call_tool(
@@ -609,6 +634,8 @@ func _ingest_pipeline(file_path: String) -> void:
 			return
 		classify_args["mode"]        = "vision"
 		classify_args["page_images"] = render_res.get("pages", [])
+		# Switch to vision model_id for image-based classification (R5).
+		classify_args["model_id"] = _settings.get("vision_model_id", "claude-opus-4-7")
 
 	var classify_res: Dictionary = await conn.call_tool(
 		"minerva_scansort_classify_document",
@@ -835,6 +862,73 @@ func _on_rules_editor_pressed() -> void:
 			dlg.queue_free()
 	)
 	dlg.popup_centered(Vector2i(880, 580))
+
+
+# ---------------------------------------------------------------------------
+# R5: Vault Registry flow
+# ---------------------------------------------------------------------------
+
+## Called when user picks "Vault Registry…" from the File menu.
+func _on_vault_registry_pressed() -> void:
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+
+	var dlg = _VaultRegistryDialog.new()
+	add_child(dlg)
+	dlg.init(conn)
+	dlg.vault_picked.connect(
+		func(picked_path: String, _picked_name: String) -> void:
+			# User double-clicked a vault entry — switch to it.
+			# Close the current vault first (if any), then begin open flow.
+			if _vault_is_open:
+				_on_close_vault_pressed()
+			_file_dialog_mode = "open"
+			_begin_open_vault(picked_path)
+	)
+	dlg.closed.connect(
+		func() -> void:
+			dlg.queue_free()
+	)
+	dlg.popup_centered(Vector2i(600, 400))
+
+
+# ---------------------------------------------------------------------------
+# R5: Settings flow
+# ---------------------------------------------------------------------------
+
+## Called when user picks "Settings…" from the File menu.
+func _on_settings_pressed() -> void:
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+
+	var dlg = _SettingsDialog.new()
+	add_child(dlg)
+	dlg.init(conn, _active_vault_path, _vault_password, _settings)
+	dlg.settings_changed.connect(
+		func(new_settings: Dictionary) -> void:
+			_settings = new_settings
+	)
+	dlg.closed.connect(
+		func() -> void:
+			dlg.queue_free()
+	)
+	dlg.popup_centered(Vector2i(540, 340))
+
+
+## Initialize _settings to defaults.  Called on vault_opened.
+## There is no get_project_key MCP tool, so we fall back to hard defaults.
+## Existing per-vault settings would require a future get_project_key tool.
+func _load_settings_defaults() -> void:
+	_settings = {
+		"text_model_id":    "claude-opus-4-7",
+		"vision_model_id":  "claude-opus-4-7",
+		"max_text_chars":   4000,
+		"default_category": "",
+	}
 
 
 # ---------------------------------------------------------------------------
