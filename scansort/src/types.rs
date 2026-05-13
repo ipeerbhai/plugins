@@ -155,6 +155,24 @@ pub fn hamming_distance_hex(a: &str, b: &str) -> VaultResult<u32> {
 }
 
 // ---------------------------------------------------------------------------
+// ChecklistItem — checklist entry stored in the checklists table (T7 R6+)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChecklistItem {
+    pub checklist_id: i64,
+    pub tax_year: i32,
+    pub item_type: String,
+    pub name: String,
+    pub match_category: Option<String>,
+    pub match_sender: Option<String>,
+    pub match_pattern: Option<String>,
+    pub enabled: bool,
+    pub matched_doc_id: Option<i64>,
+    pub status: String,
+}
+
+// ---------------------------------------------------------------------------
 // Rule — classification rule stored in the rules table (T6 R3+)
 // ---------------------------------------------------------------------------
 

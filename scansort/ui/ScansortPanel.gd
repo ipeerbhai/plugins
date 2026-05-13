@@ -56,6 +56,9 @@ const _RulesEditorDialog: Script  = preload("rules_editor_dialog.gd")
 const _VaultRegistryDialog: Script = preload("vault_registry_dialog.gd")
 const _SettingsDialog: Script      = preload("settings_dialog.gd")
 
+## R6: checklist dialog (off-tree: no class_name).
+const _ChecklistDialog: Script = preload("checklist_dialog.gd")
+
 # ---------------------------------------------------------------------------
 # Signals
 # ---------------------------------------------------------------------------
@@ -176,6 +179,7 @@ func _build_ui() -> void:
 	popup.add_separator()
 	popup.add_item("Vault Registry...", 5)
 	popup.add_item("Settings...", 6)
+	popup.add_item("Checklist...", 7)
 	popup.add_separator()
 	popup.add_item("Close Vault", 2)
 	popup.id_pressed.connect(_on_file_menu_id_pressed)
@@ -250,6 +254,7 @@ func _on_file_menu_id_pressed(id: int) -> void:
 		4: _on_rules_editor_pressed()
 		5: _on_vault_registry_pressed()
 		6: _on_settings_pressed()
+		7: _on_checklist_pressed()
 
 
 func _on_new_vault_pressed() -> void:
@@ -929,6 +934,34 @@ func _load_settings_defaults() -> void:
 		"max_text_chars":   4000,
 		"default_category": "",
 	}
+
+
+# ---------------------------------------------------------------------------
+# R6: Checklist flow
+# ---------------------------------------------------------------------------
+
+## Called when user picks "Checklist…" from the File menu.
+func _on_checklist_pressed() -> void:
+	if not _vault_is_open:
+		set_status("Open a vault first.")
+		return
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+
+	var dlg = _ChecklistDialog.new()
+	add_child(dlg)
+	dlg.init(conn, _active_vault_path, _vault_password)
+	dlg.checklist_changed.connect(
+		func() -> void:
+			pass  # panel has no cached checklist state to invalidate
+	)
+	dlg.closed.connect(
+		func() -> void:
+			dlg.queue_free()
+	)
+	dlg.popup_centered(Vector2i(660, 560))
 
 
 # ---------------------------------------------------------------------------

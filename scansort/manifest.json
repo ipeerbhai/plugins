@@ -116,6 +116,34 @@
     {
       "name": "minerva_scansort_classify_document",
       "description": "Classify a document using LLM via host.providers.chat. Returns {ok, classification}."
+    },
+    {
+      "name": "minerva_scansort_list_checklists",
+      "description": "List checklist items for a vault, optionally filtered by tax_year and/or item_type. Returns {ok, items, count}."
+    },
+    {
+      "name": "minerva_scansort_insert_checklist",
+      "description": "Add a new checklist item (auto_upload or expected_doc). Returns {ok, checklist_id}."
+    },
+    {
+      "name": "minerva_scansort_get_checklist",
+      "description": "Get a single checklist item by checklist_id. Returns {ok, item}."
+    },
+    {
+      "name": "minerva_scansort_update_checklist",
+      "description": "Update fields of a checklist item by checklist_id. Returns {ok}."
+    },
+    {
+      "name": "minerva_scansort_delete_checklist",
+      "description": "Delete a checklist item by checklist_id. Returns {ok}."
+    },
+    {
+      "name": "minerva_scansort_toggle_checklist_enabled",
+      "description": "Enable or disable a checklist item. Returns {ok}."
+    },
+    {
+      "name": "minerva_scansort_run_checklist_check",
+      "description": "Run all enabled checklist items for a tax year against vault documents. Returns {ok, expected, auto_uploaded}."
     }
   ],
   "ui": {
@@ -124,7 +152,7 @@
         "name": "scansort_panel",
         "kind": "godot_scene",
         "entry_scene": "ui/ScansortPanel.tscn",
-        "scripts": ["ui/ScansortPanel.gd", "ui/password_dialog.gd", "ui/file_tree.gd", "ui/vault_view.gd", "ui/status_panel.gd", "ui/add_document_dialog.gd", "ui/edit_details_dialog.gd", "ui/rules_editor_dialog.gd", "ui/vault_registry_dialog.gd", "ui/settings_dialog.gd"],
+        "scripts": ["ui/ScansortPanel.gd", "ui/password_dialog.gd", "ui/file_tree.gd", "ui/vault_view.gd", "ui/status_panel.gd", "ui/add_document_dialog.gd", "ui/edit_details_dialog.gd", "ui/rules_editor_dialog.gd", "ui/vault_registry_dialog.gd", "ui/settings_dialog.gd", "ui/checklist_dialog.gd"],
         "file_extensions": [],
         "ipc_channels": [],
         "save_mode": "none"
