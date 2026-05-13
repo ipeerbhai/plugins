@@ -250,7 +250,7 @@ fn handle_check_vault_has_password(params: &Value, id: Value) -> RpcResponse {
     match crypto::check_vault_has_password(path) {
         Ok((has_password, hint)) => ok_response(
             id,
-            tool_ok(json!({"has_password": has_password, "hint": hint})),
+            tool_ok(json!({"ok": true, "has_password": has_password, "hint": hint})),
         ),
         Err(e) => ok_response(id, tool_err(&e.message)),
     }
