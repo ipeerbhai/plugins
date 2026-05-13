@@ -48,6 +48,10 @@ const _StatusPanel: Script = preload("status_panel.gd")
 ## R3: add-document dialog (off-tree: no class_name).
 const _AddDocumentDialog: Script = preload("add_document_dialog.gd")
 
+## R4: edit-details and rules-editor dialogs (off-tree: no class_name).
+const _EditDetailsDialog: Script  = preload("edit_details_dialog.gd")
+const _RulesEditorDialog: Script  = preload("rules_editor_dialog.gd")
+
 # ---------------------------------------------------------------------------
 # Signals
 # ---------------------------------------------------------------------------
@@ -158,6 +162,7 @@ func _build_ui() -> void:
 	popup.add_item("Open Vault...", 1)
 	popup.add_separator()
 	popup.add_item("Add Document...", 3)
+	popup.add_item("Rules Editor...", 4)
 	popup.add_separator()
 	popup.add_item("Close Vault", 2)
 	popup.id_pressed.connect(_on_file_menu_id_pressed)
@@ -216,6 +221,9 @@ func _build_ui() -> void:
 	# Wire file_tree selection → vault_view detail.
 	_file_tree.document_selected.connect(_vault_view.on_document_selected)
 
+	# R4: wire vault_view edit button → panel handler.
+	_vault_view.edit_details_requested.connect(_on_edit_doc_pressed)
+
 # ---------------------------------------------------------------------------
 # Menu handling
 # ---------------------------------------------------------------------------
@@ -226,6 +234,7 @@ func _on_file_menu_id_pressed(id: int) -> void:
 		1: _on_open_vault_pressed()
 		2: _on_close_vault_pressed()
 		3: _on_add_document_pressed()
+		4: _on_rules_editor_pressed()
 
 
 func _on_new_vault_pressed() -> void:
@@ -713,6 +722,119 @@ func _show_pipeline_info(msg: String) -> void:
 	set_status(msg)
 	if _status_panel != null and is_instance_valid(_status_panel):
 		_status_panel.set_status(msg)
+
+
+# ---------------------------------------------------------------------------
+# R4: Edit Document flow
+# ---------------------------------------------------------------------------
+
+## Called when vault_view emits edit_details_requested(doc_id).
+## Fetches the full document, loads rules for the category dropdown, then
+## shows EditDetailsDialog.  On accept, calls update_document and refreshes.
+func _on_edit_doc_pressed(doc_id: int) -> void:
+	if not _vault_is_open:
+		set_status("No vault open.")
+		return
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+
+	# Fetch current document metadata.
+	var doc_args: Dictionary = {"vault_path": _active_vault_path, "doc_id": doc_id}
+	if not _vault_password.is_empty():
+		doc_args["password"] = _vault_password
+
+	var doc_result: Dictionary = await conn.call_tool("minerva_scansort_get_document", doc_args)
+	if not doc_result.get("ok", false):
+		set_status("ERROR: get_document failed — %s" % doc_result.get("error", "unknown"))
+		return
+
+	var doc: Dictionary = doc_result.get("document", {})
+
+	# Fetch rules for category dropdown.
+	var rules_args: Dictionary = {"path": _active_vault_path}
+	if not _vault_password.is_empty():
+		rules_args["password"] = _vault_password
+
+	var rules_result: Dictionary = await conn.call_tool("minerva_scansort_list_rules", rules_args)
+	var rules: Array = []
+	if rules_result.get("ok", false):
+		rules = rules_result.get("rules", [])
+
+	# Show the dialog.
+	var dlg = _EditDetailsDialog.new()
+	dlg.set_document(doc, rules)
+	add_child(dlg)
+	dlg.accepted.connect(
+		func(updated_fields: Dictionary) -> void:
+			dlg.queue_free()
+			_on_edit_dialog_accepted(doc_id, updated_fields)
+	)
+	dlg.cancelled.connect(
+		func() -> void:
+			dlg.queue_free()
+	)
+	dlg.popup_centered()
+
+
+func _on_edit_dialog_accepted(doc_id: int, updated_fields: Dictionary) -> void:
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+
+	var upd_args: Dictionary = {
+		"vault_path": _active_vault_path,
+		"doc_id":     doc_id,
+	}
+	# Merge updated fields into the call args.
+	for k: String in updated_fields:
+		upd_args[k] = updated_fields[k]
+	if not _vault_password.is_empty():
+		upd_args["password"] = _vault_password
+
+	var upd_result: Dictionary = await conn.call_tool("minerva_scansort_update_document", upd_args)
+	if not upd_result.get("ok", false):
+		set_status("ERROR: update_document failed — %s" % upd_result.get("error", "unknown"))
+		return
+
+	set_status("Document updated.")
+	# Refresh both views so the updated metadata is visible.
+	if _file_tree != null and is_instance_valid(_file_tree):
+		_file_tree.refresh()
+	if _vault_view != null and is_instance_valid(_vault_view):
+		_vault_view.refresh()
+
+
+# ---------------------------------------------------------------------------
+# R4: Rules Editor flow
+# ---------------------------------------------------------------------------
+
+## Called when user picks "Rules Editor…" from the File menu.
+func _on_rules_editor_pressed() -> void:
+	if not _vault_is_open:
+		set_status("Open a vault first.")
+		return
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+
+	var dlg = _RulesEditorDialog.new()
+	add_child(dlg)
+	dlg.init(conn, _active_vault_path, _vault_password)
+	# rules_changed is a no-op for now (panel does not cache a rules list).
+	# If a cached rules list is added in R5/R6, connect here.
+	dlg.rules_changed.connect(
+		func() -> void:
+			pass  # no-op: panel has no cached rules list to invalidate in R4
+	)
+	dlg.closed.connect(
+		func() -> void:
+			dlg.queue_free()
+	)
+	dlg.popup_centered(Vector2i(880, 580))
 
 
 # ---------------------------------------------------------------------------
