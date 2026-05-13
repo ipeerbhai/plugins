@@ -4,12 +4,13 @@ extends MinervaPluginPanel
 ##
 ## Layout:
 ##   VBoxContainer
-##     HBoxContainer  (toolbar)
-##       MenuButton   "File"
-##       Label        (status bar text, right-aligned)
 ##     HSplitContainer
-##       Panel        LeftPane   — placeholder for R2's file tree
-##       Panel        RightPane  — placeholder for R2's detail/status view
+##       Panel        LeftPane   — file tree
+##       Panel        RightPane  — detail/status view
+##     HBoxContainer  StatusPanel
+##
+## R7: Internal toolbar removed. A "File" MenuButton is injected into the
+## editor chrome bar via get_editor_actions().
 ##
 ## Open-vault flow (R1):
 ##   1. User clicks File → "Open Vault…"
@@ -102,9 +103,8 @@ var _settings: Dictionary = {}
 # UI widgets
 # ---------------------------------------------------------------------------
 
-var _toolbar: HBoxContainer = null
-var _file_menu_btn: MenuButton = null
-var _status_label: Label = null
+## R7: No internal toolbar. The File menu is returned via get_editor_actions()
+## and lives in the editor chrome bar.
 var _split: HSplitContainer = null
 var _left_pane: Panel = null
 var _right_pane: Panel = null
@@ -163,41 +163,9 @@ func _build_ui() -> void:
 	vbox.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	add_child(vbox)
 
-	# --- Toolbar ---
-	_toolbar = HBoxContainer.new()
-	_toolbar.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-
-	_file_menu_btn = MenuButton.new()
-	_file_menu_btn.text = "File"
-	_file_menu_btn.flat = false
-	var popup: PopupMenu = _file_menu_btn.get_popup()
-	popup.add_item("New Vault...", 0)
-	popup.add_item("Open Vault...", 1)
-	popup.add_separator()
-	popup.add_item("Add Document...", 3)
-	popup.add_item("Rules Editor...", 4)
-	popup.add_separator()
-	popup.add_item("Vault Registry...", 5)
-	popup.add_item("Settings...", 6)
-	popup.add_item("Checklist...", 7)
-	popup.add_separator()
-	popup.add_item("Close Vault", 2)
-	popup.id_pressed.connect(_on_file_menu_id_pressed)
-	_toolbar.add_child(_file_menu_btn)
-
-	# Spacer between menu and status.
-	var spacer := Control.new()
-	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_toolbar.add_child(spacer)
-
-	_status_label = Label.new()
-	_status_label.text = "Ready"
-	_status_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	_toolbar.add_child(_status_label)
-
-	vbox.add_child(_toolbar)
-
 	# --- Split panes ---
+	# R7: Toolbar removed. File menu is contributed to the editor chrome bar
+	# via get_editor_actions().
 	_split = HSplitContainer.new()
 	_split.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_split.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -984,9 +952,33 @@ func _get_connection() -> Object:
 	return conn
 
 
+## Editor actions API — returns Controls to insert into the editor chrome bar.
+## Called by Editor._apply_plugin_chrome_actions() after the panel is mounted.
+## Returns a fresh MenuButton each call; the editor owns and frees it on teardown.
+func get_editor_actions() -> Array:
+	var menu := MenuButton.new()
+	menu.text = "File"
+	menu.flat = false
+	var popup := menu.get_popup()
+	popup.add_item("New Vault...", 0)
+	popup.add_item("Open Vault...", 1)
+	popup.add_separator()
+	popup.add_item("Add Document...", 3)
+	popup.add_item("Rules Editor...", 4)
+	popup.add_separator()
+	popup.add_item("Vault Registry...", 5)
+	popup.add_item("Settings...", 6)
+	popup.add_item("Checklist...", 7)
+	popup.add_separator()
+	popup.add_item("Close Vault", 2)
+	popup.id_pressed.connect(_on_file_menu_id_pressed)
+	return [menu]
+
+
 func set_status(text: String) -> void:
-	if _status_label != null and is_instance_valid(_status_label):
-		_status_label.text = text
+	# R7: _status_label removed (toolbar gone). Route status to the bottom panel.
+	if _status_panel != null and is_instance_valid(_status_panel):
+		_status_panel.set_status(text)
 
 
 ## True if a vault is currently open.

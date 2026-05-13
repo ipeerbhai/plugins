@@ -155,7 +155,7 @@
         "scripts": ["ui/ScansortPanel.gd", "ui/password_dialog.gd", "ui/file_tree.gd", "ui/vault_view.gd", "ui/status_panel.gd", "ui/add_document_dialog.gd", "ui/edit_details_dialog.gd", "ui/rules_editor_dialog.gd", "ui/vault_registry_dialog.gd", "ui/settings_dialog.gd", "ui/checklist_dialog.gd"],
         "file_extensions": [],
         "ipc_channels": [],
-        "save_mode": "none"
+        "save_mode": "host_owned"
       }
     ],
     "ipc_messages": []
