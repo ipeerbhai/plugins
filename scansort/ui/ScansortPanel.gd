@@ -957,7 +957,13 @@ func _get_connection() -> Object:
 ## Returns a fresh MenuButton each call; the editor owns and frees it on teardown.
 func get_editor_actions() -> Array:
 	var menu := MenuButton.new()
-	menu.text = "File"
+	# Reuse Minerva's drawer icon for the File menu; tooltip explains it.
+	var icon: Texture2D = load("res://assets/icons/drawer.png")
+	if icon != null:
+		menu.icon = icon
+	else:
+		menu.text = "File"
+	menu.tooltip_text = "Scansort File menu"
 	menu.flat = false
 	var popup := menu.get_popup()
 	popup.add_item("New Vault...", 0)
