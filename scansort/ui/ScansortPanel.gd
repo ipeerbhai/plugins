@@ -45,6 +45,9 @@ const _FileTree:    Script = preload("file_tree.gd")
 const _VaultView:   Script = preload("vault_view.gd")
 const _StatusPanel: Script = preload("status_panel.gd")
 
+## R3: add-document dialog (off-tree: no class_name).
+const _AddDocumentDialog: Script = preload("add_document_dialog.gd")
+
 # ---------------------------------------------------------------------------
 # Signals
 # ---------------------------------------------------------------------------
@@ -70,6 +73,13 @@ var _active_vault_path: String = ""
 
 ## True if a vault is open.
 var _vault_is_open: bool = false
+
+## R3: password for the currently open vault (empty if no password set).
+## Never logged.
+var _vault_password: String = ""
+
+## R3: FileDialog for picking a document to ingest (separate from vault picker).
+var _doc_file_dialog: FileDialog = null
 
 # ---------------------------------------------------------------------------
 # UI widgets
@@ -147,6 +157,8 @@ func _build_ui() -> void:
 	popup.add_item("New Vault...", 0)
 	popup.add_item("Open Vault...", 1)
 	popup.add_separator()
+	popup.add_item("Add Document...", 3)
+	popup.add_separator()
 	popup.add_item("Close Vault", 2)
 	popup.id_pressed.connect(_on_file_menu_id_pressed)
 	_toolbar.add_child(_file_menu_btn)
@@ -213,6 +225,7 @@ func _on_file_menu_id_pressed(id: int) -> void:
 		0: _on_new_vault_pressed()
 		1: _on_open_vault_pressed()
 		2: _on_close_vault_pressed()
+		3: _on_add_document_pressed()
 
 
 func _on_new_vault_pressed() -> void:
@@ -231,6 +244,7 @@ func _on_close_vault_pressed() -> void:
 		return
 	_active_vault_path = ""
 	_vault_is_open = false
+	_vault_password = ""  # R3: clear cached password
 	set_status("Vault closed.")
 	vault_closed.emit()
 	# R2: clear views.
@@ -293,6 +307,7 @@ func _begin_create_vault(path: String) -> void:
 func _on_create_vault_password_submitted(password: String, hint: String, _mode: int) -> void:
 	if password.is_empty():
 		# No password chosen — open the vault directly.
+		_vault_password = ""
 		await _do_open_vault(_pending_vault_path)
 		_pending_vault_path = ""
 		_pending_password_action = ""
@@ -321,6 +336,8 @@ func _on_create_vault_password_submitted(password: String, hint: String, _mode: 
 			{"path": _pending_vault_path, "key": "password_hint", "value": hint}
 		)
 
+	# R3: cache the password so the ingest pipeline can use it.
+	_vault_password = password
 	await _do_open_vault(_pending_vault_path)
 	_pending_vault_path = ""
 	_pending_password_action = ""
@@ -380,6 +397,8 @@ func _on_open_vault_password_submitted(password: String, _hint: String, _mode: i
 			_password_dialog.show_wrong_password_error()
 		return
 
+	# R3: cache the password for use in the ingest pipeline.
+	_vault_password = password
 	await _do_open_vault(_pending_vault_path)
 	_pending_vault_path = ""
 	_pending_password_action = ""
@@ -469,6 +488,231 @@ func _on_vault_closed_r2() -> void:
 		_vault_view.clear()
 	if _status_panel != null and is_instance_valid(_status_panel):
 		_status_panel.clear()
+
+
+# ---------------------------------------------------------------------------
+# R3: Add Document flow
+# ---------------------------------------------------------------------------
+
+## Called when user picks "Add Document…" from the File menu.
+func _on_add_document_pressed() -> void:
+	if not _vault_is_open:
+		set_status("Open a vault first.")
+		return
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+
+	# Show a document-picker FileDialog (separate from the vault picker).
+	if _doc_file_dialog == null:
+		_doc_file_dialog = FileDialog.new()
+		_doc_file_dialog.file_mode  = FileDialog.FILE_MODE_OPEN_FILE
+		_doc_file_dialog.title      = "Add Document to Vault"
+		_doc_file_dialog.file_selected.connect(_on_doc_file_selected)
+		_doc_file_dialog.canceled.connect(_on_doc_file_dialog_cancelled)
+		add_child(_doc_file_dialog)
+
+	_doc_file_dialog.filters = PackedStringArray([
+		"*.pdf *.txt *.csv *.md *.json *.xml *.html *.docx *.xlsx *.xls *.png *.jpg *.jpeg *.tiff *.bmp *.webp ; Supported Documents"
+	])
+	_doc_file_dialog.popup_centered(Vector2i(700, 500))
+
+
+func _on_doc_file_selected(file_path: String) -> void:
+	_ingest_pipeline(file_path)
+
+
+func _on_doc_file_dialog_cancelled() -> void:
+	pass  # Nothing to do — user cancelled before picking a file.
+
+
+## Ingest pipeline: extract → dedup → classify → dialog → insert.
+## All call_tool calls must be awaited.
+func _ingest_pipeline(file_path: String) -> void:
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+	if not _vault_is_open:
+		set_status("No vault open.")
+		return
+
+	# -- Step 1: Extract text + fingerprints --
+	if _status_panel != null and is_instance_valid(_status_panel):
+		_status_panel.set_status("Extracting text…")
+
+	var extract_res: Dictionary = await conn.call_tool(
+		"minerva_scansort_extract_text",
+		{"file_path": file_path}
+	)
+	# extract_text returns a FLAT dict with `success` (not `ok`).
+	if not extract_res.get("success", false):
+		_show_pipeline_error("Extraction failed: " + str(extract_res.get("error", "unknown")))
+		return
+
+	var sha256:    String = str(extract_res.get("sha256",   ""))
+	var char_count: int   = int(extract_res.get("char_count", 0))
+	var full_text: String = str(extract_res.get("full_text", ""))
+	var simhash:   String = str(extract_res.get("simhash",  "0000000000000000"))
+	var dhash:     String = str(extract_res.get("dhash",    "0000000000000000"))
+
+	# -- Step 2: Dedup check (SHA-256 in current vault) --
+	if _status_panel != null and is_instance_valid(_status_panel):
+		_status_panel.set_status("Checking for duplicates…")
+
+	# check_sha256 returns {found: bool, doc_id: ...} — no `ok` wrapper.
+	var dup_res: Dictionary = await conn.call_tool(
+		"minerva_scansort_check_sha256",
+		{"vault_path": _active_vault_path, "sha256": sha256}
+	)
+	if dup_res.get("found", false):
+		_show_pipeline_info("This document is already in the vault.")
+		if _status_panel != null and is_instance_valid(_status_panel):
+			_status_panel.set_status("Idle")
+		return
+
+	# -- Step 3: Classify (text vs vision mode) --
+	if _status_panel != null and is_instance_valid(_status_panel):
+		_status_panel.set_status("Classifying…")
+
+	var classify_args: Dictionary = {
+		"vault_path": _active_vault_path,
+		"model_id":   "claude-opus-4-7",  # R3: hardcoded; R5 wires settings
+	}
+	# Use password only if set (never log it).
+	if not _vault_password.is_empty():
+		classify_args["password"] = _vault_password
+
+	const VISION_THRESHOLD := 50
+	if char_count >= VISION_THRESHOLD:
+		classify_args["mode"]          = "text"
+		classify_args["document_text"] = full_text
+	else:
+		# Vision mode — render pages first.
+		var render_res: Dictionary = await conn.call_tool(
+			"minerva_scansort_render_pages",
+			{"file_path": file_path, "max_pages": 2, "dpi": 96}
+		)
+		# render_pages also returns a FLAT dict with `success`.
+		if not render_res.get("success", false):
+			_show_pipeline_error("Render failed: " + str(render_res.get("error", "unknown")))
+			return
+		classify_args["mode"]        = "vision"
+		classify_args["page_images"] = render_res.get("pages", [])
+
+	var classify_res: Dictionary = await conn.call_tool(
+		"minerva_scansort_classify_document",
+		classify_args
+	)
+	# classify_document returns {ok: true, classification: {...}} or {error: ...}.
+	if not classify_res.get("ok", false):
+		_show_pipeline_error("Classification failed: " + str(classify_res.get("error", "unknown")))
+		if _status_panel != null and is_instance_valid(_status_panel):
+			_status_panel.set_status("Idle")
+		return
+
+	var classification: Dictionary = classify_res.get("classification", {})
+
+	# Augment classification with fingerprints + source info.
+	classification["sha256"]      = sha256
+	classification["simhash"]     = simhash
+	classification["dhash"]       = dhash
+	classification["source_file"] = file_path
+
+	# -- Step 4: Show dialog so user can review / edit --
+	var dlg = _AddDocumentDialog.new()
+	dlg.set_proposal(classification)
+	add_child(dlg)
+	dlg.accepted.connect(
+		func(final: Dictionary) -> void:
+			dlg.queue_free()
+			_on_add_dialog_accepted(final, file_path, sha256, simhash, dhash)
+	)
+	dlg.cancelled.connect(
+		func() -> void:
+			dlg.queue_free()
+			_on_add_dialog_cancelled()
+	)
+	dlg.popup_centered()
+
+	if _status_panel != null and is_instance_valid(_status_panel):
+		_status_panel.set_status("Waiting for user review…")
+
+
+func _on_add_dialog_accepted(
+		final: Dictionary,
+		file_path: String,
+		sha256: String,
+		simhash: String,
+		dhash: String) -> void:
+	if _status_panel != null and is_instance_valid(_status_panel):
+		_status_panel.set_status("Storing in vault…")
+
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+
+	var insert_args: Dictionary = {
+		"vault_path":   _active_vault_path,
+		"file_path":    file_path,
+		"category":     final.get("category",    ""),
+		"confidence":   float(final.get("confidence", 0.0)),
+		"sender":       final.get("sender",      ""),
+		"description":  final.get("description", ""),
+		"doc_date":     final.get("doc_date",    ""),
+		"status":       "classified",
+		"sha256":       sha256,
+		"simhash":      simhash,
+		"dhash":        dhash,
+		"source_path":  file_path,
+	}
+	# Pass password only if set.
+	if not _vault_password.is_empty():
+		insert_args["password"] = _vault_password
+
+	var insert_res: Dictionary = await conn.call_tool(
+		"minerva_scansort_insert_document",
+		insert_args
+	)
+	# insert_document returns {ok: true, doc_id: N}.
+	if not insert_res.get("ok", false):
+		_show_pipeline_error("Insert failed: " + str(insert_res.get("error", "unknown")))
+		return
+
+	if _status_panel != null and is_instance_valid(_status_panel):
+		_status_panel.set_status("Idle")
+	set_status("Document added to vault.")
+
+	# Refresh views.
+	if _file_tree != null and is_instance_valid(_file_tree):
+		_file_tree.refresh()
+	if _vault_view != null and is_instance_valid(_vault_view):
+		_vault_view.refresh()
+
+
+func _on_add_dialog_cancelled() -> void:
+	if _status_panel != null and is_instance_valid(_status_panel):
+		_status_panel.set_status("Idle")
+	set_status("Add document cancelled.")
+
+
+## Show a non-blocking error in the status bar / status panel.
+## Toolbar carries the error message; pipeline-state panel returns to Idle so
+## subsequent runs aren't gated on the user noticing the stale label.
+func _show_pipeline_error(msg: String) -> void:
+	set_status("ERROR: " + msg)
+	if _status_panel != null and is_instance_valid(_status_panel):
+		_status_panel.set_status("Idle")
+	push_warning("[ScansortPanel] pipeline error: " + msg)
+
+
+## Show a non-blocking info message.
+func _show_pipeline_info(msg: String) -> void:
+	set_status(msg)
+	if _status_panel != null and is_instance_valid(_status_panel):
+		_status_panel.set_status(msg)
 
 
 # ---------------------------------------------------------------------------

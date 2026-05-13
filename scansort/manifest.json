@@ -124,7 +124,7 @@
         "name": "scansort_panel",
         "kind": "godot_scene",
         "entry_scene": "ui/ScansortPanel.tscn",
-        "scripts": ["ui/ScansortPanel.gd", "ui/password_dialog.gd", "ui/file_tree.gd", "ui/vault_view.gd", "ui/status_panel.gd"],
+        "scripts": ["ui/ScansortPanel.gd", "ui/password_dialog.gd", "ui/file_tree.gd", "ui/vault_view.gd", "ui/status_panel.gd", "ui/add_document_dialog.gd"],
         "file_extensions": [],
         "ipc_channels": [],
         "save_mode": "none"
