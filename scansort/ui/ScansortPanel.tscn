@@ -9,6 +9,3 @@ anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
 script = ExtResource("1_scansort")
-
-[node name="Label" type="Label" parent="."]
-text = "Scansort plugin loaded (skeleton)"
