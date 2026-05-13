@@ -681,7 +681,11 @@ fn handle_classify_document(
 
     let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("text");
     let max_chars = args.get("max_chars").and_then(|v| v.as_u64()).unwrap_or(4000) as usize;
-    let model_id = args.get("model_id").and_then(|v| v.as_str()).unwrap_or("");
+    // Accept `model` (preferred) or `model_id` (deprecated back-compat alias).
+    let model = args.get("model").and_then(|v| v.as_str())
+        .or_else(|| args.get("model_id").and_then(|v| v.as_str()))
+        .unwrap_or("default");
+    let model_spec = args.get("model_spec").cloned();
     let vault_id = args.get("vault_id").and_then(|v| v.as_str());
 
     // 1. Load rules
@@ -715,8 +719,15 @@ fn handle_classify_document(
     // 3. Issue host.providers.chat capability request
     let mut chat_args = json!({
         "messages": messages,
-        "model_id": model_id,
+        "model": model,
     });
+    // Only forward spec when it's a non-empty object — broker rejects empty {} as "unknown kind".
+    if let Some(spec) = model_spec {
+        let is_empty_obj = spec.as_object().map_or(false, |o| o.is_empty());
+        if !spec.is_null() && !is_empty_obj {
+            chat_args["model_spec"] = spec;
+        }
+    }
     if let Some(vid) = vault_id {
         chat_args["vault_id"] = json!(vid);
     }
@@ -1295,10 +1306,12 @@ fn main() {
                                 "document_text": {"type": "string", "description": "Extracted document text (required for text mode)."},
                                 "page_images": {"type": "array", "description": "Array of {page_num, base64} objects (required for vision mode).", "items": {"type": "object"}},
                                 "max_chars": {"type": "integer", "description": "Maximum characters of text to send to LLM (default: 4000)."},
-                                "model_id": {"type": "string", "description": "Model identifier to pass to host.providers.chat."},
+                                "model": {"type": "string", "description": "Model identifier to pass to host.providers.chat (preferred; defaults to 'default')."},
+                                "model_id": {"type": "string", "description": "Deprecated alias for 'model'. Use 'model' instead."},
+                                "model_spec": {"type": "object", "description": "Structured provider spec from ProviderOptionButton (kind, model_id, etc.). Wins over 'model' when broker supports it."},
                                 "vault_id": {"type": "string", "description": "Optional vault_id context for host.providers.chat."},
                             },
-                            "required": ["vault_path", "model_id"],
+                            "required": ["vault_path"],
                         },
                     },
                     {
