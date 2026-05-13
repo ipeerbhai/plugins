@@ -56,6 +56,30 @@
     {
       "name": "minerva_scansort_check_sha256_all_vaults",
       "description": "Check whether a sha256 exists in any registered vault."
+    },
+    {
+      "name": "minerva_scansort_insert_document",
+      "description": "Read a file from disk, compress with zstd, and insert it into the vault's documents table."
+    },
+    {
+      "name": "minerva_scansort_query_documents",
+      "description": "Query documents with optional filters (category, sender, status, date range, pattern, tag, doc_id)."
+    },
+    {
+      "name": "minerva_scansort_get_document",
+      "description": "Get a single document's metadata by doc_id."
+    },
+    {
+      "name": "minerva_scansort_extract_document",
+      "description": "Extract a document from the vault to the filesystem, decompressing zstd."
+    },
+    {
+      "name": "minerva_scansort_update_document",
+      "description": "Update document metadata fields (status, category, display_name, description, tags) by doc_id."
+    },
+    {
+      "name": "minerva_scansort_vault_inventory",
+      "description": "List all documents in a vault with metadata (no file data blob)."
     }
   ],
   "ui": {

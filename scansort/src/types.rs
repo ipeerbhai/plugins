@@ -57,6 +57,49 @@ impl From<serde_json::Error> for VaultError {
 pub type VaultResult<T> = Result<T, VaultError>;
 
 // ---------------------------------------------------------------------------
+// Document — returned by query/get/inventory
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Document {
+    pub doc_id: i64,
+    pub original_filename: String,
+    pub display_name: String,
+    pub file_ext: String,
+    pub category: String,
+    pub confidence: f64,
+    pub sender: String,
+    pub description: String,
+    pub doc_date: String,
+    pub classified_at: String,
+    pub sha256: String,
+    pub simhash: String,
+    pub dhash: String,
+    pub status: String,
+    pub file_size: i64,
+    pub compression: String,
+    pub encrypted: bool,
+    pub tags: Vec<String>,
+    pub source_path: String,
+}
+
+// ---------------------------------------------------------------------------
+// DocumentFilter — query filter parameters
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default)]
+pub struct DocumentFilter {
+    pub category: Option<String>,
+    pub sender: Option<String>,
+    pub status: Option<String>,
+    pub date_from: Option<String>,
+    pub date_to: Option<String>,
+    pub pattern: Option<String>,
+    pub tag: Option<String>,
+    pub doc_id: Option<i64>,
+}
+
+// ---------------------------------------------------------------------------
 // VaultInfo — returned by open_vault
 // ---------------------------------------------------------------------------
 

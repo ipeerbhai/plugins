@@ -23,6 +23,7 @@
 
 mod crypto;
 mod db;
+mod documents;
 mod fingerprints;
 mod registry;
 mod schema;
@@ -354,6 +355,135 @@ fn handle_check_sha256_all_vaults(params: &Value, id: Value) -> RpcResponse {
     }
 }
 
+fn handle_insert_document(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let vault_path = args.get("vault_path").and_then(|v| v.as_str()).unwrap_or("");
+    let file_path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+    if vault_path.is_empty() {
+        return ok_response(id, tool_err("vault_path is required"));
+    }
+    if file_path.is_empty() {
+        return ok_response(id, tool_err("file_path is required"));
+    }
+    let category = args.get("category").and_then(|v| v.as_str()).unwrap_or("");
+    let confidence = args.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let sender = args.get("sender").and_then(|v| v.as_str()).unwrap_or("");
+    let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
+    let doc_date = args.get("doc_date").and_then(|v| v.as_str()).unwrap_or("");
+    let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    let sha256 = args.get("sha256").and_then(|v| v.as_str()).unwrap_or("");
+    let simhash = args.get("simhash").and_then(|v| v.as_str()).unwrap_or("");
+    let dhash = args.get("dhash").and_then(|v| v.as_str()).unwrap_or("");
+    let source_path = args.get("source_path").and_then(|v| v.as_str()).unwrap_or("");
+    match documents::insert_document(
+        vault_path, file_path, category, confidence, sender,
+        description, doc_date, status, sha256, simhash, dhash, source_path,
+    ) {
+        Ok(doc_id) => ok_response(id, tool_ok(json!({"ok": true, "doc_id": doc_id}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_query_documents(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let vault_path = args.get("vault_path").and_then(|v| v.as_str()).unwrap_or("");
+    if vault_path.is_empty() {
+        return ok_response(id, tool_err("vault_path is required"));
+    }
+    let filter = types::DocumentFilter {
+        category: args.get("category").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from),
+        sender: args.get("sender").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from),
+        status: args.get("status").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from),
+        date_from: args.get("date_from").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from),
+        date_to: args.get("date_to").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from),
+        pattern: args.get("pattern").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from),
+        tag: args.get("tag").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from),
+        doc_id: args.get("doc_id").and_then(|v| v.as_i64()),
+    };
+    match documents::query_documents(vault_path, &filter) {
+        Ok(docs) => match serde_json::to_value(&docs) {
+            Ok(v) => ok_response(id, tool_ok(json!({"ok": true, "documents": v}))),
+            Err(e) => ok_response(id, tool_err(&e.to_string())),
+        },
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_get_document(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let vault_path = args.get("vault_path").and_then(|v| v.as_str()).unwrap_or("");
+    if vault_path.is_empty() {
+        return ok_response(id, tool_err("vault_path is required"));
+    }
+    let doc_id = match args.get("doc_id").and_then(|v| v.as_i64()) {
+        Some(d) => d,
+        None => return ok_response(id, tool_err("doc_id is required")),
+    };
+    match documents::get_document(vault_path, doc_id) {
+        Ok(doc) => match serde_json::to_value(&doc) {
+            Ok(v) => ok_response(id, tool_ok(json!({"ok": true, "document": v}))),
+            Err(e) => ok_response(id, tool_err(&e.to_string())),
+        },
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_extract_document(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let vault_path = args.get("vault_path").and_then(|v| v.as_str()).unwrap_or("");
+    if vault_path.is_empty() {
+        return ok_response(id, tool_err("vault_path is required"));
+    }
+    let doc_id = match args.get("doc_id").and_then(|v| v.as_i64()) {
+        Some(d) => d,
+        None => return ok_response(id, tool_err("doc_id is required")),
+    };
+    let dest = args.get("dest").and_then(|v| v.as_str()).unwrap_or("");
+    if dest.is_empty() {
+        return ok_response(id, tool_err("dest is required"));
+    }
+    match documents::extract_document(vault_path, doc_id, dest) {
+        Ok(out_path) => ok_response(id, tool_ok(json!({"ok": true, "path": out_path}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_update_document(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let vault_path = args.get("vault_path").and_then(|v| v.as_str()).unwrap_or("");
+    if vault_path.is_empty() {
+        return ok_response(id, tool_err("vault_path is required"));
+    }
+    let doc_id = match args.get("doc_id").and_then(|v| v.as_i64()) {
+        Some(d) => d,
+        None => return ok_response(id, tool_err("doc_id is required")),
+    };
+    let updates_val = args.get("updates").cloned().unwrap_or(Value::Object(Default::default()));
+    let updates: std::collections::HashMap<String, Value> = match updates_val {
+        Value::Object(map) => map.into_iter().collect(),
+        _ => return ok_response(id, tool_err("updates must be an object")),
+    };
+    match documents::update_document(vault_path, doc_id, &updates) {
+        Ok(()) => ok_response(id, tool_ok(json!({"ok": true}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_vault_inventory(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let vault_path = args.get("vault_path").and_then(|v| v.as_str()).unwrap_or("");
+    if vault_path.is_empty() {
+        return ok_response(id, tool_err("vault_path is required"));
+    }
+    match documents::vault_inventory(vault_path) {
+        Ok(docs) => match serde_json::to_value(&docs) {
+            Ok(v) => ok_response(id, tool_ok(json!({"ok": true, "documents": v, "count": docs.len()}))),
+            Err(e) => ok_response(id, tool_err(&e.to_string())),
+        },
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
 fn main() {
     // Logging goes to stderr so it never pollutes the JSON-RPC stdout channel.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -536,6 +666,96 @@ fn main() {
                             "required": ["sha256"],
                         },
                     },
+                    {
+                        "name": "minerva_scansort_insert_document",
+                        "description": "Read a file from disk, compress with zstd, and insert it into the vault's documents table.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "vault_path": {"type": "string", "description": "Absolute path to the vault file."},
+                                "file_path": {"type": "string", "description": "Absolute path to the file to ingest."},
+                                "category": {"type": "string", "description": "Classification category."},
+                                "confidence": {"type": "number", "description": "Classification confidence (0.0–1.0)."},
+                                "sender": {"type": "string", "description": "Document sender / source."},
+                                "description": {"type": "string", "description": "Human-readable description."},
+                                "doc_date": {"type": "string", "description": "Document date (ISO-8601 preferred)."},
+                                "status": {"type": "string", "description": "Document status (default: classified)."},
+                                "sha256": {"type": "string", "description": "Pre-computed SHA-256 (computed from file if empty)."},
+                                "simhash": {"type": "string", "description": "SimHash hex string."},
+                                "dhash": {"type": "string", "description": "dHash hex string."},
+                                "source_path": {"type": "string", "description": "Original source path (defaults to file_path)."},
+                            },
+                            "required": ["vault_path", "file_path"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_query_documents",
+                        "description": "Query documents with optional filters (category, sender, status, date range, pattern, tag, doc_id).",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "vault_path": {"type": "string", "description": "Absolute path to the vault file."},
+                                "category": {"type": "string", "description": "Filter by category."},
+                                "sender": {"type": "string", "description": "Filter by sender (substring match)."},
+                                "status": {"type": "string", "description": "Filter by status."},
+                                "date_from": {"type": "string", "description": "Filter by doc_date >= date_from."},
+                                "date_to": {"type": "string", "description": "Filter by doc_date <= date_to."},
+                                "pattern": {"type": "string", "description": "Substring match across description/filename/sender/tags."},
+                                "tag": {"type": "string", "description": "Filter by tag."},
+                                "doc_id": {"type": "integer", "description": "Filter by specific doc_id."},
+                            },
+                            "required": ["vault_path"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_get_document",
+                        "description": "Get a single document's metadata by doc_id.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "vault_path": {"type": "string", "description": "Absolute path to the vault file."},
+                                "doc_id": {"type": "integer", "description": "Document ID to retrieve."},
+                            },
+                            "required": ["vault_path", "doc_id"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_extract_document",
+                        "description": "Extract a document from the vault to the filesystem, decompressing zstd.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "vault_path": {"type": "string", "description": "Absolute path to the vault file."},
+                                "doc_id": {"type": "integer", "description": "Document ID to extract."},
+                                "dest": {"type": "string", "description": "Destination path or directory for the extracted file."},
+                            },
+                            "required": ["vault_path", "doc_id", "dest"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_update_document",
+                        "description": "Update document metadata fields (status, category, display_name, description, tags) by doc_id.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "vault_path": {"type": "string", "description": "Absolute path to the vault file."},
+                                "doc_id": {"type": "integer", "description": "Document ID to update."},
+                                "updates": {"type": "object", "description": "Map of field names to new values. Allowed: status, category, display_name, description, tags."},
+                            },
+                            "required": ["vault_path", "doc_id", "updates"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_vault_inventory",
+                        "description": "List all documents in a vault with metadata (no file data blob).",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "vault_path": {"type": "string", "description": "Absolute path to the vault file."},
+                            },
+                            "required": ["vault_path"],
+                        },
+                    },
                 ]
             })),
 
@@ -577,6 +797,24 @@ fn main() {
                     }
                     "minerva_scansort_check_sha256_all_vaults" => {
                         handle_check_sha256_all_vaults(&req.params, req.id)
+                    }
+                    "minerva_scansort_insert_document" => {
+                        handle_insert_document(&req.params, req.id)
+                    }
+                    "minerva_scansort_query_documents" => {
+                        handle_query_documents(&req.params, req.id)
+                    }
+                    "minerva_scansort_get_document" => {
+                        handle_get_document(&req.params, req.id)
+                    }
+                    "minerva_scansort_extract_document" => {
+                        handle_extract_document(&req.params, req.id)
+                    }
+                    "minerva_scansort_update_document" => {
+                        handle_update_document(&req.params, req.id)
+                    }
+                    "minerva_scansort_vault_inventory" => {
+                        handle_vault_inventory(&req.params, req.id)
                     }
                     other => err_response(req.id, -32601, format!("unknown tool: {other}")),
                 }
