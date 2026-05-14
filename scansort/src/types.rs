@@ -249,11 +249,24 @@ pub struct Rule {
 }
 
 // ---------------------------------------------------------------------------
-// Classification — result of classify_document (T6 R3+)
+// Classification — result of classify_document (T6 R3+, extended W2)
 // ---------------------------------------------------------------------------
+
+/// Per-rule semantic-match signal returned by Phase 1 classification.
+///
+/// `label` matches a rule's `.label` field.
+/// `score` is 0.0–1.0 — how well the document matches that rule's
+/// instruction/signals as judged by the LLM. W3's deterministic rule walk
+/// will threshold these scores and apply conditions/exceptions.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RuleSignal {
+    pub label: String,
+    pub score: f64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Classification {
+    // ── legacy fields (unchanged) ──────────────────────────────────────────
     pub category: String,
     pub confidence: f64,
     pub issuer: String,
@@ -263,6 +276,21 @@ pub struct Classification {
     pub raw_response: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
+    // ── W2 additions ───────────────────────────────────────────────────────
+    /// Short free-text document type ("W-2", "invoice", "bank statement", …).
+    #[serde(default)]
+    pub doc_type: String,
+    /// Monetary amount extracted from the document (empty when not present).
+    #[serde(default)]
+    pub amount: String,
+    /// Calendar year extracted from doc_date (0 when not parseable).
+    #[serde(default)]
+    pub year: i32,
+    /// Per-rule semantic-match scores.  One entry per *enabled* rule in the
+    /// rule set.  W3 consumes these to threshold, apply conditions, and pick
+    /// which rules fire.  Missing rules default to 0.0.
+    #[serde(default)]
+    pub rule_signals: Vec<RuleSignal>,
 }
 
 // ---------------------------------------------------------------------------

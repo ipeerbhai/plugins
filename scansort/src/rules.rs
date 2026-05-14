@@ -387,41 +387,92 @@ pub fn is_valid_label(rules: &[Rule], label: &str) -> bool {
     rules.iter().any(|r| r.enabled && r.label == label)
 }
 
-/// Build the system prompt for classification, mirroring scan_rules.gd#build_prompt_context.
+/// Build the system prompt for Phase 1 classification.
+///
+/// The prompt requests two things from the LLM:
+///
+/// 1. **Extracted facts** — `doc_date`, `issuer`, `amount`, `doc_type`,
+///    `description`, `tags`, and an overall `confidence`.
+/// 2. **Per-rule semantic-match scores** — one entry per enabled rule,
+///    scoring how well the document matches that rule's instruction/signals.
+///
+/// The per-rule score array feeds W3's deterministic rule walk (thresholding,
+/// conditions, exceptions, stop_processing).  The LLM must NOT pick a winner
+/// — it must score every listed rule independently.
 pub fn build_prompt_context(rules: &[Rule]) -> String {
+    // Collect enabled rule labels for the score-array schema example.
+    let enabled_labels: Vec<&str> = rules
+        .iter()
+        .filter(|r| r.enabled)
+        .map(|r| r.label.as_str())
+        .collect();
+
+    let rule_signals_example: String = if enabled_labels.is_empty() {
+        r#"[{"label": "<rule_label>", "score": 0.0}]"#.to_string()
+    } else {
+        let entries: Vec<String> = enabled_labels
+            .iter()
+            .map(|l| format!(r#"{{"label": "{l}", "score": 0.0}}"#))
+            .collect();
+        format!("[{}]", entries.join(", "))
+    };
+
     let mut lines: Vec<String> = Vec::new();
-    lines.push(
-        "You are a document classifier. Classify the document into exactly one category."
-            .to_string(),
-    );
-    lines.push(
-        r#"Respond with JSON: {"category": "<label>", "confidence": <0.0-1.0>, "issuer": "<who issued this document>", "description": "<brief description>", "date": "<YYYY-MM-DD document date>", "tags": ["tag1", "tag2"]}"#
-            .to_string(),
-    );
-    lines.push(
-        "tags should be 2-5 short keywords relevant to the document content.".to_string(),
-    );
+
+    lines.push("You are a document classifier and fact extractor.".to_string());
     lines.push(String::new());
-    lines.push("Categories:".to_string());
+    lines.push("## Task".to_string());
+    lines.push("Analyze the document and respond with a single JSON object containing:".to_string());
+    lines.push(String::new());
+    lines.push("1. **Extracted facts** about the document.".to_string());
+    lines.push("2. **Per-rule semantic scores** — for EVERY rule listed below, score how well the document matches that rule (0.0 = no match, 1.0 = perfect match). Score ALL rules independently; do NOT pick just one winner.".to_string());
+    lines.push(String::new());
+
+    lines.push("## Required JSON schema".to_string());
+    lines.push(r#"{
+  "doc_date": "<YYYY-MM-DD document date, or empty string if unknown>",
+  "issuer": "<organization or person that issued the document>",
+  "amount": "<monetary amount as a string, e.g. '1234.56', or empty string if none>",
+  "doc_type": "<short document-type label, e.g. 'W-2', 'invoice', 'bank statement', 'receipt'>",
+  "description": "<one-sentence description of the document>",
+  "tags": ["<keyword1>", "<keyword2>"],
+  "confidence": <overall extraction confidence 0.0–1.0>,
+  "rule_signals": <per-rule score array — see below>
+}"#.to_string());
+    lines.push(String::new());
+
+    lines.push("## Rules to score".to_string());
+    lines.push(format!(
+        "Provide a `rule_signals` array with EXACTLY one entry per enabled rule below.\n\
+         Each entry: {{\"label\": \"<exact rule label>\", \"score\": <0.0-1.0>}}.\n\
+         Example shape (fill in real scores): {rule_signals_example}"
+    ));
+    lines.push(String::new());
 
     for r in rules {
         if !r.enabled {
             continue;
         }
-        lines.push(String::new());
-        lines.push(format!("## {}", r.label));
-        lines.push(r.instruction.clone());
+        lines.push(format!("### {}", r.label));
+        if !r.instruction.is_empty() {
+            lines.push(r.instruction.clone());
+        }
         if !r.signals.is_empty() {
             lines.push(format!("Keywords: {}", r.signals.join(", ")));
         }
+        lines.push(String::new());
     }
 
-    lines.push(String::new());
     let def = default_category(rules);
-    lines.push(
-        "You MUST use one of the listed category labels exactly. Do not invent categories like 'unknown' or 'other'."
-            .to_string(),
-    );
-    lines.push(format!(r#"If unsure, classify as "{def}"."#));
+    lines.push("## Important".to_string());
+    lines.push("- Score ALL listed rules, even if the score is 0.0.".to_string());
+    lines.push("- `issuer` is the entity that created/sent the document (e.g. a bank, employer, or utility company).".to_string());
+    lines.push("- `tags` should be 2–5 short keywords relevant to the document content.".to_string());
+    lines.push("- `doc_date` must be YYYY-MM-DD format (e.g. \"2024-03-15\") or an empty string.".to_string());
+    lines.push(format!(
+        "- For the `description` field, if you are unsure of the document type classify it as \"{def}\"."
+    ));
+    lines.push("- Respond with ONLY the JSON object — no prose, no markdown fences.".to_string());
+
     lines.join("\n")
 }
