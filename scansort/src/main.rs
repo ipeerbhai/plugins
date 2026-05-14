@@ -27,6 +27,7 @@ mod classifier;
 mod crypto;
 mod db;
 mod destination;
+mod destinations;
 mod documents;
 mod extract;
 mod fingerprints;
@@ -1357,6 +1358,90 @@ fn handle_list_disk_files(params: &Value, id: Value) -> RpcResponse {
     }
 }
 
+// ---------------------------------------------------------------------------
+// W4: destination registry handlers
+// ---------------------------------------------------------------------------
+
+fn handle_destination_add(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let registry_path = args.get("registry_path").and_then(|v| v.as_str()).unwrap_or("");
+    if registry_path.is_empty() {
+        return ok_response(id, tool_err("registry_path is required"));
+    }
+    let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    if kind.is_empty() {
+        return ok_response(id, tool_err("kind is required"));
+    }
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    if path.is_empty() {
+        return ok_response(id, tool_err("path is required"));
+    }
+    let label = args.get("label").and_then(|v| v.as_str());
+    let locked = args.get("locked").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let p = std::path::Path::new(registry_path);
+    let mut reg = match destinations::load_or_init(p) {
+        Ok(r) => r,
+        Err(e) => return ok_response(id, tool_err(&e.message)),
+    };
+    match destinations::add(&mut reg, kind, path, label, locked) {
+        Ok(dest) => {
+            if let Err(e) = destinations::save(p, &reg) {
+                return ok_response(id, tool_err(&e.message));
+            }
+            match serde_json::to_value(&dest) {
+                Ok(v) => ok_response(id, tool_ok(json!({"ok": true, "destination": v}))),
+                Err(e) => ok_response(id, tool_err(&e.to_string())),
+            }
+        }
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_destination_list(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let registry_path = args.get("registry_path").and_then(|v| v.as_str()).unwrap_or("");
+    if registry_path.is_empty() {
+        return ok_response(id, tool_err("registry_path is required"));
+    }
+    let p = std::path::Path::new(registry_path);
+    let reg = match destinations::load_or_init(p) {
+        Ok(r) => r,
+        Err(e) => return ok_response(id, tool_err(&e.message)),
+    };
+    let all = destinations::list(&reg);
+    match serde_json::to_value(all) {
+        Ok(v) => ok_response(id, tool_ok(json!({
+            "ok": true,
+            "destinations": v,
+            "count": all.len(),
+        }))),
+        Err(e) => ok_response(id, tool_err(&e.to_string())),
+    }
+}
+
+fn handle_destination_remove(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let registry_path = args.get("registry_path").and_then(|v| v.as_str()).unwrap_or("");
+    if registry_path.is_empty() {
+        return ok_response(id, tool_err("registry_path is required"));
+    }
+    let dest_id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    if dest_id.is_empty() {
+        return ok_response(id, tool_err("id is required"));
+    }
+    let p = std::path::Path::new(registry_path);
+    let mut reg = match destinations::load_or_init(p) {
+        Ok(r) => r,
+        Err(e) => return ok_response(id, tool_err(&e.message)),
+    };
+    let removed = destinations::remove(&mut reg, dest_id);
+    if let Err(e) = destinations::save(p, &reg) {
+        return ok_response(id, tool_err(&e.message));
+    }
+    ok_response(id, tool_ok(json!({"ok": true, "removed": removed})))
+}
+
 fn main() {
     // Logging goes to stderr so it never pollutes the JSON-RPC stdout channel.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -1960,6 +2045,44 @@ fn main() {
                             "required": ["vault_path", "file_path", "subfolder", "doc_date"],
                         },
                     },
+                    {
+                        "name": "minerva_scansort_destination_add",
+                        "description": "Register a new filing destination (vault file or directory) in the session-level destination registry. The plugin generates a stable unique id. Returns {ok, destination: {id, kind, path, label, locked}}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "registry_path": {"type": "string", "description": "Absolute path to the destination registry JSON file. Created on first use."},
+                                "kind": {"type": "string", "description": "\"vault\" (a .ssort vault file) or \"directory\" (a plain directory)."},
+                                "path": {"type": "string", "description": "Absolute path to the vault file or directory."},
+                                "label": {"type": "string", "description": "Optional human-readable label. Defaults to the file/dir name of path."},
+                                "locked": {"type": "boolean", "description": "When true, marks this destination as locked/final (W8 will use this to refuse reprocessing). Defaults to false."},
+                            },
+                            "required": ["registry_path", "kind", "path"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_destination_list",
+                        "description": "List all destinations in the session-level destination registry. Returns {ok, destinations: [{id, kind, path, label, locked}], count}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "registry_path": {"type": "string", "description": "Absolute path to the destination registry JSON file."},
+                            },
+                            "required": ["registry_path"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_destination_remove",
+                        "description": "Remove a destination from the session-level registry by its id. Returns {ok, removed: bool}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "registry_path": {"type": "string", "description": "Absolute path to the destination registry JSON file."},
+                                "id": {"type": "string", "description": "The stable id of the destination to remove (from destination_add or destination_list)."},
+                            },
+                            "required": ["registry_path", "id"],
+                        },
+                    },
                 ]
             })),
 
@@ -2091,6 +2214,15 @@ fn main() {
                     }
                     "minerva_scansort_list_disk_files" => {
                         handle_list_disk_files(&req.params, req.id)
+                    }
+                    "minerva_scansort_destination_add" => {
+                        handle_destination_add(&req.params, req.id)
+                    }
+                    "minerva_scansort_destination_list" => {
+                        handle_destination_list(&req.params, req.id)
+                    }
+                    "minerva_scansort_destination_remove" => {
+                        handle_destination_remove(&req.params, req.id)
                     }
                     other => err_response(req.id, -32601, format!("unknown tool: {other}")),
                 }
