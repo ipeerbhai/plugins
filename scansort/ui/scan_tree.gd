@@ -29,6 +29,11 @@ signal check_toggled
 ## target_kind: always "folder" (only folder rows accept drops).
 signal file_dropped(drag_data: Dictionary, target_key: String, target_kind: String)
 
+## W5b: Emitted when one of the inline row buttons on a top-level destination row
+## is clicked.  dest_id is the "dest:<id>" key without the prefix stripped, and
+## action is one of "remove", "reprocess", or "lock_toggle".
+signal dest_button_pressed(dest_id: String, action: String)
+
 # Column indices.
 const COL_CHECK := 0
 const COL_NAME := 1
@@ -36,6 +41,11 @@ const COL_DATE := 2
 
 const COLOR_FOLDER := Color(0.9, 0.85, 0.6)   # warm yellow
 const COLOR_FILE := Color(0.78, 0.85, 0.78)   # soft green
+
+# W5b: inline button IDs for destination rows.
+const BTN_ID_REMOVE     := 0
+const BTN_ID_REPROCESS  := 1
+const BTN_ID_LOCK       := 2
 
 var _provider: Object = null
 
@@ -61,6 +71,8 @@ func _ready() -> void:
 	item_selected.connect(_on_item_selected)
 	item_edited.connect(_on_item_edited)
 	gui_input.connect(_on_gui_input)
+	# W5b: inline destination row buttons.
+	button_clicked.connect(_on_button_clicked)
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +139,19 @@ func _add_node(parent: TreeItem, node: Dictionary) -> void:
 		var children: Array = node.get("children", []) if node.get("children") is Array else []
 		for child: Dictionary in children:
 			_add_node(item, child)
+		# W5b: add inline action buttons on top-level destination rows.
+		# A destination row carries a "dest_id" field in its node dict.
+		var dest_id: String = str(node.get("dest_id", ""))
+		if not dest_id.is_empty():
+			var is_locked: bool = bool(node.get("locked", false))
+			# Use short text labels — cross-platform, no icon loading required.
+			item.add_button(COL_DATE, _make_icon_texture(), BTN_ID_REMOVE, false, "Remove destination")
+			item.add_button(COL_DATE, _make_icon_texture(), BTN_ID_REPROCESS, false, "Reprocess destination")
+			item.add_button(COL_DATE, _make_icon_texture(), BTN_ID_LOCK, false,
+				"Locked — click to unlock" if is_locked else "Unlocked — click to lock")
+			# Store dest_id + locked on the item for the button handler.
+			item.set_meta("dest_id", dest_id)
+			item.set_meta("dest_locked", is_locked)
 	else:
 		item.set_cell_mode(COL_CHECK, TreeItem.CELL_MODE_CHECK)
 		item.set_checked(COL_CHECK, false)
@@ -137,6 +162,15 @@ func _add_node(parent: TreeItem, node: Dictionary) -> void:
 		var tooltip: String = str(node.get("tooltip", ""))
 		if not tooltip.is_empty():
 			item.set_tooltip_text(COL_NAME, tooltip)
+
+
+## W5b: build a minimal 1×1 placeholder Texture2D for inline buttons.
+## We use text tooltips to distinguish button roles — cross-platform, no icon
+## file dependency. A real icon can be swapped in here later.
+func _make_icon_texture() -> Texture2D:
+	var img := Image.create(12, 12, false, Image.FORMAT_RGBA8)
+	img.fill(Color(0.7, 0.7, 0.7, 0.9))
+	return ImageTexture.create_from_image(img)
 
 
 func _collect_checked(item: TreeItem, result: Array) -> void:
@@ -184,6 +218,23 @@ func _on_gui_input(event: InputEvent) -> void:
 	if get_column_at_position(mb.position) != COL_NAME:
 		return
 	file_activated.emit(str(item.get_metadata(COL_NAME)))
+
+
+# ---------------------------------------------------------------------------
+# W5b: Inline destination row button handler
+# ---------------------------------------------------------------------------
+
+func _on_button_clicked(item: TreeItem, _column: int, btn_id: int, _mouse_button: int) -> void:
+	var dest_id: String = str(item.get_meta("dest_id", ""))
+	if dest_id.is_empty():
+		return
+	match btn_id:
+		BTN_ID_REMOVE:
+			dest_button_pressed.emit(dest_id, "remove")
+		BTN_ID_REPROCESS:
+			dest_button_pressed.emit(dest_id, "reprocess")
+		BTN_ID_LOCK:
+			dest_button_pressed.emit(dest_id, "lock_toggle")
 
 
 # ---------------------------------------------------------------------------

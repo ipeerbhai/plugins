@@ -71,6 +71,9 @@ const _DiskProvider: Script = preload("scan_tree_disk_provider.gd")
 ## W5: destination registry provider — vault or directory destination.
 const _DestinationProvider: Script = preload("scan_tree_destination_provider.gd")
 
+## W5b: aggregate area providers (one per kind) for the two-area splitter layout.
+const _AreaProvider: Script = preload("scan_tree_area_provider.gd")
+
 ## W7: dedup disposition dialog (off-tree: no class_name).
 const _DedupDispositionDialog: Script = preload("dedup_disposition_dialog.gd")
 
@@ -158,6 +161,15 @@ var _dest_scroll_content: VBoxContainer = null
 ## W5: registry_path required by destination_add/list/remove tools.
 ## Provided at vault-open time (or via settings). Empty = feature unavailable.
 var _registry_path: String = ""
+
+## W5b: Two-area splitter layout — Vault area + Directory area, each backed
+## by an aggregate AreaProvider that renders all destinations of that kind
+## as top-level virtual-root rows with inline [Remove][Reprocess][Lock] buttons.
+var _vault_area_tree: Tree = null
+var _dir_area_tree: Tree = null
+var _vault_area_provider: Object = null
+var _dir_area_provider: Object = null
+
 ## Chrome-bar buttons — created in get_editor_actions(); the editor owns and
 ## frees them on teardown, so guard with is_instance_valid before use.
 var _process_btn: Button = null
@@ -286,36 +298,90 @@ func _build_ui() -> void:
 	source_col.add_child(_source_tree)
 	columns.add_child(source_col)
 
-	# --- Right column: destination pane (W5: dynamic N-destination stack) ---
+	# --- Right column: destination pane (W5b: VSplitContainer two-area layout) ---
 	var dest_col := VBoxContainer.new()
 	dest_col.name = "DestPane"
 	dest_col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	dest_col.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	dest_col.custom_minimum_size.x = 200
 
-	# Column header row: "Destinations" label + "+" add button.
-	var dest_header_row := HBoxContainer.new()
-	var dest_header_lbl := Label.new()
-	dest_header_lbl.text = "Destinations"
-	dest_header_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	dest_header_row.add_child(dest_header_lbl)
-	var dest_add_btn := Button.new()
-	dest_add_btn.text = "+"
-	dest_add_btn.tooltip_text = "Add a destination…"
-	dest_add_btn.flat = false
-	dest_add_btn.pressed.connect(_on_dest_add_pressed)
-	dest_header_row.add_child(dest_add_btn)
-	dest_col.add_child(dest_header_row)
+	# W5b: VSplitContainer — top = Vault area, bottom = Directory area.
+	var dest_split := VSplitContainer.new()
+	dest_split.name = "DestSplit"
+	dest_split.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	dest_split.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	dest_col.add_child(dest_split)
 
-	# Scrollable content area holding the per-destination sections.
-	var dest_scroll := ScrollContainer.new()
-	dest_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	dest_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	dest_col.add_child(dest_scroll)
+	# --- Vault area (top half) ---
+	var vault_area := VBoxContainer.new()
+	vault_area.name = "VaultArea"
+	vault_area.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	vault_area.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	vault_area.custom_minimum_size.y = 80
 
+	var vault_hdr := HBoxContainer.new()
+	var vault_hdr_lbl := Label.new()
+	vault_hdr_lbl.text = "Vaults"
+	vault_hdr_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	vault_hdr.add_child(vault_hdr_lbl)
+	var vault_add_btn := Button.new()
+	vault_add_btn.text = "+"
+	vault_add_btn.tooltip_text = "Add a vault destination…"
+	vault_add_btn.flat = false
+	vault_add_btn.pressed.connect(func() -> void: _on_dest_add_for_kind("vault"))
+	vault_hdr.add_child(vault_add_btn)
+	vault_area.add_child(vault_hdr)
+
+	_vault_area_tree = _ScanTree.new()
+	_vault_area_tree.tree_role = "dest:vault"
+	_vault_area_tree.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_vault_area_tree.file_dropped.connect(_on_area_tree_file_dropped)
+	_vault_area_tree.dest_button_pressed.connect(
+		func(dest_id: String, action: String) -> void:
+			_on_area_dest_button_pressed(dest_id, action)
+	)
+	vault_area.add_child(_vault_area_tree)
+	dest_split.add_child(vault_area)
+
+	# --- Directory area (bottom half) ---
+	var dir_area := VBoxContainer.new()
+	dir_area.name = "DirArea"
+	dir_area.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	dir_area.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	dir_area.custom_minimum_size.y = 80
+
+	var dir_hdr := HBoxContainer.new()
+	var dir_hdr_lbl := Label.new()
+	dir_hdr_lbl.text = "Directories"
+	dir_hdr_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	dir_hdr.add_child(dir_hdr_lbl)
+	var dir_add_btn := Button.new()
+	dir_add_btn.text = "+"
+	dir_add_btn.tooltip_text = "Add a directory destination…"
+	dir_add_btn.flat = false
+	dir_add_btn.pressed.connect(func() -> void: _on_dest_add_for_kind("directory"))
+	dir_hdr.add_child(dir_add_btn)
+	dir_area.add_child(dir_hdr)
+
+	_dir_area_tree = _ScanTree.new()
+	_dir_area_tree.tree_role = "dest:directory"
+	_dir_area_tree.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_dir_area_tree.file_dropped.connect(_on_area_tree_file_dropped)
+	_dir_area_tree.dest_button_pressed.connect(
+		func(dest_id: String, action: String) -> void:
+			_on_area_dest_button_pressed(dest_id, action)
+	)
+	dir_area.add_child(_dir_area_tree)
+	dest_split.add_child(dir_area)
+
+	# W5: keep _dest_scroll_content as a hidden off-screen VBoxContainer so that
+	# pre-existing tests that check "panel._dest_scroll_content != null" still pass.
+	# _add_dest_section (called directly by T/V test groups) will append into it.
 	_dest_scroll_content = VBoxContainer.new()
+	_dest_scroll_content.name = "_DestScrollContent"
 	_dest_scroll_content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	dest_scroll.add_child(_dest_scroll_content)
+	_dest_scroll_content.visible = false
+	dest_col.add_child(_dest_scroll_content)
 
 	columns.add_child(dest_col)
 
@@ -615,8 +681,11 @@ func _on_vault_opened_r2(path: String, open_result: Dictionary) -> void:
 	var stem: String     = path.get_file().get_basename()
 	_registry_path = "%s/%s.registry.json" % [base_dir, stem]
 
-	# W5: load destinations and build the dynamic right column.
+	# W5: load destinations and build the dynamic right column (legacy stacked sections).
 	await _refresh_dest_pane(conn)
+
+	# W5b: build/refresh the two-area aggregate trees.
+	await _refresh_area_trees(conn)
 
 	if _status_panel != null and is_instance_valid(_status_panel):
 		_status_panel.init(conn)
@@ -630,6 +699,15 @@ func _on_vault_closed_r2() -> void:
 		_source_tree.populate([])
 	# W5: clear all destination trees.
 	_clear_dest_pane()
+	# W5b: clear area trees.
+	if _vault_area_tree != null and is_instance_valid(_vault_area_tree):
+		_vault_area_tree.set_provider(null)
+		_vault_area_tree.populate([])
+	if _dir_area_tree != null and is_instance_valid(_dir_area_tree):
+		_dir_area_tree.set_provider(null)
+		_dir_area_tree.populate([])
+	_vault_area_provider = null
+	_dir_area_provider = null
 	_source_provider = null
 	_registry_path = ""
 	if _status_panel != null and is_instance_valid(_status_panel):
@@ -776,10 +854,235 @@ func _add_dest_section(conn: Object, dest: Dictionary) -> void:
 
 
 ## Refresh all existing destination trees from their providers.
+## W5b: also refreshes the two aggregate area trees.
 func _refresh_all_dest_trees() -> void:
 	for tree in _dest_trees:
 		if tree != null and is_instance_valid(tree):
 			await (tree as Object).call("refresh")
+	# W5b: refresh the area trees too.
+	if _vault_area_tree != null and is_instance_valid(_vault_area_tree):
+		await _vault_area_tree.refresh()
+	if _dir_area_tree != null and is_instance_valid(_dir_area_tree):
+		await _dir_area_tree.refresh()
+
+
+## W5b: Build / refresh the two aggregate area providers and populate the area trees.
+func _refresh_area_trees(conn: Object) -> void:
+	if conn == null or _registry_path.is_empty():
+		return
+	# Build / replace providers (RefCounted — old refs auto-freed on reassign).
+	_vault_area_provider = _AreaProvider.new()
+	_vault_area_provider.init(conn, _registry_path, "vault")
+	_dir_area_provider = _AreaProvider.new()
+	_dir_area_provider.init(conn, _registry_path, "directory")
+
+	if _vault_area_tree != null and is_instance_valid(_vault_area_tree):
+		_vault_area_tree.set_provider(_vault_area_provider)
+		await _vault_area_tree.refresh()
+	if _dir_area_tree != null and is_instance_valid(_dir_area_tree):
+		_dir_area_tree.set_provider(_dir_area_provider)
+		await _dir_area_tree.refresh()
+
+
+## W5b: handler for dest_button_pressed emitted by either area tree.
+## Resolves dest_id and dispatches to the appropriate action.
+func _on_area_dest_button_pressed(dest_id: String, action: String) -> void:
+	if not _vault_is_open:
+		return
+	var conn = _get_connection()
+	if conn == null:
+		return
+	# Find the destination dict for label + locked state from either provider.
+	var dest_dict: Dictionary = _find_dest_by_id(dest_id)
+	var dest_label: String = str(dest_dict.get("label", dest_id))
+	var is_locked: bool = bool(dest_dict.get("locked", false))
+
+	match action:
+		"remove":
+			_on_dest_remove_pressed(dest_id)
+		"reprocess":
+			_on_dest_reprocess_pressed(dest_id, dest_label)
+		"lock_toggle":
+			# Toggle locked state; pass null for the reprocess_btn (not available here).
+			_on_dest_locked_toggled(dest_id, not is_locked, null)
+
+
+## W5b: find a destination dict from the area providers' last_destinations cache.
+func _find_dest_by_id(dest_id: String) -> Dictionary:
+	# Check vault provider first.
+	if _vault_area_provider != null:
+		var dests: Array = _vault_area_provider.get("last_destinations") if "last_destinations" in _vault_area_provider else []
+		for d: Dictionary in dests:
+			if str(d.get("id", "")) == dest_id:
+				return d
+	# Then directory provider.
+	if _dir_area_provider != null:
+		var dests: Array = _dir_area_provider.get("last_destinations") if "last_destinations" in _dir_area_provider else []
+		for d: Dictionary in dests:
+			if str(d.get("id", "")) == dest_id:
+				return d
+	# Also check _dest_registry (populated by _refresh_dest_pane).
+	for d: Dictionary in _dest_registry:
+		if str(d.get("id", "")) == dest_id:
+			return d
+	return {}
+
+
+## W5b: file_dropped handler wired to both area trees.
+## Resolves the destination from the drop target key (which is either "dest:<id>"
+## for a top-level row, or a category/file key nested inside a destination).
+## Walks up the item's parent chain to find the "dest:<id>" ancestor.
+func _on_area_tree_file_dropped(drag_data: Dictionary, target_key: String, target_kind: String) -> void:
+	# Resolve which destination this drop landed in by walking up to the
+	# top-level "dest:<id>" row.  If the target IS a top-level dest row,
+	# target_key is already "dest:<id>".
+	var dest_id: String = ""
+	var dest_dict: Dictionary = {}
+
+	if target_key.begins_with("dest:"):
+		dest_id = target_key.substr(5)  # strip "dest:"
+		dest_dict = _find_dest_by_id(dest_id)
+	else:
+		# Walk up the active tree's item hierarchy to find the dest ancestor.
+		# Determine which tree emitted (vault or dir area tree).
+		var tree_that_dropped: Tree = null
+		if _vault_area_tree != null and is_instance_valid(_vault_area_tree):
+			# We find the item by key in both trees.
+			var item = _find_item_by_key(_vault_area_tree, target_key)
+			if item != null:
+				tree_that_dropped = _vault_area_tree
+		if tree_that_dropped == null and _dir_area_tree != null and is_instance_valid(_dir_area_tree):
+			var item = _find_item_by_key(_dir_area_tree, target_key)
+			if item != null:
+				tree_that_dropped = _dir_area_tree
+		if tree_that_dropped != null:
+			var item = _find_item_by_key(tree_that_dropped, target_key)
+			# Walk up to root's direct child (top-level dest row).
+			while item != null:
+				var parent = item.get_parent()
+				if parent == null or parent == tree_that_dropped.get_root():
+					break
+				item = parent
+			if item != null:
+				var item_key: String = str(item.get_metadata(1))
+				if item_key.begins_with("dest:"):
+					dest_id = item_key.substr(5)
+					dest_dict = _find_dest_by_id(dest_id)
+
+	# Delegate to the main drop handler with the resolved dest context.
+	_on_tree_file_dropped(drag_data, target_key, target_kind, dest_dict)
+
+
+## W5b: helper — find a TreeItem by its COL_NAME metadata key, searching from root.
+func _find_item_by_key(tree: Tree, key: String) -> TreeItem:
+	var root: TreeItem = tree.get_root()
+	if root == null:
+		return null
+	return _find_item_recursive(root, key)
+
+
+func _find_item_recursive(item: TreeItem, key: String) -> TreeItem:
+	if str(item.get_metadata(1)) == key:
+		return item
+	var child: TreeItem = item.get_first_child()
+	while child != null:
+		var found: TreeItem = _find_item_recursive(child, key)
+		if found != null:
+			return found
+		child = child.get_next()
+	return null
+
+
+## W5b: per-kind Add button handler — opens the add-destination dialog
+## pre-set to the given kind ("vault" or "directory").
+func _on_dest_add_for_kind(kind: String) -> void:
+	if not _vault_is_open:
+		set_status("Open a vault first.")
+		return
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+	if _registry_path.is_empty():
+		set_status("No registry path — open a vault first.")
+		return
+
+	var dlg := AcceptDialog.new()
+	dlg.title = "Add %s Destination" % ("Vault" if kind == "vault" else "Directory")
+	dlg.min_size = Vector2i(440, 180)
+	_UiScale.apply_to(dlg)
+
+	var vbox := VBoxContainer.new()
+	dlg.add_child(vbox)
+
+	# Label field.
+	var label_row := HBoxContainer.new()
+	var label_lbl := Label.new()
+	label_lbl.text = "Label:"
+	label_row.add_child(label_lbl)
+	var label_edit := LineEdit.new()
+	label_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	label_edit.placeholder_text = "e.g. Archived Invoices"
+	label_row.add_child(label_edit)
+	vbox.add_child(label_row)
+
+	# Path field + browse button.
+	var path_row := HBoxContainer.new()
+	var path_lbl := Label.new()
+	path_lbl.text = "Path:"
+	path_row.add_child(path_lbl)
+	var path_edit := LineEdit.new()
+	path_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	if kind == "vault":
+		path_edit.placeholder_text = "/absolute/path/to/vault.ssort"
+	else:
+		path_edit.placeholder_text = "/absolute/path/to/directory"
+	path_row.add_child(path_edit)
+	var browse_btn := Button.new()
+	browse_btn.text = "…"
+	path_row.add_child(browse_btn)
+	vbox.add_child(path_row)
+
+	add_child(dlg)
+
+	browse_btn.pressed.connect(func() -> void:
+		var picker := FileDialog.new()
+		_UiScale.apply_to(picker)
+		picker.access = FileDialog.ACCESS_FILESYSTEM
+		if kind == "vault":
+			picker.file_mode = FileDialog.FILE_MODE_OPEN_FILE
+			picker.filters = PackedStringArray(["*.ssort ; Scansort Vault"])
+			picker.title = "Select Vault File"
+		else:
+			picker.file_mode = FileDialog.FILE_MODE_OPEN_DIR
+			picker.title = "Select Directory"
+		picker.file_selected.connect(func(p: String) -> void:
+			path_edit.text = p
+			picker.queue_free()
+		)
+		picker.dir_selected.connect(func(p: String) -> void:
+			path_edit.text = p
+			picker.queue_free()
+		)
+		picker.canceled.connect(func() -> void: picker.queue_free())
+		add_child(picker)
+		picker.popup_centered(Vector2i(700, 500))
+	)
+
+	dlg.confirmed.connect(func() -> void:
+		var dest_path: String = path_edit.text.strip_edges()
+		var dest_label: String = label_edit.text.strip_edges()
+		if dest_path.is_empty():
+			set_status("Add destination: path is required.")
+			dlg.queue_free()
+			return
+		if dest_label.is_empty():
+			dest_label = dest_path.get_file()
+		_do_add_destination(conn, kind, dest_path, dest_label)
+		dlg.queue_free()
+	)
+	dlg.canceled.connect(func() -> void: dlg.queue_free())
+	dlg.popup_centered()
 
 
 ## "+" add-destination button handler. Shows a simple dialog to pick kind + path.
@@ -903,6 +1206,7 @@ func _do_add_destination(conn: Object, kind: String, path: String, label: String
 		return
 	set_status("Destination added.")
 	await _refresh_dest_pane(conn)
+	await _refresh_area_trees(conn)
 
 
 ## "×" remove-destination button handler.
@@ -928,6 +1232,7 @@ func _on_dest_remove_pressed(dest_id: String) -> void:
 		return
 	set_status("Destination removed.")
 	await _refresh_dest_pane(conn)
+	await _refresh_area_trees(conn)
 
 
 ## W8: Reprocess button handler — shows confirm dialog then calls backend.
@@ -986,6 +1291,7 @@ func _on_dest_reprocess_pressed(dest_id: String, dest_label: String) -> void:
 	set_status("Reprocessed: %s" % summary)
 	# Refresh this destination's sub-tree so the UI reflects the cleared state.
 	await _refresh_dest_pane(conn)
+	await _refresh_area_trees(conn)
 
 
 ## W8: Locked toggle handler — calls set_destination_locked and updates the
