@@ -23,6 +23,12 @@ signal selection_changed(key: String)
 ## Emitted whenever any checkbox is toggled.
 signal check_toggled
 
+## Emitted when a file row is dropped onto a folder row in this tree.
+## drag_data: the Dictionary returned by _get_drag_data on the source tree.
+## target_key: the key of the folder item that received the drop.
+## target_kind: always "folder" (only folder rows accept drops).
+signal file_dropped(drag_data: Dictionary, target_key: String, target_kind: String)
+
 # Column indices.
 const COL_CHECK := 0
 const COL_NAME := 1
@@ -32,6 +38,10 @@ const COLOR_FOLDER := Color(0.9, 0.85, 0.6)   # warm yellow
 const COLOR_FILE := Color(0.78, 0.85, 0.78)   # soft green
 
 var _provider: Object = null
+
+## Set by ScansortPanel after construction: "source" or "vault".
+## Used in drag data so the drop handler can distinguish the origin.
+var tree_role: String = ""
 
 
 func _ready() -> void:
@@ -46,6 +56,8 @@ func _ready() -> void:
 	select_mode = Tree.SELECT_ROW
 	size_flags_vertical = Control.SIZE_EXPAND_FILL
 	size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	# Accept drops only directly onto items (folder rows).
+	drop_mode_flags = Tree.DROP_MODE_ON_ITEM
 	item_selected.connect(_on_item_selected)
 	item_edited.connect(_on_item_edited)
 	gui_input.connect(_on_gui_input)
@@ -172,3 +184,49 @@ func _on_gui_input(event: InputEvent) -> void:
 	if get_column_at_position(mb.position) != COL_NAME:
 		return
 	file_activated.emit(str(item.get_metadata(COL_NAME)))
+
+
+# ---------------------------------------------------------------------------
+# Drag-and-drop (U6)
+# ---------------------------------------------------------------------------
+
+## Begin a drag when the user drags a file row.
+## Returns null for folder rows (they are structural, not draggable).
+func _get_drag_data(at_position: Vector2) -> Variant:
+	var item := get_item_at_position(at_position)
+	if item == null:
+		return null
+	if str(item.get_meta("kind", "file")) == "folder":
+		return null
+	var data := {
+		"scan_tree_drag": true,
+		"key":  str(item.get_metadata(COL_NAME)),
+		"role": tree_role,
+	}
+	# Lightweight drag preview — just a label with the item's name text.
+	var label := Label.new()
+	label.text = item.get_text(COL_NAME)
+	set_drag_preview(label)
+	return data
+
+
+## Accept drops only when: data is our dict AND the target row is a folder.
+func _can_drop_data(at_position: Vector2, data: Variant) -> bool:
+	if not (data is Dictionary and data.get("scan_tree_drag", false) == true):
+		return false
+	var target := get_item_at_position(at_position)
+	if target == null:
+		return false
+	return str(target.get_meta("kind", "file")) == "folder"
+
+
+## Emit file_dropped so ScansortPanel can handle classify / reclassify logic.
+func _drop_data(at_position: Vector2, data: Variant) -> void:
+	var target := get_item_at_position(at_position)
+	if target == null or str(target.get_meta("kind", "file")) != "folder":
+		return
+	file_dropped.emit(
+		data as Dictionary,
+		str(target.get_metadata(COL_NAME)),
+		"folder"
+	)

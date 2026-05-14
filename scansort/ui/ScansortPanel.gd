@@ -162,6 +162,17 @@ var _pending_vault_path: String = ""
 var _file_dialog_mode: String = ""  # "open" | "create"
 
 # ---------------------------------------------------------------------------
+# U6: inject-to-chat cache
+# ---------------------------------------------------------------------------
+
+## Pre-extracted text from the checked source files, rebuilt whenever the
+## source-pane checkboxes change.  Empty string = nothing to inject.
+var _inject_payload_cache: String = ""
+
+## True when the user has toggled the inject-to-chat switch on.
+var _inject_enabled: bool = false
+
+# ---------------------------------------------------------------------------
 # Platform hooks
 # ---------------------------------------------------------------------------
 
@@ -232,6 +243,14 @@ func _build_ui() -> void:
 	_status_panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	layout.add_child(_status_panel)
 
+	# U6: assign roles for drag context and wire signals.
+	_source_tree.tree_role = "source"
+	_dest_tree.tree_role   = "vault"
+	# Only the vault tree receives drops (source has no folder rows to land on).
+	_dest_tree.file_dropped.connect(_on_tree_file_dropped)
+	# Rebuild inject payload whenever source checkboxes change.
+	_source_tree.check_toggled.connect(_on_source_check_toggled)
+
 # ---------------------------------------------------------------------------
 # Menu handling
 # ---------------------------------------------------------------------------
@@ -249,6 +268,7 @@ func _on_file_menu_id_pressed(id: int) -> void:
 		9: _on_create_vault_rules_pressed()
 		10: _on_use_library_rules_pressed()
 		11: _on_settings_pressed()
+		12: _on_export_marked_pressed()
 
 
 func _on_new_vault_pressed() -> void:
@@ -1384,6 +1404,8 @@ func get_editor_actions() -> Array:
 	popup.add_separator()
 	popup.add_item("Settings...", 11)
 	popup.add_separator()
+	popup.add_item("Export Marked to Disk...", 12)
+	popup.add_separator()
 	popup.add_item("Close Vault", 2)
 	popup.id_pressed.connect(_on_file_menu_id_pressed)
 	# Cache the popup so vault state changes can grey out gated items.
@@ -1406,7 +1428,7 @@ func get_editor_actions() -> Array:
 func _refresh_chrome_menu_state() -> void:
 	if _chrome_popup == null or not is_instance_valid(_chrome_popup):
 		return
-	var vault_gated: Array[int] = [2, 3, 4, 7, 9, 10]
+	var vault_gated: Array[int] = [2, 3, 4, 7, 9, 10, 12]
 	for item_id in vault_gated:
 		var idx: int = _chrome_popup.get_item_index(item_id)
 		if idx >= 0:
@@ -1414,6 +1436,243 @@ func _refresh_chrome_menu_state() -> void:
 	# U5: enable Process All when a vault is open (and no run is in progress).
 	if _process_btn != null and is_instance_valid(_process_btn):
 		_process_btn.disabled = not _vault_is_open
+
+
+# ---------------------------------------------------------------------------
+# U6: drag-to-classify / drag-to-reclassify
+# ---------------------------------------------------------------------------
+
+## Handles drops from either tree onto a vault category folder.
+## drag_data.role == "source"  → classify source file into target category.
+## drag_data.role == "vault"   → reclassify vault document to target category.
+func _on_tree_file_dropped(drag_data: Dictionary, target_key: String, _target_kind: String) -> void:
+	if not _vault_is_open:
+		set_status("Open a vault first.")
+		return
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+
+	var category: String = target_key.substr(4)  # strip "cat:" prefix
+	var role: String     = str(drag_data.get("role", ""))
+	var drag_key: String = str(drag_data.get("key", ""))
+
+	if role == "source":
+		# Drag-to-classify: source file path → insert with user-assigned category.
+		var fname: String = drag_key.get_file()
+
+		# Extract text + fingerprints.
+		var extract_res: Dictionary = await conn.call_tool(
+			"minerva_scansort_extract_text",
+			{"file_path": drag_key}
+		)
+		if not extract_res.get("success", false):
+			set_status("ERROR: extraction failed — %s" % str(extract_res.get("error", "unknown")))
+			return
+
+		var sha256:  String = str(extract_res.get("sha256",  ""))
+		var simhash: String = str(extract_res.get("simhash", "0000000000000000"))
+		var dhash:   String = str(extract_res.get("dhash",   "0000000000000000"))
+
+		# Dedup check.
+		var dup_res: Dictionary = await conn.call_tool(
+			"minerva_scansort_check_sha256",
+			{"vault_path": _active_vault_path, "sha256": sha256}
+		)
+		if dup_res.get("found", false):
+			set_status("Already in vault.")
+			return
+
+		# Insert with user-assigned category (no AI classify step).
+		var insert_args: Dictionary = {
+			"vault_path":    _active_vault_path,
+			"file_path":     drag_key,
+			"category":      category,
+			"confidence":    1.0,
+			"sender":        "",
+			"description":   "",
+			"doc_date":      "",
+			"status":        "classified",
+			"sha256":        sha256,
+			"simhash":       simhash,
+			"dhash":         dhash,
+			"source_path":   drag_key,
+			"rule_snapshot": "",
+		}
+		if not _vault_password.is_empty():
+			insert_args["password"] = _vault_password
+
+		var insert_res: Dictionary = await conn.call_tool(
+			"minerva_scansort_insert_document",
+			insert_args
+		)
+		if not insert_res.get("ok", false):
+			set_status("ERROR: insert failed — %s" % str(insert_res.get("error", "unknown")))
+			return
+
+		set_status("Filed %s → %s" % [fname, category])
+		if _dest_tree != null and is_instance_valid(_dest_tree):
+			await _dest_tree.refresh()
+		if _source_tree != null and is_instance_valid(_source_tree):
+			await _source_tree.refresh()
+
+	elif role == "vault":
+		# Drag-to-reclassify: doc:<id> → update category.
+		var doc_id: int = int(drag_key.substr(4))  # strip "doc:" prefix
+		var upd_args: Dictionary = {
+			"vault_path": _active_vault_path,
+			"doc_id":     doc_id,
+			"category":   category,
+		}
+		if not _vault_password.is_empty():
+			upd_args["password"] = _vault_password
+
+		var upd_res: Dictionary = await conn.call_tool(
+			"minerva_scansort_update_document",
+			upd_args
+		)
+		if not upd_res.get("ok", false):
+			set_status("ERROR: reclassify failed — %s" % str(upd_res.get("error", "unknown")))
+			return
+
+		set_status("Reclassified → %s" % category)
+		if _dest_tree != null and is_instance_valid(_dest_tree):
+			await _dest_tree.refresh()
+
+
+# ---------------------------------------------------------------------------
+# U6: Export Marked to Disk
+# ---------------------------------------------------------------------------
+
+## Copies every checked vault document to the configured disk root.
+## One failure does NOT abort the loop — counts are summarised at the end.
+## Checkboxes are left as-is (they clear naturally on the next tree refresh).
+func _on_export_marked_pressed() -> void:
+	if not _vault_is_open:
+		set_status("Open a vault first.")
+		return
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+
+	var keys: Array = _dest_tree.get_checked_keys() if _dest_tree != null and is_instance_valid(_dest_tree) else []
+	if keys.is_empty():
+		set_status("No documents marked for export.")
+		return
+
+	var exported: int = 0
+	var failed: int   = 0
+	var skipped: int  = 0
+
+	for key: String in keys:
+		if not key.begins_with("doc:"):
+			skipped += 1
+			continue
+		var doc_id: int = int(key.substr(4))
+
+		# Fetch document metadata for source_path and doc_date.
+		var doc_args: Dictionary = {"vault_path": _active_vault_path, "doc_id": doc_id}
+		if not _vault_password.is_empty():
+			doc_args["password"] = _vault_password
+
+		var doc_res: Dictionary = await conn.call_tool("minerva_scansort_get_document", doc_args)
+		if not doc_res.get("ok", false):
+			push_warning("[ScansortPanel] export: get_document failed for doc_id %d: %s" % [
+				doc_id, str(doc_res.get("error", "unknown"))
+			])
+			failed += 1
+			continue
+
+		var document: Dictionary = doc_res.get("document", {})
+		var source_path: String  = str(document.get("source_path", ""))
+		var doc_date: String     = str(document.get("doc_date", ""))
+
+		if source_path.is_empty():
+			# Original file gone — can't export.
+			skipped += 1
+			continue
+
+		var place_args: Dictionary = {
+			"vault_path": _active_vault_path,
+			"file_path":  source_path,
+			"subfolder":  "{year}",
+			"doc_date":   doc_date,
+		}
+		if not _vault_password.is_empty():
+			place_args["password"] = _vault_password
+
+		var place_res: Dictionary = await conn.call_tool("minerva_scansort_place_on_disk", place_args)
+		if place_res.has("error"):
+			push_warning("[ScansortPanel] export: place_on_disk failed for doc %d: %s" % [
+				doc_id, str(place_res.get("error", "unknown"))
+			])
+			failed += 1
+			continue
+
+		exported += 1
+
+	set_status("Exported %d, %d failed, %d skipped" % [exported, failed, skipped])
+
+
+# ---------------------------------------------------------------------------
+# U6: inject-to-chat
+# ---------------------------------------------------------------------------
+
+## Called when source-pane checkboxes change.
+## Rebuilds _inject_payload_cache from the extracted text of all checked files.
+## Async — each file may require an MCP round-trip.
+func _on_source_check_toggled() -> void:
+	var conn = _get_connection()
+	if conn == null:
+		_inject_payload_cache = ""
+		return
+
+	var keys: Array = _source_tree.get_checked_keys() if _source_tree != null and is_instance_valid(_source_tree) else []
+	if keys.is_empty():
+		_inject_payload_cache = ""
+		return
+
+	const MAX_FILE_CHARS := 20000
+	var blob: String = ""
+
+	for file_path: String in keys:
+		var extract_res: Dictionary = await conn.call_tool(
+			"minerva_scansort_extract_text",
+			{"file_path": file_path}
+		)
+		if not extract_res.get("success", false):
+			continue
+		var text: String = str(extract_res.get("full_text", ""))
+		if text.length() > MAX_FILE_CHARS:
+			text = text.substr(0, MAX_FILE_CHARS) + "\n…[truncated]"
+		blob += "=== %s ===\n%s\n\n" % [file_path.get_file(), text]
+
+	_inject_payload_cache = blob
+
+
+## Platform hook: called when the user toggles the inject-to-chat switch.
+## If enabled but no source files are checked yet, nudges the user.
+func _on_panel_inject_toggle_changed(enabled: bool) -> void:
+	_inject_enabled = enabled
+	if enabled and _inject_payload_cache.is_empty():
+		set_status("Inject to Chat: check source files first.")
+
+
+## Platform hook: called synchronously when a note is requested for chat injection.
+## MUST NOT use await — PluginScenePanelHost.invoke_create_note does not await it.
+## Returns null when no cache is ready (platform falls back to a screenshot).
+## Returns a text-kind payload dict that Editor._build_note_from_plugin_payload
+## recognises when the cache is populated.
+func _on_panel_create_note_request(_ctx: Dictionary) -> Variant:
+	if _inject_payload_cache.is_empty():
+		return null
+	return {
+		"kind":    "text",
+		"title":   "Scansort source files",
+		"content": _inject_payload_cache,
+	}
 
 
 func set_status(text: String) -> void:
