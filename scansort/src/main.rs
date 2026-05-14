@@ -26,6 +26,7 @@ mod checklists;
 mod classifier;
 mod crypto;
 mod db;
+mod destination;
 mod documents;
 mod extract;
 mod fingerprints;
@@ -1196,6 +1197,80 @@ fn handle_list_source_files(params: &Value, id: Value) -> RpcResponse {
     }
 }
 
+fn handle_set_destination(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let vault_path = args.get("vault_path").and_then(|v| v.as_str()).unwrap_or("");
+    let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+    let disk_root = args.get("disk_root").and_then(|v| v.as_str());
+    if vault_path.is_empty() {
+        return ok_response(id, tool_err("vault_path is required"));
+    }
+    if mode.is_empty() {
+        return ok_response(id, tool_err("mode is required"));
+    }
+    match destination::set_destination(vault_path, mode, disk_root) {
+        Ok(()) => ok_response(
+            id,
+            tool_ok(json!({
+                "ok": true,
+                "mode": mode,
+                "disk_root": disk_root.unwrap_or(""),
+            })),
+        ),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_get_destination(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let vault_path = args.get("vault_path").and_then(|v| v.as_str()).unwrap_or("");
+    if vault_path.is_empty() {
+        return ok_response(id, tool_err("vault_path is required"));
+    }
+    match destination::get_destination(vault_path) {
+        Ok((mode, disk_root)) => ok_response(
+            id,
+            tool_ok(json!({
+                "ok": true,
+                "mode": mode,
+                "disk_root": disk_root,
+            })),
+        ),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_place_on_disk(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let vault_path = args.get("vault_path").and_then(|v| v.as_str()).unwrap_or("");
+    let file_path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+    let subfolder = args.get("subfolder").and_then(|v| v.as_str()).unwrap_or("");
+    let doc_date = args.get("doc_date").and_then(|v| v.as_str()).unwrap_or("");
+    let rename_pattern = args.get("rename_pattern").and_then(|v| v.as_str());
+    if vault_path.is_empty() {
+        return ok_response(id, tool_err("vault_path is required"));
+    }
+    if file_path.is_empty() {
+        return ok_response(id, tool_err("file_path is required"));
+    }
+    if subfolder.is_empty() {
+        return ok_response(id, tool_err("subfolder is required"));
+    }
+    if doc_date.is_empty() {
+        return ok_response(id, tool_err("doc_date is required"));
+    }
+    match destination::place_on_disk(vault_path, file_path, subfolder, doc_date, rename_pattern) {
+        Ok(placed_path) => ok_response(
+            id,
+            tool_ok(json!({
+                "ok": true,
+                "placed_path": placed_path.to_string_lossy(),
+            })),
+        ),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
 fn main() {
     // Logging goes to stderr so it never pollutes the JSON-RPC stdout channel.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -1737,6 +1812,45 @@ fn main() {
                             "required": [],
                         },
                     },
+                    {
+                        "name": "minerva_scansort_set_destination",
+                        "description": "Persist the destination mode for a vault. mode must be vault_only, disk_only, or vault_and_disk. disk_root is required (non-empty) for disk_only and vault_and_disk. Returns {ok, mode, disk_root}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "vault_path": {"type": "string", "description": "Absolute path to the .ssort vault file."},
+                                "mode": {"type": "string", "description": "One of: vault_only, disk_only, vault_and_disk."},
+                                "disk_root": {"type": "string", "description": "Absolute path to the on-disk destination directory. Required for disk_only and vault_and_disk."},
+                            },
+                            "required": ["vault_path", "mode"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_get_destination",
+                        "description": "Read the persisted destination settings for a vault. Defaults to {mode: vault_only, disk_root: ''} when unset. Returns {ok, mode, disk_root}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "vault_path": {"type": "string", "description": "Absolute path to the .ssort vault file."},
+                            },
+                            "required": ["vault_path"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_place_on_disk",
+                        "description": "Copy a file to its resolved on-disk location under the vault's configured disk_root. Resolves {year} and {date} templates in subfolder and rename_pattern. Creates missing directories. Collision-safe (appends (1), (2), … before extension). Returns {ok, placed_path}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "vault_path": {"type": "string", "description": "Absolute path to the .ssort vault file."},
+                                "file_path": {"type": "string", "description": "Absolute path to the source file to copy."},
+                                "subfolder": {"type": "string", "description": "Subdirectory under disk_root. Supports {year} and {date} templates."},
+                                "doc_date": {"type": "string", "description": "ISO date string (YYYY-MM-DD) used to resolve {year} and {date} templates."},
+                                "rename_pattern": {"type": "string", "description": "Optional base-name pattern (extension preserved). Supports {year} and {date}. Omit to keep the original filename."},
+                            },
+                            "required": ["vault_path", "file_path", "subfolder", "doc_date"],
+                        },
+                    },
                 ]
             })),
 
@@ -1853,6 +1967,15 @@ fn main() {
                     }
                     "minerva_scansort_list_source_files" => {
                         handle_list_source_files(&req.params, req.id)
+                    }
+                    "minerva_scansort_set_destination" => {
+                        handle_set_destination(&req.params, req.id)
+                    }
+                    "minerva_scansort_get_destination" => {
+                        handle_get_destination(&req.params, req.id)
+                    }
+                    "minerva_scansort_place_on_disk" => {
+                        handle_place_on_disk(&req.params, req.id)
                     }
                     other => err_response(req.id, -32601, format!("unknown tool: {other}")),
                 }
