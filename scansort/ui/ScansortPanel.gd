@@ -681,10 +681,31 @@ func _on_vault_opened_r2(path: String, open_result: Dictionary) -> void:
 	var stem: String     = path.get_file().get_basename()
 	_registry_path = "%s/%s.registry.json" % [base_dir, stem]
 
+	# W5c: auto-register the open vault as a machine-local routing target.
+	# This is idempotent — "already registered" errors are treated as success.
+	# The area tree rendering (below) does NOT depend on this succeeding.
+	if conn != null and not _registry_path.is_empty():
+		var vault_label: String = path.get_file().get_basename()
+		var reg_result: Dictionary = await conn.call_tool(
+			"minerva_scansort_destination_add",
+			{
+				"registry_path": _registry_path,
+				"kind":          "vault",
+				"path":          path,
+				"label":         vault_label,
+			},
+		)
+		if not reg_result.get("ok", false):
+			var reg_err: String = str(reg_result.get("error", ""))
+			if not reg_err.contains("already registered"):
+				push_warning("[ScansortPanel] auto-register vault failed: %s" % reg_err)
+			# Either already registered (idempotent OK) or warning logged — continue either way.
+
 	# W5: load destinations and build the dynamic right column (legacy stacked sections).
 	await _refresh_dest_pane(conn)
 
-	# W5b: build/refresh the two-area aggregate trees.
+	# W5b / W5c: build/refresh the two-area aggregate trees.
+	# The vault area renders the open vault directly from its file; no registry dependency.
 	await _refresh_area_trees(conn)
 
 	if _status_panel != null and is_instance_valid(_status_panel):
@@ -866,13 +887,17 @@ func _refresh_all_dest_trees() -> void:
 		await _dir_area_tree.refresh()
 
 
-## W5b: Build / refresh the two aggregate area providers and populate the area trees.
+## W5b / W5c: Build / refresh the two aggregate area providers and populate the area trees.
+## For the vault area the open vault path is passed explicitly so it is always
+## rendered directly from its file (W5c — not registry-dependent).
 func _refresh_area_trees(conn: Object) -> void:
-	if conn == null or _registry_path.is_empty():
+	if conn == null:
 		return
+	# Vault area requires an open vault path (W5c); directory area requires a registry path.
+	# Either can be empty without crashing — the providers return [] gracefully.
 	# Build / replace providers (RefCounted — old refs auto-freed on reassign).
 	_vault_area_provider = _AreaProvider.new()
-	_vault_area_provider.init(conn, _registry_path, "vault")
+	_vault_area_provider.init(conn, _registry_path, "vault", _active_vault_path)
 	_dir_area_provider = _AreaProvider.new()
 	_dir_area_provider.init(conn, _registry_path, "directory")
 

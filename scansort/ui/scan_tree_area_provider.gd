@@ -1,6 +1,15 @@
 extends "scan_tree_provider.gd"
 ## Aggregate scan_tree provider for a destination area (vault OR directory kind).
 ##
+## For vault areas: the currently-open vault is ALWAYS rendered first, sourced
+## directly from its file path (via query_documents on that path).  This
+## ensures vault contents are visible even when the destination registry is
+## empty, stale, or on a different machine.  Registry vault destinations that
+## are NOT the open vault are appended after it (deduped by path).
+##
+## For directory areas: behaves as before — renders all "directory" entries
+## from the destination registry.
+##
 ## Calls minerva_scansort_destination_list, filters by `area_kind`, and builds
 ## a virtual-root node list where each top-level entry is one destination of
 ## that kind.  The destination row is a folder node with key "dest:<id>" and
@@ -18,16 +27,22 @@ extends "scan_tree_provider.gd"
 var _conn: Object = null
 var _registry_path: String = ""
 var _area_kind: String = ""  # "vault" or "directory"
+## For vault areas: the currently-open vault path.  Always rendered first,
+## regardless of whether it appears in the registry.  Empty = no open vault.
+var _open_vault_path: String = ""
 
 ## Latest destination list fetched (used by the panel to resolve dest_id from key).
 var last_destinations: Array = []
 
 
 ## Attach connection + registry path + area kind.  Call before get_tree_data().
-func init(conn: Object, registry_path: String, area_kind: String) -> void:
+## open_vault_path: for vault areas, pass the currently-open vault path so it
+## is always rendered directly from its file (W5c).  Ignored for directory areas.
+func init(conn: Object, registry_path: String, area_kind: String, open_vault_path: String = "") -> void:
 	_conn = conn
 	_registry_path = registry_path
 	_area_kind = area_kind
+	_open_vault_path = open_vault_path
 
 
 func get_source_label() -> String:
@@ -35,47 +50,105 @@ func get_source_label() -> String:
 
 
 func get_tree_data() -> Array:
-	if _conn == null or _registry_path.is_empty():
+	if _conn == null:
 		return []
 
-	var result: Dictionary = await _conn.call_tool(
-		"minerva_scansort_destination_list",
-		{"registry_path": _registry_path},
-	)
-	if not result.get("ok", false):
-		push_warning("[AreaProvider] destination_list failed: %s" % result.get("error", "unknown"))
+	# W5c: For vault areas, the open vault is always rendered regardless of the
+	# registry.  We need a conn but do NOT require a registry_path to show the
+	# open vault row.  Directory areas do require the registry to be set.
+	if _area_kind == "vault" and _open_vault_path.is_empty():
+		# No vault open — nothing to show even if registry has entries.
+		return []
+	if _area_kind == "directory" and _registry_path.is_empty():
 		return []
 
-	var all_dests: Array = result.get("destinations", [])
+	# Fetch the registry destination list (best-effort; may return empty on
+	# first open before auto-registration completes, or on a different machine).
+	var all_dests: Array = []
+	if not _registry_path.is_empty():
+		var result: Dictionary = await _conn.call_tool(
+			"minerva_scansort_destination_list",
+			{"registry_path": _registry_path},
+		)
+		if result.get("ok", false):
+			all_dests = result.get("destinations", [])
+		else:
+			push_warning("[AreaProvider] destination_list failed: %s" % result.get("error", "unknown"))
 	last_destinations = all_dests.duplicate(true)
 
 	var nodes: Array = []
-	for dest: Dictionary in all_dests:
-		var kind: String = str(dest.get("kind", ""))
-		if kind != _area_kind:
-			continue
-		var dest_id: String  = str(dest.get("id", ""))
-		var label: String    = str(dest.get("label", dest.get("path", dest_id)))
-		var is_locked: bool  = bool(dest.get("locked", false))
 
-		# Fetch children for this destination.
-		var children: Array = []
-		if kind == "vault":
-			children = await _get_vault_children(dest)
-		elif kind == "directory":
-			children = await _get_directory_children(dest)
+	if _area_kind == "vault":
+		# --- W5c: open vault row always first, sourced directly from file ---
+		# Find registry entry for the open vault (for dest_id + locked state).
+		var open_dest_id: String  = ""
+		var open_locked: bool     = false
+		var open_label: String    = _open_vault_path.get_file().get_basename()
+		for dest: Dictionary in all_dests:
+			if str(dest.get("kind", "")) == "vault" and str(dest.get("path", "")) == _open_vault_path:
+				open_dest_id = str(dest.get("id", ""))
+				open_locked  = bool(dest.get("locked", false))
+				var dlabel: String = str(dest.get("label", ""))
+				if not dlabel.is_empty():
+					open_label = dlabel
+				break
+
+		# Build children by querying the vault file directly.
+		var open_children: Array = await _get_vault_children_by_path(_open_vault_path)
 
 		nodes.append({
 			"kind":     "folder",
-			"name":     label,
-			"key":      "dest:%s" % dest_id,
+			"name":     open_label,
+			"key":      "dest:%s" % (open_dest_id if not open_dest_id.is_empty() else _open_vault_path),
 			"date":     "",
-			"tooltip":  label,
-			"children": children,
-			# Extra fields consumed by scan_tree._add_node to place inline buttons.
-			"dest_id":  dest_id,
-			"locked":   is_locked,
+			"tooltip":  _open_vault_path,
+			"children": open_children,
+			"dest_id":  open_dest_id,
+			"locked":   open_locked,
 		})
+
+		# Append any OTHER registry vault destinations (deduped: skip open vault).
+		for dest: Dictionary in all_dests:
+			var kind: String = str(dest.get("kind", ""))
+			if kind != "vault":
+				continue
+			var dest_path: String = str(dest.get("path", ""))
+			if dest_path == _open_vault_path:
+				continue  # already rendered above
+			var dest_id: String  = str(dest.get("id", ""))
+			var label: String    = str(dest.get("label", dest.get("path", dest_id)))
+			var is_locked: bool  = bool(dest.get("locked", false))
+			var children: Array  = await _get_vault_children(dest)
+			nodes.append({
+				"kind":     "folder",
+				"name":     label,
+				"key":      "dest:%s" % dest_id,
+				"date":     "",
+				"tooltip":  label,
+				"children": children,
+				"dest_id":  dest_id,
+				"locked":   is_locked,
+			})
+	else:
+		# Directory area: registry-driven (unchanged from W5b).
+		for dest: Dictionary in all_dests:
+			var kind: String = str(dest.get("kind", ""))
+			if kind != _area_kind:
+				continue
+			var dest_id: String  = str(dest.get("id", ""))
+			var label: String    = str(dest.get("label", dest.get("path", dest_id)))
+			var is_locked: bool  = bool(dest.get("locked", false))
+			var children: Array  = await _get_directory_children(dest)
+			nodes.append({
+				"kind":     "folder",
+				"name":     label,
+				"key":      "dest:%s" % dest_id,
+				"date":     "",
+				"tooltip":  label,
+				"children": children,
+				"dest_id":  dest_id,
+				"locked":   is_locked,
+			})
 
 	return nodes
 
@@ -83,6 +156,23 @@ func get_tree_data() -> Array:
 # ---------------------------------------------------------------------------
 # Per-destination child fetching (mirrors scan_tree_destination_provider.gd)
 # ---------------------------------------------------------------------------
+
+## W5c: fetch vault children directly from a vault path (bypasses registry).
+## Used for the always-present open vault row.
+func _get_vault_children_by_path(vault_path: String) -> Array:
+	if vault_path.is_empty():
+		return []
+
+	var result: Dictionary = await _conn.call_tool(
+		"minerva_scansort_query_documents",
+		{"vault_path": vault_path},
+	)
+	if not result.get("ok", false):
+		push_warning("[AreaProvider] open vault query_documents failed: %s" % result.get("error", "unknown"))
+		return []
+
+	return _build_category_nodes(result.get("documents", []))
+
 
 func _get_vault_children(dest: Dictionary) -> Array:
 	var vault_path: String = str(dest.get("path", ""))
@@ -97,7 +187,12 @@ func _get_vault_children(dest: Dictionary) -> Array:
 		push_warning("[AreaProvider] vault query_documents failed: %s" % result.get("error", "unknown"))
 		return []
 
-	var docs: Array = result.get("documents", [])
+	return _build_category_nodes(result.get("documents", []))
+
+
+## Build a category→document tree from a flat documents array.
+## Shared by both _get_vault_children and _get_vault_children_by_path.
+func _build_category_nodes(docs: Array) -> Array:
 	var by_category: Dictionary = {}
 	for doc: Dictionary in docs:
 		var cat: String = str(doc.get("category", "uncategorized"))
