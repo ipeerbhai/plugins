@@ -60,6 +60,7 @@ const _VaultRegistryDialog: Script = preload("vault_registry_dialog.gd")
 
 ## R6: checklist dialog (off-tree: no class_name).
 const _ChecklistDialog: Script = preload("checklist_dialog.gd")
+const _SettingsDialog: Script  = preload("settings_dialog.gd")
 
 # ---------------------------------------------------------------------------
 # Signals
@@ -225,6 +226,7 @@ func _on_file_menu_id_pressed(id: int) -> void:
 		8: _on_library_rules_editor_pressed()
 		9: _on_create_vault_rules_pressed()
 		10: _on_use_library_rules_pressed()
+		11: _on_settings_pressed()
 
 
 func _on_new_vault_pressed() -> void:
@@ -975,13 +977,24 @@ func _on_vault_registry_pressed() -> void:
 
 ## R9: Resolve the model spec to use for classify_document calls.
 ## Returns {model_spec: Dictionary} — reads from the chrome OptionButton
-## Inherits the chat panel's currently-selected model spec.
+## Resolves the classification model spec.
 ##
-## Returns {"model_spec": Dictionary} — empty Dict when chat isn't initialized
-## (headless tests / SingletonObject absent) or no model is selected. The
-## caller's classify call site guards against an empty spec to preserve the
-## broker's safe-fallback behavior.
+## Precedence:
+##   1. Per-plugin user override stored in scansort_settings.json (set via
+##      the Settings dialog). Travels across vaults.
+##   2. Chat panel's currently-selected model (inherit mode — the default).
+##
+## Returns {"model_spec": Dictionary} — empty Dict when neither layer
+## supplies a spec (headless tests / no chat / inherit + chat unset). The
+## caller's classify call site drops empty specs from args (broker rejects
+## empty {} as "unknown kind").
 func _resolve_chat_model_for_classify() -> Dictionary:
+	# Layer 1: per-plugin override.
+	var override: Dictionary = _SettingsDialog.ScansortSettings.load_model_override()
+	if not override.is_empty():
+		return {"model_spec": override}
+
+	# Layer 2: inherit chat panel's current selection.
 	var so = Engine.get_main_loop().root.get_node_or_null("SingletonObject") if Engine.get_main_loop() != null else null
 	if so == null:
 		return {"model_spec": {}}
@@ -991,6 +1004,27 @@ func _resolve_chat_model_for_classify() -> Dictionary:
 	var spec = chats.get_active_model_spec()
 	var dict_spec: Dictionary = spec as Dictionary if spec is Dictionary else {}
 	return {"model_spec": dict_spec}
+
+
+## Called when user picks "Settings…" from the File menu (id 11).
+## Always available — settings are user-level, not vault-gated.
+func _on_settings_pressed() -> void:
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+	var dlg = _SettingsDialog.new()
+	add_child(dlg)
+	dlg.init(conn)
+	dlg.settings_changed.connect(
+		func() -> void:
+			set_status("Scansort settings saved.")
+	)
+	dlg.closed.connect(
+		func() -> void:
+			dlg.queue_free()
+	)
+	dlg.popup_centered(Vector2i(520, 240))
 
 
 # ---------------------------------------------------------------------------
@@ -1067,6 +1101,8 @@ func get_editor_actions() -> Array:
 	popup.add_separator()
 	popup.add_item("Vault Registry...", 5)
 	popup.add_item("Checklist...", 7)
+	popup.add_separator()
+	popup.add_item("Settings...", 11)
 	popup.add_separator()
 	popup.add_item("Close Vault", 2)
 	popup.id_pressed.connect(_on_file_menu_id_pressed)
