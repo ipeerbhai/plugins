@@ -5,7 +5,9 @@
 //! provided by the host. Schema mirrors the experiment's
 //! `user://scansort_rules.json` format so files port forward.
 
-use crate::types::{Rule, VaultError, VaultResult};
+use crate::db;
+use crate::types::{now_iso, Rule, VaultError, VaultResult};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -263,6 +265,167 @@ pub fn remove(file: &mut RulesFile, label: &str) -> bool {
             true
         }
         None => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R5: Vault → Sibling rules migration
+// ---------------------------------------------------------------------------
+
+/// Outcome of `migrate_embedded_to_sibling` — what the legacy-rules export
+/// step did (or didn't do) for a given vault.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum MigrationOutcome {
+    /// The embedded `rules` table had no rows — nothing to migrate.
+    NoLegacyRules,
+    /// Wrote N rules from the embedded table to a brand-new sibling file.
+    Exported { count: usize, sibling: PathBuf },
+    /// Sibling exists and contains an equivalent rule set — no action.
+    SiblingMatches { sibling: PathBuf },
+    /// Sibling exists and diverges from the embedded table.
+    /// Caller (UI) decides how to resolve. Leaves both stores untouched.
+    Divergent {
+        sibling: PathBuf,
+        embedded_count: usize,
+        sibling_count: usize,
+    },
+}
+
+/// Read the legacy embedded `rules` table directly from a vault connection
+/// and convert to FileRule shape. Used by `migrate_embedded_to_sibling`.
+fn read_embedded_rules(conn: &Connection) -> VaultResult<Vec<FileRule>> {
+    let mut stmt = conn.prepare(
+        "SELECT label, name, instruction, signals, subfolder, rename_pattern, \
+         confidence_threshold, encrypt, enabled, is_default \
+         FROM rules ORDER BY rule_id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let signals_raw: Option<String> = row.get("signals")?;
+        let signals: Vec<String> = signals_raw
+            .map(|s| db::parse_json_array(&s))
+            .unwrap_or_default();
+        Ok(FileRule {
+            label: db::get_string(row, "label"),
+            name: db::get_string(row, "name"),
+            instruction: db::get_string(row, "instruction"),
+            signals,
+            subfolder: db::get_string(row, "subfolder"),
+            rename_pattern: db::get_string(row, "rename_pattern"),
+            confidence_threshold: db::get_f64(row, "confidence_threshold"),
+            encrypt: db::get_bool(row, "encrypt"),
+            enabled: db::get_bool(row, "enabled"),
+            is_default: db::get_bool(row, "is_default"),
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Compare a sibling file's rules with the embedded table's rules.
+///
+/// Returns true if they diverge in any content field. Order is ignored
+/// (compared by label). rule_id is ignored (file format has no PK).
+fn rules_diverge(file_rules: &[FileRule], embedded: &[FileRule]) -> bool {
+    if file_rules.len() != embedded.len() {
+        return true;
+    }
+    let mut by_label: std::collections::HashMap<&str, &FileRule> =
+        std::collections::HashMap::new();
+    for r in file_rules {
+        by_label.insert(r.label.as_str(), r);
+    }
+    for er in embedded {
+        match by_label.get(er.label.as_str()) {
+            None => return true,
+            Some(fr) => {
+                if fr.name != er.name
+                    || fr.instruction != er.instruction
+                    || fr.signals != er.signals
+                    || fr.subfolder != er.subfolder
+                    || fr.rename_pattern != er.rename_pattern
+                    || (fr.confidence_threshold - er.confidence_threshold).abs() > 1e-9
+                    || fr.encrypt != er.encrypt
+                    || fr.enabled != er.enabled
+                    || fr.is_default != er.is_default
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// On first 1.1.0 open of a legacy vault, export the embedded `rules` table
+/// to the sibling `<vault-stem>.rules.json` (if it doesn't yet exist).
+///
+/// Behavior:
+/// - No legacy rules → returns NoLegacyRules, no side-effects.
+/// - Sibling doesn't exist → writes it, records `rules_exported_at`/
+///   `rules_exported_to` in project keys, returns Exported.
+/// - Sibling exists and matches → records `rules_exported_at`, returns SiblingMatches.
+/// - Sibling exists and diverges → records `rules_divergence_detected*` project
+///   keys, returns Divergent. Caller (UI) decides resolution.
+///
+/// The embedded `rules` table is left in place in all cases — it remains
+/// readable by deprecated tools and external SQLite browsers.
+pub fn migrate_embedded_to_sibling(
+    conn: &Connection,
+    vault_path: &str,
+) -> VaultResult<MigrationOutcome> {
+    if vault_path.is_empty() {
+        return Ok(MigrationOutcome::NoLegacyRules);
+    }
+    let embedded = read_embedded_rules(conn)?;
+    if embedded.is_empty() {
+        return Ok(MigrationOutcome::NoLegacyRules);
+    }
+
+    let sibling = sibling_path(Path::new(vault_path));
+
+    if !sibling.exists() {
+        let mut file = RulesFile::default();
+        for r in embedded.iter().cloned() {
+            file.rules.push(r);
+        }
+        let count = file.rules.len();
+        save(&sibling, &file)?;
+        db::set_project_key(conn, "rules_exported_at", &now_iso())?;
+        db::set_project_key(conn, "rules_exported_to", &sibling.to_string_lossy())?;
+        return Ok(MigrationOutcome::Exported { count, sibling });
+    }
+
+    // Sibling exists — compare for divergence.
+    match load(&sibling) {
+        Ok(existing) => {
+            if rules_diverge(&existing.rules, &embedded) {
+                db::set_project_key(conn, "rules_divergence_detected", "true")?;
+                db::set_project_key(conn, "rules_divergence_detected_at", &now_iso())?;
+                db::set_project_key(conn, "rules_divergence_sibling", &sibling.to_string_lossy())?;
+                Ok(MigrationOutcome::Divergent {
+                    sibling,
+                    embedded_count: embedded.len(),
+                    sibling_count: existing.rules.len(),
+                })
+            } else {
+                // No-op match — mark export step as completed.
+                db::set_project_key(conn, "rules_exported_at", &now_iso())?;
+                db::set_project_key(conn, "rules_exported_to", &sibling.to_string_lossy())?;
+                Ok(MigrationOutcome::SiblingMatches { sibling })
+            }
+        }
+        Err(_) => {
+            // Sibling exists but failed to parse — treat as divergent so the UI
+            // can prompt the user; don't overwrite a potentially-edited file
+            // the user cares about.
+            db::set_project_key(conn, "rules_divergence_detected", "true")?;
+            db::set_project_key(conn, "rules_divergence_detected_at", &now_iso())?;
+            db::set_project_key(conn, "rules_divergence_sibling", &sibling.to_string_lossy())?;
+            Ok(MigrationOutcome::Divergent {
+                sibling,
+                embedded_count: embedded.len(),
+                sibling_count: 0,
+            })
+        }
     }
 }
 
@@ -698,6 +861,196 @@ mod tests {
         assert!(parsed["snapshot_hash"].as_str().unwrap().len() == 64);
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // ----- R5: migrate_embedded_to_sibling tests --------------------------
+
+    /// Create an in-memory SQLite with the legacy rules schema and seed it
+    /// with the given rules. Used to simulate a pre-1.1.0 vault.
+    fn legacy_vault_with_rules(rows: &[(&str, &str, &[&str])]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE project (key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE rules (
+                rule_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT UNIQUE NOT NULL,
+                name TEXT,
+                instruction TEXT,
+                signals TEXT,
+                subfolder TEXT,
+                rename_pattern TEXT DEFAULT '',
+                confidence_threshold REAL DEFAULT 0.6,
+                encrypt INTEGER DEFAULT 0,
+                enabled INTEGER DEFAULT 1,
+                is_default INTEGER DEFAULT 0
+            );
+            "#,
+        )
+        .unwrap();
+        for (label, instruction, signals) in rows {
+            let signals_json = serde_json::to_string(signals).unwrap();
+            conn.execute(
+                "INSERT INTO rules (label, name, instruction, signals, subfolder, \
+                 rename_pattern, confidence_threshold, encrypt, enabled, is_default) \
+                 VALUES (?1, ?1, ?2, ?3, '', '', 0.6, 0, 1, 0)",
+                rusqlite::params![label, instruction, signals_json],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn migrate_with_empty_rules_returns_no_legacy_rules() {
+        let conn = legacy_vault_with_rules(&[]);
+        let dir = unique_tmp("mig_empty");
+        fs::create_dir_all(&dir).unwrap();
+        let vault = dir.join("v.ssort");
+        let outcome =
+            migrate_embedded_to_sibling(&conn, vault.to_str().unwrap()).expect("migrate");
+        assert_eq!(outcome, MigrationOutcome::NoLegacyRules);
+        assert!(!sibling_path(&vault).exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_writes_sibling_when_absent_and_records_keys() {
+        let conn = legacy_vault_with_rules(&[
+            ("school", "School materials", &["chapter", "homework"]),
+            ("receipt", "Purchase receipts", &["total", "subtotal"]),
+        ]);
+        let dir = unique_tmp("mig_export");
+        fs::create_dir_all(&dir).unwrap();
+        let vault = dir.join("v.ssort");
+        let sibling = sibling_path(&vault);
+        assert!(!sibling.exists());
+
+        let outcome =
+            migrate_embedded_to_sibling(&conn, vault.to_str().unwrap()).expect("migrate");
+        match outcome {
+            MigrationOutcome::Exported { count, sibling: out_sib } => {
+                assert_eq!(count, 2);
+                assert_eq!(out_sib, sibling);
+            }
+            other => panic!("expected Exported, got: {other:?}"),
+        }
+        assert!(sibling.exists(), "sibling file must be written");
+
+        let loaded = load(&sibling).expect("load");
+        assert_eq!(loaded.rules.len(), 2);
+        let labels: Vec<&str> = loaded.rules.iter().map(|r| r.label.as_str()).collect();
+        assert!(labels.contains(&"school"));
+        assert!(labels.contains(&"receipt"));
+
+        // Project keys recorded the export.
+        assert!(db::get_project_key(&conn, "rules_exported_at").unwrap().is_some());
+        assert_eq!(
+            db::get_project_key(&conn, "rules_exported_to").unwrap().as_deref(),
+            Some(sibling.to_str().unwrap()),
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_detects_sibling_matches_and_does_not_overwrite() {
+        let conn = legacy_vault_with_rules(&[
+            ("school", "School materials", &["chapter"]),
+        ]);
+        let dir = unique_tmp("mig_match");
+        fs::create_dir_all(&dir).unwrap();
+        let vault = dir.join("v.ssort");
+        let sibling = sibling_path(&vault);
+
+        // Pre-populate sibling with the SAME content as the embedded table.
+        let pre_existing = RulesFile {
+            schema_version: 1,
+            default_category: "memories".to_string(),
+            confidence_threshold: 0.6,
+            rename_pattern: "{date}_{sender}_{description}".to_string(),
+            rules: vec![FileRule {
+                label: "school".to_string(),
+                name: "school".to_string(),
+                instruction: "School materials".to_string(),
+                signals: vec!["chapter".to_string()],
+                subfolder: String::new(),
+                rename_pattern: String::new(),
+                confidence_threshold: 0.6,
+                encrypt: false,
+                enabled: true,
+                is_default: false,
+            }],
+        };
+        save(&sibling, &pre_existing).unwrap();
+        let mtime_before = fs::metadata(&sibling).unwrap().modified().unwrap();
+
+        let outcome =
+            migrate_embedded_to_sibling(&conn, vault.to_str().unwrap()).expect("migrate");
+        assert_eq!(outcome, MigrationOutcome::SiblingMatches { sibling: sibling.clone() });
+
+        // Sibling unchanged on disk.
+        let mtime_after = fs::metadata(&sibling).unwrap().modified().unwrap();
+        assert_eq!(mtime_before, mtime_after, "matching sibling must not be rewritten");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_detects_divergence_and_records_marker_keys() {
+        let conn = legacy_vault_with_rules(&[
+            ("school", "EMBEDDED instruction", &["chapter"]),
+        ]);
+        let dir = unique_tmp("mig_diverge");
+        fs::create_dir_all(&dir).unwrap();
+        let vault = dir.join("v.ssort");
+        let sibling = sibling_path(&vault);
+
+        // Pre-populate sibling with DIFFERENT instruction.
+        let diverging = RulesFile {
+            schema_version: 1,
+            default_category: "memories".to_string(),
+            confidence_threshold: 0.6,
+            rename_pattern: String::new(),
+            rules: vec![FileRule {
+                label: "school".to_string(),
+                name: "school".to_string(),
+                instruction: "SIBLING instruction (user-edited)".to_string(),
+                signals: vec!["chapter".to_string()],
+                subfolder: String::new(),
+                rename_pattern: String::new(),
+                confidence_threshold: 0.6,
+                encrypt: false,
+                enabled: true,
+                is_default: false,
+            }],
+        };
+        save(&sibling, &diverging).unwrap();
+
+        let outcome =
+            migrate_embedded_to_sibling(&conn, vault.to_str().unwrap()).expect("migrate");
+        match outcome {
+            MigrationOutcome::Divergent { embedded_count, sibling_count, .. } => {
+                assert_eq!(embedded_count, 1);
+                assert_eq!(sibling_count, 1);
+            }
+            other => panic!("expected Divergent, got: {other:?}"),
+        }
+        // Sibling untouched.
+        let after = load(&sibling).expect("reload");
+        assert_eq!(after.rules[0].instruction, "SIBLING instruction (user-edited)");
+        // Markers recorded.
+        assert_eq!(
+            db::get_project_key(&conn, "rules_divergence_detected").unwrap().as_deref(),
+            Some("true"),
+        );
+        assert!(db::get_project_key(&conn, "rules_divergence_detected_at").unwrap().is_some());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_with_empty_vault_path_is_a_noop() {
+        let conn = legacy_vault_with_rules(&[("anything", "x", &[])]);
+        let outcome = migrate_embedded_to_sibling(&conn, "").expect("migrate");
+        assert_eq!(outcome, MigrationOutcome::NoLegacyRules);
     }
 
     #[test]

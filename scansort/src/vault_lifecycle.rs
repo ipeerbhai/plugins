@@ -63,6 +63,16 @@ pub fn open_vault(path: &str) -> VaultResult<VaultInfo> {
     // Apply schema migrations for older vaults
     schema::migrate(&conn)?;
 
+    // R5: export embedded rules to sibling rules file on first 1.1.0 open of
+    // a legacy vault. Records the outcome via project keys; the UI can read
+    // rules_divergence_detected / rules_exported_at to decide whether to
+    // surface a notification. Errors here are non-fatal — the vault still
+    // opens; rules-related operations will surface the missing-rules-file
+    // error at classify time.
+    if let Err(e) = crate::rules_file::migrate_embedded_to_sibling(&conn, path) {
+        log::warn!("rules-file migration step failed for {path}: {}", e.message);
+    }
+
     // Read project metadata
     let name = db::get_project_key(&conn, "name")?
         .unwrap_or_default();
