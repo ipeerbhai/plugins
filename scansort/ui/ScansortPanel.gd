@@ -691,21 +691,23 @@ func _refresh_dest_pane(conn: Object) -> void:
 			await (tree as Object).call("refresh")
 
 
-## Build one destination section: header row (label + remove button) + scan_tree.
+## Build one destination section: header row (label + reprocess + lock + remove) + scan_tree.
+## W8: adds a Reprocess button and a locked toggle to each section header.
 func _add_dest_section(conn: Object, dest: Dictionary) -> void:
 	if _dest_scroll_content == null or not is_instance_valid(_dest_scroll_content):
 		return
 
-	var dest_id: String = str(dest.get("id", ""))
-	var label: String   = str(dest.get("label", dest.get("path", dest_id)))
-	var kind: String    = str(dest.get("kind", ""))
+	var dest_id: String  = str(dest.get("id", ""))
+	var label: String    = str(dest.get("label", dest.get("path", dest_id)))
+	var kind: String     = str(dest.get("kind", ""))
+	var is_locked: bool  = bool(dest.get("locked", false))
 
 	var section := VBoxContainer.new()
 	section.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	section.add_theme_constant_override("separation", 2)
 	_dest_scroll_content.add_child(section)
 
-	# Header: "[kind icon] label" + "×" remove button.
+	# Header: "[kind icon] label" + reprocess btn + lock toggle + "×" remove button.
 	var hdr := HBoxContainer.new()
 	var hdr_lbl := Label.new()
 	var kind_icon: String = "V:" if kind == "vault" else "D:"
@@ -714,12 +716,36 @@ func _add_dest_section(conn: Object, dest: Dictionary) -> void:
 	hdr_lbl.add_theme_font_size_override("font_size", 11)
 	hdr.add_child(hdr_lbl)
 
+	# W8: Reprocess button — disabled when locked.
+	var reprocess_btn := Button.new()
+	reprocess_btn.name = "ReprocessBtn"
+	reprocess_btn.text = "⟳"
+	reprocess_btn.tooltip_text = "Reprocess: clear this destination's state for a clean re-run"
+	reprocess_btn.flat = true
+	reprocess_btn.disabled = is_locked
+	var captured_id   := dest_id
+	var captured_label := label
+	reprocess_btn.pressed.connect(func() -> void:
+		_on_dest_reprocess_pressed(captured_id, captured_label)
+	)
+	hdr.add_child(reprocess_btn)
+
+	# W8: Locked toggle (CheckBox). Checked = destination is locked/final.
+	var lock_check := CheckBox.new()
+	lock_check.name = "LockCheck"
+	lock_check.text = "🔒"
+	lock_check.button_pressed = is_locked
+	lock_check.tooltip_text = "Lock this destination to prevent reprocessing"
+	lock_check.toggled.connect(func(pressed: bool) -> void:
+		_on_dest_locked_toggled(captured_id, pressed, reprocess_btn)
+	)
+	hdr.add_child(lock_check)
+
 	var remove_btn := Button.new()
 	remove_btn.text = "×"
 	remove_btn.tooltip_text = "Remove this destination from the registry"
 	remove_btn.flat = true
 	# Capture dest_id by value for the closure.
-	var captured_id := dest_id
 	remove_btn.pressed.connect(func() -> void:
 		_on_dest_remove_pressed(captured_id)
 	)
@@ -902,6 +928,94 @@ func _on_dest_remove_pressed(dest_id: String) -> void:
 		return
 	set_status("Destination removed.")
 	await _refresh_dest_pane(conn)
+
+
+## W8: Reprocess button handler — shows confirm dialog then calls backend.
+## Called when the user clicks the ⟳ button on a destination's header.
+## MUST show a confirm dialog before doing anything destructive.
+func _on_dest_reprocess_pressed(dest_id: String, dest_label: String) -> void:
+	if not _vault_is_open:
+		return
+	var conn = _get_connection()
+	if conn == null:
+		return
+	if _registry_path.is_empty():
+		return
+
+	# Show confirm dialog — do NOT call the backend without explicit user confirmation.
+	var dlg := AcceptDialog.new()
+	dlg.title = "Confirm Reprocess"
+	dlg.dialog_text = (
+		"Reprocess destination '%s'?\n\n" % dest_label
+		+ "This will PERMANENTLY DELETE all filed output for this destination\n"
+		+ "(files in a directory, or document rows in a vault).\n\n"
+		+ "The operation cannot be undone. Process All will re-populate it on the next run."
+	)
+	dlg.ok_button_text = "Reprocess"
+	add_child(dlg)
+
+	var confirmed := false
+	dlg.confirmed.connect(func() -> void:
+		confirmed = true
+	)
+	dlg.canceled.connect(func() -> void: dlg.queue_free())
+	dlg.popup_centered(Vector2i(480, 220))
+
+	# Wait for dialog to be dismissed.
+	await dlg.visibility_changed
+	if not confirmed:
+		if is_instance_valid(dlg):
+			dlg.queue_free()
+		return
+	if is_instance_valid(dlg):
+		dlg.queue_free()
+
+	# User confirmed — now call the backend.
+	set_status("Reprocessing destination '%s'..." % dest_label)
+	var result: Dictionary = await conn.call_tool(
+		"minerva_scansort_reprocess_destination",
+		{
+			"registry_path":  _registry_path,
+			"destination_id": dest_id,
+		},
+	)
+	if not result.get("ok", false):
+		set_status("ERROR: reprocess_destination failed — %s" % result.get("error", "unknown"))
+		return
+	var summary: String = str(result.get("summary", "Done."))
+	set_status("Reprocessed: %s" % summary)
+	# Refresh this destination's sub-tree so the UI reflects the cleared state.
+	await _refresh_dest_pane(conn)
+
+
+## W8: Locked toggle handler — calls set_destination_locked and updates the
+## Reprocess button's disabled state immediately (no full pane refresh needed).
+func _on_dest_locked_toggled(dest_id: String, locked: bool, reprocess_btn: Button) -> void:
+	if not _vault_is_open:
+		return
+	var conn = _get_connection()
+	if conn == null:
+		return
+	if _registry_path.is_empty():
+		return
+
+	var result: Dictionary = await conn.call_tool(
+		"minerva_scansort_set_destination_locked",
+		{
+			"registry_path":  _registry_path,
+			"destination_id": dest_id,
+			"locked":         locked,
+		},
+	)
+	if not result.get("ok", false):
+		set_status("ERROR: set_destination_locked failed — %s" % result.get("error", "unknown"))
+		return
+
+	# Sync the Reprocess button's disabled state immediately (UX — backend refuses
+	# regardless, but this gives instant visual feedback).
+	if reprocess_btn != null and is_instance_valid(reprocess_btn):
+		reprocess_btn.disabled = locked
+	set_status("Destination %s." % ("locked" if locked else "unlocked"))
 
 
 # ---------------------------------------------------------------------------

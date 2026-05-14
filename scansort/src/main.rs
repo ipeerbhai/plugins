@@ -35,6 +35,7 @@ mod fingerprints;
 mod placement;
 mod registry;
 mod render;
+mod reprocess;
 mod rule_engine;
 mod rules;
 mod rules_file;
@@ -1501,6 +1502,69 @@ fn handle_destination_remove(params: &Value, id: Value) -> RpcResponse {
 }
 
 // ---------------------------------------------------------------------------
+// W8: reprocess + locked/final flag handlers
+// ---------------------------------------------------------------------------
+
+/// `minerva_scansort_reprocess_destination` — W8.
+///
+/// Clears a destination's state so a fresh Process All re-run re-populates it.
+/// REFUSED if the destination is locked.  The caller MUST gate this behind an
+/// explicit confirm dialog; the backend enforces `locked` as a second defence.
+fn handle_reprocess_destination(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let registry_path = args.get("registry_path").and_then(|v| v.as_str()).unwrap_or("");
+    if registry_path.is_empty() {
+        return ok_response(id, tool_err("registry_path is required"));
+    }
+    let destination_id = args.get("destination_id").and_then(|v| v.as_str()).unwrap_or("");
+    if destination_id.is_empty() {
+        return ok_response(id, tool_err("destination_id is required"));
+    }
+    let p = std::path::Path::new(registry_path);
+    match reprocess::reprocess_destination(p, destination_id) {
+        Ok(r) => ok_response(id, tool_ok(json!({
+            "ok": true,
+            "destination_id": r.destination_id,
+            "kind": r.kind,
+            "summary": r.summary,
+            "cleared_count": r.cleared_count,
+        }))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+/// `minerva_scansort_set_destination_locked` — W8.
+///
+/// Toggle the `locked` flag on a destination.  A locked destination refuses
+/// reprocess at the backend level.  This persists via the registry JSON.
+fn handle_set_destination_locked(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let registry_path = args.get("registry_path").and_then(|v| v.as_str()).unwrap_or("");
+    if registry_path.is_empty() {
+        return ok_response(id, tool_err("registry_path is required"));
+    }
+    let destination_id = args.get("destination_id").and_then(|v| v.as_str()).unwrap_or("");
+    if destination_id.is_empty() {
+        return ok_response(id, tool_err("destination_id is required"));
+    }
+    let locked = match args.get("locked").and_then(|v| v.as_bool()) {
+        Some(b) => b,
+        None => return ok_response(id, tool_err("locked (boolean) is required")),
+    };
+    let p = std::path::Path::new(registry_path);
+    match reprocess::set_destination_locked(p, destination_id, locked) {
+        Ok(dest) => match serde_json::to_value(&dest) {
+            Ok(v) => ok_response(id, tool_ok(json!({
+                "ok": true,
+                "destination": v,
+            }))),
+            Err(e) => ok_response(id, tool_err(&e.to_string())),
+        },
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // W7: near-dup detection handlers
 // ---------------------------------------------------------------------------
 
@@ -2498,6 +2562,31 @@ fn main() {
                             "required": ["dir_path"],
                         },
                     },
+                    {
+                        "name": "minerva_scansort_reprocess_destination",
+                        "description": "W8: Clear a destination's state so a fresh Process All re-run re-populates it. DESTRUCTIVE — caller MUST gate behind an explicit confirm dialog. REFUSED (error) if the destination is locked/final. For a directory destination: deletes all regular files in the directory (subdirectories untouched). For a vault destination: deletes ALL documents and fingerprints rows. Default Process All is unaffected — this is a separate path. Returns {ok, destination_id, kind, summary, cleared_count}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "registry_path": {"type": "string", "description": "Absolute path to the destination registry JSON file."},
+                                "destination_id": {"type": "string", "description": "The stable id of the destination to reprocess (from destination_add or destination_list)."},
+                            },
+                            "required": ["registry_path", "destination_id"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_set_destination_locked",
+                        "description": "W8: Set or clear the locked/final flag on a destination. A locked destination refuses reprocess at the backend level (defence-in-depth). Returns {ok, destination} with the updated destination record.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "registry_path": {"type": "string", "description": "Absolute path to the destination registry JSON file."},
+                                "destination_id": {"type": "string", "description": "The stable id of the destination to update."},
+                                "locked": {"type": "boolean", "description": "true to lock/finalise the destination; false to unlock it."},
+                            },
+                            "required": ["registry_path", "destination_id", "locked"],
+                        },
+                    },
                 ]
             })),
 
@@ -2653,6 +2742,12 @@ fn main() {
                     }
                     "minerva_scansort_scan_directory_hashes" => {
                         handle_scan_directory_hashes(&req.params, req.id)
+                    }
+                    "minerva_scansort_reprocess_destination" => {
+                        handle_reprocess_destination(&req.params, req.id)
+                    }
+                    "minerva_scansort_set_destination_locked" => {
+                        handle_set_destination_locked(&req.params, req.id)
                     }
                     other => err_response(req.id, -32601, format!("unknown tool: {other}")),
                 }
