@@ -33,6 +33,7 @@ mod extract;
 mod fingerprints;
 mod registry;
 mod render;
+mod rule_engine;
 mod rules;
 mod rules_file;
 mod schema;
@@ -1362,6 +1363,61 @@ fn handle_list_disk_files(params: &Value, id: Value) -> RpcResponse {
 // W4: destination registry handlers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// W3: run_rule_engine handler
+// ---------------------------------------------------------------------------
+
+fn handle_run_rule_engine(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+
+    // ── Rules source ────────────────────────────────────────────────────────
+    // Accept a pre-loaded rules array or load from rules_path.
+    let rules_path = args.get("rules_path").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+
+    let rule_list: Vec<types::Rule> = if let Some(rp) = rules_path {
+        let p = std::path::Path::new(rp);
+        let file = match rules_file::load_or_init(p) {
+            Ok(f) => f,
+            Err(e) => return ok_response(id, tool_err(&format!("Failed to load rules: {}", e.message))),
+        };
+        file.to_rules()
+    } else if let Some(rules_val) = args.get("rules") {
+        match serde_json::from_value::<Vec<types::Rule>>(rules_val.clone()) {
+            Ok(v) => v,
+            Err(e) => return ok_response(id, tool_err(&format!("Failed to parse rules: {e}"))),
+        }
+    } else {
+        return ok_response(id, tool_err("rules_path or rules is required"));
+    };
+
+    // ── Classification (Phase-1 output) ─────────────────────────────────────
+    let classification: types::Classification = match args.get("classification") {
+        Some(v) => match serde_json::from_value(v.clone()) {
+            Ok(c) => c,
+            Err(e) => return ok_response(id, tool_err(&format!("Failed to parse classification: {e}"))),
+        },
+        None => return ok_response(id, tool_err("classification is required")),
+    };
+
+    // ── File facts ───────────────────────────────────────────────────────────
+    let file_facts = rule_engine::FileFacts {
+        filename: args.get("filename").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        extension: args.get("extension").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        size: args.get("size").and_then(|v| v.as_i64()).unwrap_or(0),
+    };
+
+    // ── Run the walk ──────────────────────────────────────────────────────────
+    let outcome = rule_engine::run(&classification, &file_facts, &rule_list);
+
+    match serde_json::to_value(&outcome) {
+        Ok(v) => ok_response(id, tool_ok(json!({
+            "ok": true,
+            "outcome": v,
+        }))),
+        Err(e) => ok_response(id, tool_err(&e.to_string())),
+    }
+}
+
 fn handle_destination_add(params: &Value, id: Value) -> RpcResponse {
     let args = params.get("arguments").unwrap_or(params);
     let registry_path = args.get("registry_path").and_then(|v| v.as_str()).unwrap_or("");
@@ -2046,6 +2102,25 @@ fn main() {
                         },
                     },
                     {
+                        "name": "minerva_scansort_run_rule_engine",
+                        "description": "Phase-2 deterministic rule walk (W3). Takes Phase-1 classification output (extracted facts + per-rule semantic scores) and file facts, walks the rule set in `order` order, applies semantic-threshold + condition + exception gates, and returns which rules fired with their resolved actions (category, copy_to, resolved subfolder/rename_pattern). No LLM calls; pure deterministic function. W10 Process-All calls this for each document.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "rules_path": {"type": "string", "description": "Absolute path to the rules JSON file. Loaded via load_or_init (returns empty rules set when file does not yet exist). Provide either rules_path OR rules."},
+                                "rules": {"type": "array", "description": "Pre-loaded rules array (alternative to rules_path). Each element is a Rule object. Provide either rules_path OR rules.", "items": {"type": "object"}},
+                                "classification": {
+                                    "type": "object",
+                                    "description": "Phase-1 Classification output from minerva_scansort_classify_document. Must include rule_signals (per-rule scores) and extracted facts (doc_date, year, issuer, amount, doc_type, confidence)."
+                                },
+                                "filename": {"type": "string", "description": "Source file name (e.g. 'invoice_2024.pdf'). Used in filename/extension conditions."},
+                                "extension": {"type": "string", "description": "File extension without dot (e.g. 'pdf'). Used in extension conditions."},
+                                "size": {"type": "integer", "description": "File size in bytes. Used in size conditions."},
+                            },
+                            "required": ["classification"],
+                        },
+                    },
+                    {
                         "name": "minerva_scansort_destination_add",
                         "description": "Register a new filing destination (vault file or directory) in the session-level destination registry. The plugin generates a stable unique id. Returns {ok, destination: {id, kind, path, label, locked}}.",
                         "inputSchema": {
@@ -2214,6 +2289,9 @@ fn main() {
                     }
                     "minerva_scansort_list_disk_files" => {
                         handle_list_disk_files(&req.params, req.id)
+                    }
+                    "minerva_scansort_run_rule_engine" => {
+                        handle_run_rule_engine(&req.params, req.id)
                     }
                     "minerva_scansort_destination_add" => {
                         handle_destination_add(&req.params, req.id)

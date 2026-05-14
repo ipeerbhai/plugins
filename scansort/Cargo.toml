@@ -26,6 +26,9 @@ hex = "0.4"
 zstd = "0.13"
 md-5 = "0.10"
 
+# W3: deterministic condition evaluation (regex operator)
+regex = "1"
+
 # R2: text extraction + rendering
 justpdf = "0.1"
 image = "0.25"
