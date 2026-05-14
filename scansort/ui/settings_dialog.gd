@@ -42,7 +42,11 @@ var _model_picker: OptionButton = null
 var _help_label:   Label        = null
 
 
+const _UiScale := preload("ui_scale.gd")
+
+
 func _ready() -> void:
+	_UiScale.apply_to(self)
 	title = "Scansort Settings"
 	min_size = Vector2(520, 240)
 	ok_button_text = "Save"

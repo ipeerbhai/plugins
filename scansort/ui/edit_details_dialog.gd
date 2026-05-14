@@ -41,7 +41,11 @@ var _category_labels: Array        = []
 var _error_label:    Label         = null
 
 
+const _UiScale := preload("ui_scale.gd")
+
+
 func _ready() -> void:
+	_UiScale.apply_to(self)
 	title = "Edit Document Details"
 	min_size = Vector2(520, 380)
 	ok_button_text = "Save"

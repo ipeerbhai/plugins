@@ -31,7 +31,11 @@ var _edit_fields: Dictionary = {}
 var _edit_checklist_id: int = -1
 
 
+const _UiScale := preload("ui_scale.gd")
+
+
 func _ready() -> void:
+	_UiScale.apply_to(self)
 	title = "Tax Checklist"
 	min_size = Vector2(620, 500)
 	ok_button_text = "Close"

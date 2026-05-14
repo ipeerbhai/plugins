@@ -36,7 +36,11 @@ var _remove_button: Button  = null
 var _file_dialog:  FileDialog = null
 
 
+const _UiScale := preload("ui_scale.gd")
+
+
 func _ready() -> void:
+	_UiScale.apply_to(self)
 	title = "Vault Registry"
 	min_size = Vector2i(580, 380)
 	ok_button_text = "Close"
@@ -95,6 +99,7 @@ func _build_ui() -> void:
 
 	# FileDialog for adding vault files.
 	_file_dialog = FileDialog.new()
+	_UiScale.apply_to(_file_dialog)
 	_file_dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILE
 	_file_dialog.access    = FileDialog.ACCESS_FILESYSTEM
 	_file_dialog.min_size  = Vector2i(600, 400)

@@ -43,7 +43,11 @@ var _tags_field:        LineEdit      = null
 var _error_label:       Label         = null
 
 
+const _UiScale := preload("ui_scale.gd")
+
+
 func _ready() -> void:
+	_UiScale.apply_to(self)
 	title = "Add Document to Vault"
 	min_size = Vector2(520, 380)
 	# AcceptDialog fires `confirmed` when OK is pressed.

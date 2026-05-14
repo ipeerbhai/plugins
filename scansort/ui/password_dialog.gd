@@ -30,7 +30,11 @@ var _error_label: Label = null
 var _vbox: VBoxContainer = null
 
 
+const _UiScale := preload("ui_scale.gd")
+
+
 func _ready() -> void:
+	_UiScale.apply_to(self)
 	min_size = Vector2(420, 200)
 	confirmed.connect(_on_ok)
 	canceled.connect(_on_cancelled)

@@ -69,7 +69,11 @@ var _import_dialog: FileDialog = null
 var _export_dialog: FileDialog = null
 
 
+const _UiScale := preload("ui_scale.gd")
+
+
 func _ready() -> void:
+	_UiScale.apply_to(self)
 	if _source_label.is_empty():
 		title = "Classification Rules"
 	else:
@@ -410,6 +414,7 @@ func _on_delete_pressed() -> void:
 	# Build confirmation dialog lazily.
 	if _confirm_dlg == null:
 		_confirm_dlg = ConfirmationDialog.new()
+		_UiScale.apply_to(_confirm_dlg)
 		add_child(_confirm_dlg)
 		_confirm_dlg.confirmed.connect(_execute_delete)
 
@@ -518,6 +523,7 @@ func _on_save_pressed() -> void:
 func _on_import_pressed() -> void:
 	if _import_dialog == null:
 		_import_dialog = FileDialog.new()
+		_UiScale.apply_to(_import_dialog)
 		_import_dialog.access = FileDialog.ACCESS_FILESYSTEM
 		_import_dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILE
 		_import_dialog.title = "Import Rules from JSON"
@@ -563,6 +569,7 @@ func _on_import_file_selected(file_path: String) -> void:
 func _on_export_pressed() -> void:
 	if _export_dialog == null:
 		_export_dialog = FileDialog.new()
+		_UiScale.apply_to(_export_dialog)
 		_export_dialog.access = FileDialog.ACCESS_FILESYSTEM
 		_export_dialog.file_mode = FileDialog.FILE_MODE_SAVE_FILE
 		_export_dialog.title = "Export Rules to JSON"
