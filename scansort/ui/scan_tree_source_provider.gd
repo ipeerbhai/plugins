@@ -4,8 +4,12 @@ extends "scan_tree_provider.gd"
 ## Renders the supported document files (.pdf/.docx/.xlsx/.xls) under the
 ## source directory — set via minerva_scansort_set_source_dir — as a flat,
 ## name-sorted list of file nodes. Each node carries an `in_vault` flag
-## (surfaced in the tooltip) for dedup feedback; the visible ✓ indicator is
-## a later round's concern.
+## (surfaced in the tooltip) for dedup feedback.
+##
+## U5: session marks from the batch pipeline are pushed in via
+## set_session_marks(). Files in the processed set or with in_vault=true get
+## a ✓ prefix on their display name; low-confidence files also note that in
+## their tooltip.
 ##
 ## File keys are absolute paths so callers can map a selected row back to disk.
 ##
@@ -14,6 +18,18 @@ extends "scan_tree_provider.gd"
 var _conn: Object = null
 var _vault_path: String = ""
 var _source_dir: String = ""
+
+## U5: session mark sets pushed by ScansortPanel after each batch step.
+## Keys are absolute file paths; used as a set (value is always true).
+var _processed_keys: Dictionary = {}
+var _low_confidence_keys: Dictionary = {}
+
+
+## U5: called by ScansortPanel to push current session state so the source
+## tree reflects batch-pipeline progress on the next refresh().
+func set_session_marks(processed: Dictionary, low_confidence: Dictionary) -> void:
+	_processed_keys = processed
+	_low_confidence_keys = low_confidence
 
 
 ## Attach the plugin connection + optional vault path (enables in_vault dedup).
@@ -62,14 +78,24 @@ func get_tree_data() -> Array:
 		var fname: String = str(f.get("name", "unknown"))
 		var in_vault: bool = bool(f.get("in_vault", false))
 		var size: int = int(f.get("size", 0))
+
+		# U5: show a ✓ mark when the file is in the vault or was processed this
+		# session. Low-confidence files get an extra note in the tooltip.
+		var is_done: bool = in_vault or _processed_keys.has(fpath)
+		var is_low_conf: bool = _low_confidence_keys.has(fpath)
+		var display_name: String = ("✓ " if is_done else "") + fname
+		var tooltip: String = "%s\nIn vault: %s\nSize: %d bytes" % [
+			fpath, ("yes" if in_vault else "no"), size,
+		]
+		if is_low_conf:
+			tooltip += "\n(low confidence)"
+
 		nodes.append({
 			"kind": "file",
-			"name": fname,
+			"name": display_name,
 			"key": fpath,
 			"date": "",
-			"tooltip": "%s\nIn vault: %s\nSize: %d bytes" % [
-				fpath, ("yes" if in_vault else "no"), size,
-			],
+			"tooltip": tooltip,
 			"children": [],
 			"in_vault": in_vault,
 		})

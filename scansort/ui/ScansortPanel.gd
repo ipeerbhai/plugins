@@ -121,6 +121,26 @@ var _dest_provider:   Object = null
 ## frees them on teardown, so guard with is_instance_valid before use.
 var _process_btn: Button = null
 var _stop_btn:    Button = null
+
+# ---------------------------------------------------------------------------
+# U5: batch pipeline session state
+# ---------------------------------------------------------------------------
+
+## Set of absolute source paths processed during the current session.
+## Used as a set; value is always true. Never persisted.
+var _processed_keys: Dictionary = {}
+
+## Subset of _processed_keys whose classification confidence was below
+## LOW_CONFIDENCE_THRESHOLD. Never persisted.
+var _low_confidence_keys: Dictionary = {}
+
+## Set to true by _on_stop_pressed(); the batch loop checks this between
+## files and breaks early.
+var _process_cancelled: bool = false
+
+## Classification confidence below which a processed doc is flagged as
+## low-confidence.
+const LOW_CONFIDENCE_THRESHOLD := 0.5
 var _status_panel: HBoxContainer = null
 
 ## File dialog (reused for open and create).
@@ -741,6 +761,230 @@ func _on_add_dialog_cancelled() -> void:
 	set_status("Add document cancelled.")
 
 
+# ---------------------------------------------------------------------------
+# U5: Process All batch pipeline
+# ---------------------------------------------------------------------------
+
+## Called when the user clicks the "Process All" button in the chrome bar.
+## Iterates every source file: extract → dedup → classify → insert.
+## Files already in the vault or in _processed_keys are skipped. One failed
+## file does NOT abort the whole run.
+func _on_process_all_pressed() -> void:
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+	if not _vault_is_open:
+		set_status("No vault open.")
+		return
+
+	# Fetch the source file list.
+	var list_res: Dictionary = await conn.call_tool(
+		"minerva_scansort_list_source_files",
+		{"vault_path": _active_vault_path}
+	)
+	if not list_res.get("ok", false):
+		set_status("Process All: no source directory set or list failed.")
+		return
+	var files: Array = list_res.get("files", [])
+	if files.is_empty():
+		set_status("Process All: source directory is empty.")
+		return
+
+	# Enter running state.
+	_process_cancelled = false
+	if _process_btn != null and is_instance_valid(_process_btn):
+		_process_btn.disabled = true
+	if _stop_btn != null and is_instance_valid(_stop_btn):
+		_stop_btn.disabled = false
+	set_status("Processing…")
+
+	var total: int = files.size()
+	var processed_this_run: int = 0
+	var skipped: int = 0
+	var failed: int = 0
+	var low_conf: int = 0
+
+	const MAX_CLASSIFY_CHARS := 4000
+
+	for i: int in range(total):
+		if _process_cancelled:
+			break
+
+		var file: Dictionary = files[i]
+		var fpath: String = str(file.get("path", ""))
+		var fname: String = str(file.get("name", fpath.get_file()))
+
+		# Skip already-done files.
+		if bool(file.get("in_vault", false)) or _processed_keys.has(fpath):
+			skipped += 1
+			continue
+
+		set_status("Processing %d/%d: %s…" % [i + 1, total, fname])
+
+		# -- Step 1: Extract --
+		var extract_res: Dictionary = await conn.call_tool(
+			"minerva_scansort_extract_text",
+			{"file_path": fpath}
+		)
+		if not extract_res.get("success", false):
+			push_warning("[ScansortPanel] batch extract failed for %s: %s" % [
+				fname, str(extract_res.get("error", "unknown"))
+			])
+			failed += 1
+			continue
+
+		var sha256:     String = str(extract_res.get("sha256",   ""))
+		var char_count: int    = int(extract_res.get("char_count", 0))
+		var full_text:  String = str(extract_res.get("full_text", ""))
+		var simhash:    String = str(extract_res.get("simhash",  "0000000000000000"))
+		var dhash:      String = str(extract_res.get("dhash",    "0000000000000000"))
+
+		# -- Step 2: Dedup --
+		var dup_res: Dictionary = await conn.call_tool(
+			"minerva_scansort_check_sha256",
+			{"vault_path": _active_vault_path, "sha256": sha256}
+		)
+		if dup_res.get("found", false):
+			# Already in vault (list may have been stale) — mark and skip.
+			_processed_keys[fpath] = true
+			skipped += 1
+			_push_session_marks_to_provider()
+			continue
+
+		# -- Step 3: Classify --
+		var model_desc: Dictionary = _resolve_chat_model_for_classify()
+		var model_spec: Dictionary = model_desc.get("model_spec", {}) as Dictionary if model_desc.get("model_spec") is Dictionary else {}
+		var classify_args: Dictionary = {
+			"vault_path": _active_vault_path,
+			"model":      "default",
+		}
+		if not model_spec.is_empty():
+			classify_args["model_spec"] = model_spec
+		if not _vault_password.is_empty():
+			classify_args["password"] = _vault_password
+
+		const VISION_THRESHOLD := 50
+		if char_count >= VISION_THRESHOLD:
+			classify_args["mode"]          = "text"
+			classify_args["document_text"] = full_text
+			if MAX_CLASSIFY_CHARS > 0:
+				classify_args["max_text_chars"] = MAX_CLASSIFY_CHARS
+		else:
+			var render_res: Dictionary = await conn.call_tool(
+				"minerva_scansort_render_pages",
+				{"file_path": fpath, "max_pages": 2, "dpi": 96}
+			)
+			if not render_res.get("success", false):
+				push_warning("[ScansortPanel] batch render failed for %s: %s" % [
+					fname, str(render_res.get("error", "unknown"))
+				])
+				failed += 1
+				continue
+			classify_args["mode"]        = "vision"
+			classify_args["page_images"] = render_res.get("pages", [])
+
+		var classify_res: Dictionary = await conn.call_tool(
+			"minerva_scansort_classify_document",
+			classify_args
+		)
+		if not classify_res.get("ok", false):
+			push_warning("[ScansortPanel] batch classify failed for %s: %s" % [
+				fname, str(classify_res.get("error", "unknown"))
+			])
+			failed += 1
+			continue
+
+		var classification: Dictionary = classify_res.get("classification", {})
+
+		# -- Step 4: Insert --
+		var insert_args: Dictionary = {
+			"vault_path":    _active_vault_path,
+			"file_path":     fpath,
+			"category":      classification.get("category",    ""),
+			"confidence":    float(classification.get("confidence", 0.0)),
+			"sender":        classification.get("sender",      ""),
+			"description":   classification.get("description", ""),
+			"doc_date":      classification.get("doc_date",    ""),
+			"status":        "classified",
+			"sha256":        sha256,
+			"simhash":       simhash,
+			"dhash":         dhash,
+			"source_path":   fpath,
+			"rule_snapshot": str(classify_res.get("rule_snapshot", "")),
+		}
+		if not _vault_password.is_empty():
+			insert_args["password"] = _vault_password
+
+		var insert_res: Dictionary = await conn.call_tool(
+			"minerva_scansort_insert_document",
+			insert_args
+		)
+		if not insert_res.get("ok", false):
+			push_warning("[ScansortPanel] batch insert failed for %s: %s" % [
+				fname, str(insert_res.get("error", "unknown"))
+			])
+			failed += 1
+			continue
+
+		# Successful insert — record session state.
+		_processed_keys[fpath] = true
+		processed_this_run += 1
+		var confidence: float = float(classification.get("confidence", 0.0))
+		if confidence < LOW_CONFIDENCE_THRESHOLD:
+			_low_confidence_keys[fpath] = true
+			low_conf += 1
+
+		_push_session_marks_to_provider()
+
+	# Run finished (or cancelled) — refresh both trees.
+	if _dest_tree != null and is_instance_valid(_dest_tree):
+		await _dest_tree.refresh()
+	if _source_tree != null and is_instance_valid(_source_tree):
+		await _source_tree.refresh()
+
+	# Restore button states.
+	if _process_btn != null and is_instance_valid(_process_btn):
+		_process_btn.disabled = not _vault_is_open
+	if _stop_btn != null and is_instance_valid(_stop_btn):
+		_stop_btn.disabled = true
+
+	# Summary status.
+	if _process_cancelled:
+		set_status("Stopped — processed %d, %d low-confidence, %d failed, %d skipped" % [
+			processed_this_run, low_conf, failed, skipped
+		])
+	else:
+		set_status("Processed %d/%d — %d low-confidence, %d failed, %d skipped" % [
+			processed_this_run, total, low_conf, failed, skipped
+		])
+
+
+## Stop button — sets the cancel flag; the batch loop picks it up between
+## files.
+func _on_stop_pressed() -> void:
+	_process_cancelled = true
+	set_status("Stopping…")
+
+
+## Clear session state (processed + low-confidence sets) and refresh the
+## source tree so ✓ marks are removed. Public — U6 may expose a UI trigger.
+func clear_processed_state() -> void:
+	_processed_keys.clear()
+	_low_confidence_keys.clear()
+	_push_session_marks_to_provider()
+	if _source_tree != null and is_instance_valid(_source_tree):
+		await _source_tree.refresh()
+
+
+## Push the current session mark sets into the source provider so the next
+## refresh() reflects up-to-date ✓ marks without a full list_source_files
+## round-trip.
+func _push_session_marks_to_provider() -> void:
+	if _source_provider != null and _source_provider.has_method("set_session_marks"):
+		_source_provider.set_session_marks(_processed_keys, _low_confidence_keys)
+
+
 ## Show a non-blocking error in the status bar / status panel.
 ## Toolbar carries the error message; pipeline-state panel returns to Idle so
 ## subsequent runs aren't gated on the user noticing the stale label.
@@ -1105,13 +1349,15 @@ func get_editor_actions() -> Array:
 	_process_btn = Button.new()
 	_process_btn.flat = false
 	_process_btn.icon = load("res://assets/icons/send_icons/send_icon_24_no_bg.png")
-	_process_btn.tooltip_text = "Process All — extract, classify and file every source document (wired in U5)."
-	_process_btn.disabled = true
+	_process_btn.tooltip_text = "Process All — extract, classify and file every source document."
+	_process_btn.disabled = not _vault_is_open
+	_process_btn.pressed.connect(_on_process_all_pressed)
 	_stop_btn = Button.new()
 	_stop_btn.flat = false
 	_stop_btn.icon = load("res://assets/icons/stop_icons/stop-sign-24.png")
-	_stop_btn.tooltip_text = "Stop the running batch (wired in U5)."
+	_stop_btn.tooltip_text = "Stop the running batch."
 	_stop_btn.disabled = true
+	_stop_btn.pressed.connect(_on_stop_pressed)
 
 	var menu := MenuButton.new()
 	# Reuse Minerva's drawer icon for the File menu; tooltip explains it.
@@ -1165,6 +1411,9 @@ func _refresh_chrome_menu_state() -> void:
 		var idx: int = _chrome_popup.get_item_index(item_id)
 		if idx >= 0:
 			_chrome_popup.set_item_disabled(idx, not _vault_is_open)
+	# U5: enable Process All when a vault is open (and no run is in progress).
+	if _process_btn != null and is_instance_valid(_process_btn):
+		_process_btn.disabled = not _vault_is_open
 
 
 func set_status(text: String) -> void:
