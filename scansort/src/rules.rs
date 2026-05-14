@@ -33,6 +33,12 @@ fn row_to_rule(row: &rusqlite::Row) -> Result<Rule, rusqlite::Error> {
         encrypt: db::get_bool(row, "encrypt"),
         enabled: db::get_bool(row, "enabled"),
         is_default: db::get_bool(row, "is_default"),
+        // New v2 fields — not stored in the legacy embedded table; default values.
+        conditions: None,
+        exceptions: None,
+        order: 0,
+        stop_processing: false,
+        copy_to: Vec::new(),
     })
 }
 
@@ -389,7 +395,7 @@ pub fn build_prompt_context(rules: &[Rule]) -> String {
             .to_string(),
     );
     lines.push(
-        r#"Respond with JSON: {"category": "<label>", "confidence": <0.0-1.0>, "sender": "<who sent it>", "description": "<brief description>", "date": "<YYYY-MM-DD document date>", "tags": ["tag1", "tag2"]}"#
+        r#"Respond with JSON: {"category": "<label>", "confidence": <0.0-1.0>, "issuer": "<who issued this document>", "description": "<brief description>", "date": "<YYYY-MM-DD document date>", "tags": ["tag1", "tag2"]}"#
             .to_string(),
     );
     lines.push(

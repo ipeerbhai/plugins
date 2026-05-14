@@ -400,7 +400,11 @@ fn handle_insert_document(params: &Value, id: Value) -> RpcResponse {
     }
     let category = args.get("category").and_then(|v| v.as_str()).unwrap_or("");
     let confidence = args.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let sender = args.get("sender").and_then(|v| v.as_str()).unwrap_or("");
+    // Accept "issuer" (canonical) with "sender" as backward-compat alias.
+    let issuer = args.get("issuer")
+        .or_else(|| args.get("sender"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
     let doc_date = args.get("doc_date").and_then(|v| v.as_str()).unwrap_or("");
     let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("");
@@ -410,7 +414,7 @@ fn handle_insert_document(params: &Value, id: Value) -> RpcResponse {
     let source_path = args.get("source_path").and_then(|v| v.as_str()).unwrap_or("");
     let rule_snapshot = args.get("rule_snapshot").and_then(|v| v.as_str()).unwrap_or("");
     match documents::insert_document(
-        vault_path, file_path, category, confidence, sender,
+        vault_path, file_path, category, confidence, issuer,
         description, doc_date, status, sha256, simhash, dhash, source_path,
         rule_snapshot,
     ) {
@@ -425,9 +429,15 @@ fn handle_query_documents(params: &Value, id: Value) -> RpcResponse {
     if vault_path.is_empty() {
         return ok_response(id, tool_err("vault_path is required"));
     }
+    // Accept "issuer" (canonical) with "sender" as backward-compat alias.
+    let issuer_filter = args.get("issuer")
+        .or_else(|| args.get("sender"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
     let filter = types::DocumentFilter {
         category: args.get("category").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from),
-        sender: args.get("sender").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from),
+        issuer: issuer_filter,
         status: args.get("status").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from),
         date_from: args.get("date_from").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from),
         date_to: args.get("date_to").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from),
@@ -589,6 +599,18 @@ fn handle_insert_rule(params: &Value, id: Value) -> RpcResponse {
             Ok(f) => f,
             Err(e) => return ok_response(id, tool_err(&e.message)),
         };
+        // Parse optional new v2 fields from args (all default when absent).
+        let conditions: Option<types::ConditionNode> = args.get("conditions")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let exceptions: Option<types::ConditionNode> = args.get("exceptions")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let order = args.get("order").and_then(|v| v.as_i64()).unwrap_or(0);
+        let stop_processing = args.get("stop_processing").and_then(|v| v.as_bool()).unwrap_or(false);
+        let copy_to: Vec<String> = args.get("copy_to")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
         let rule = rules_file::FileRule {
             label: label.to_string(),
             name: name.to_string(),
@@ -600,6 +622,11 @@ fn handle_insert_rule(params: &Value, id: Value) -> RpcResponse {
             encrypt,
             enabled,
             is_default,
+            conditions,
+            exceptions,
+            order,
+            stop_processing,
+            copy_to,
         };
         let idx = rules_file::upsert(&mut file, rule);
         if let Err(e) = rules_file::save(p, &file) {
@@ -752,6 +779,18 @@ fn handle_update_rule(params: &Value, id: Value) -> RpcResponse {
         if let Some(v) = updates.get("is_default").and_then(|x| x.as_bool()) { rule.is_default = v; }
         if let Some(v) = updates.get("signals").and_then(|x| x.as_array()) {
             rule.signals = v.iter().filter_map(|s| s.as_str().map(String::from)).collect();
+        }
+        // New v2 fields.
+        if let Some(v) = updates.get("conditions") {
+            rule.conditions = serde_json::from_value(v.clone()).ok();
+        }
+        if let Some(v) = updates.get("exceptions") {
+            rule.exceptions = serde_json::from_value(v.clone()).ok();
+        }
+        if let Some(v) = updates.get("order").and_then(|x| x.as_i64()) { rule.order = v; }
+        if let Some(v) = updates.get("stop_processing").and_then(|x| x.as_bool()) { rule.stop_processing = v; }
+        if let Some(v) = updates.get("copy_to").and_then(|x| x.as_array()) {
+            rule.copy_to = v.iter().filter_map(|s| s.as_str().map(String::from)).collect();
         }
         // Label renames are supported but must not collide.
         if let Some(new_label) = updates.get("label").and_then(|x| x.as_str()) {
@@ -1522,7 +1561,7 @@ fn main() {
                                 "file_path": {"type": "string", "description": "Absolute path to the file to ingest."},
                                 "category": {"type": "string", "description": "Classification category."},
                                 "confidence": {"type": "number", "description": "Classification confidence (0.0–1.0)."},
-                                "sender": {"type": "string", "description": "Document sender / source."},
+                                "issuer": {"type": "string", "description": "Document issuer / source (\"sender\" accepted as backward-compat alias)."},
                                 "description": {"type": "string", "description": "Human-readable description."},
                                 "doc_date": {"type": "string", "description": "Document date (ISO-8601 preferred)."},
                                 "status": {"type": "string", "description": "Document status (default: classified)."},
@@ -1537,17 +1576,17 @@ fn main() {
                     },
                     {
                         "name": "minerva_scansort_query_documents",
-                        "description": "Query documents with optional filters (category, sender, status, date range, pattern, tag, doc_id).",
+                        "description": "Query documents with optional filters (category, issuer, status, date range, pattern, tag, doc_id).",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "vault_path": {"type": "string", "description": "Absolute path to the vault file."},
                                 "category": {"type": "string", "description": "Filter by category."},
-                                "sender": {"type": "string", "description": "Filter by sender (substring match)."},
+                                "issuer": {"type": "string", "description": "Filter by issuer (substring match). \"sender\" accepted as backward-compat alias."},
                                 "status": {"type": "string", "description": "Filter by status."},
                                 "date_from": {"type": "string", "description": "Filter by doc_date >= date_from."},
                                 "date_to": {"type": "string", "description": "Filter by doc_date <= date_to."},
-                                "pattern": {"type": "string", "description": "Substring match across description/filename/sender/tags."},
+                                "pattern": {"type": "string", "description": "Substring match across description/filename/issuer/tags."},
                                 "tag": {"type": "string", "description": "Filter by tag."},
                                 "doc_id": {"type": "integer", "description": "Filter by specific doc_id."},
                             },

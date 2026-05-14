@@ -23,7 +23,7 @@ pub fn insert_document(
     file_path: &str,
     category: &str,
     confidence: f64,
-    sender: &str,
+    issuer: &str,
     description: &str,
     doc_date: &str,
     status: &str,
@@ -84,7 +84,7 @@ pub fn insert_document(
     // Insert document row
     let doc_id: i64 = match conn.execute(
         "INSERT INTO documents \
-         (original_filename, file_ext, category, confidence, sender, \
+         (original_filename, file_ext, category, confidence, issuer, \
           description, doc_date, classified_at, sha256, simhash, dhash, \
           status, file_data, file_size, compression, source_path, rule_snapshot) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'zstd', ?15, ?16)",
@@ -93,7 +93,7 @@ pub fn insert_document(
             file_ext,
             category,
             confidence,
-            sender,
+            issuer,
             description,
             doc_date,
             now,
@@ -162,9 +162,9 @@ pub fn query_documents(path: &str, filter: &DocumentFilter) -> VaultResult<Vec<D
         param_values.push(Box::new(cat.clone()));
     }
 
-    if let Some(ref sender) = filter.sender {
-        clauses.push("sender LIKE ?".to_string());
-        param_values.push(Box::new(format!("%{sender}%")));
+    if let Some(ref issuer) = filter.issuer {
+        clauses.push("issuer LIKE ?".to_string());
+        param_values.push(Box::new(format!("%{issuer}%")));
     }
 
     if let Some(ref status) = filter.status {
@@ -186,7 +186,7 @@ pub fn query_documents(path: &str, filter: &DocumentFilter) -> VaultResult<Vec<D
         let p = format!("%{pattern}%");
         clauses.push(
             "(description LIKE ? OR original_filename LIKE ? \
-             OR display_name LIKE ? OR tags LIKE ? OR sender LIKE ?)"
+             OR display_name LIKE ? OR tags LIKE ? OR issuer LIKE ?)"
                 .to_string(),
         );
         param_values.push(Box::new(p.clone()));
@@ -213,7 +213,7 @@ pub fn query_documents(path: &str, filter: &DocumentFilter) -> VaultResult<Vec<D
     };
 
     let sql = format!(
-        "SELECT doc_id, original_filename, file_ext, category, confidence, sender, \
+        "SELECT doc_id, original_filename, file_ext, category, confidence, issuer, \
          description, doc_date, classified_at, sha256, simhash, dhash, \
          status, file_size, compression, encryption_iv, source_path, \
          display_name, tags, rule_snapshot \
@@ -243,7 +243,7 @@ pub fn query_documents(path: &str, filter: &DocumentFilter) -> VaultResult<Vec<D
             file_ext: db::get_string(row, "file_ext"),
             category: db::get_string(row, "category"),
             confidence: db::get_f64(row, "confidence"),
-            sender: db::get_string(row, "sender"),
+            issuer: db::get_string(row, "issuer"),
             description: db::get_string(row, "description"),
             doc_date: db::get_string(row, "doc_date"),
             classified_at: db::get_string(row, "classified_at"),
@@ -457,7 +457,7 @@ pub fn vault_inventory(path: &str) -> VaultResult<Vec<Document>> {
     let conn = db::connect(path)?;
 
     let mut stmt = conn.prepare(
-        "SELECT doc_id, original_filename, file_ext, category, confidence, sender, \
+        "SELECT doc_id, original_filename, file_ext, category, confidence, issuer, \
          description, doc_date, classified_at, sha256, simhash, dhash, \
          status, file_size, compression, encryption_iv, source_path, \
          display_name, tags, rule_snapshot \
@@ -483,7 +483,7 @@ pub fn vault_inventory(path: &str) -> VaultResult<Vec<Document>> {
             file_ext: db::get_string(row, "file_ext"),
             category: db::get_string(row, "category"),
             confidence: db::get_f64(row, "confidence"),
-            sender: db::get_string(row, "sender"),
+            issuer: db::get_string(row, "issuer"),
             description: db::get_string(row, "description"),
             doc_date: db::get_string(row, "doc_date"),
             classified_at: db::get_string(row, "classified_at"),

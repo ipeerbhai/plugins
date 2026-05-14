@@ -11,6 +11,41 @@ use std::io::Read;
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
+// ConditionNode — recursive condition tree for rule gates (W1 storage only)
+// ---------------------------------------------------------------------------
+
+/// A node in a deterministic condition tree.
+///
+/// Three JSON shapes are supported:
+///
+/// - `{"all": [<node>, ...]}` — all child nodes must be true
+/// - `{"any": [<node>, ...]}` — at least one child node must be true
+/// - `{"field": "<name>", "op": "<op>", "value": <scalar>}` — leaf predicate
+///
+/// Valid `op` values (stored as strings; evaluation is a later work-item):
+///   `contains`, `equals`, `matches`, `<`, `>`, `<=`, `>=`
+///
+/// Valid `field` values (stored as strings; validation is a later work-item):
+///   Phase-1 facts: `year`, `doc_date`, `issuer`, `amount`, `confidence`, `doc_type`
+///   File facts: `filename`, `extension`, `size`
+///
+/// `value` accepts string or number via `serde_json::Value`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum ConditionNode {
+    /// `{"all": [...]}` — all children must be true.
+    All { all: Vec<ConditionNode> },
+    /// `{"any": [...]}` — any child must be true.
+    Any { any: Vec<ConditionNode> },
+    /// `{"field": "...", "op": "...", "value": ...}` — leaf predicate.
+    Predicate {
+        field: String,
+        op: String,
+        value: serde_json::Value,
+    },
+}
+
+// ---------------------------------------------------------------------------
 // Error handling
 // ---------------------------------------------------------------------------
 
@@ -67,7 +102,7 @@ pub struct Document {
     pub file_ext: String,
     pub category: String,
     pub confidence: f64,
-    pub sender: String,
+    pub issuer: String,
     pub description: String,
     pub doc_date: String,
     pub classified_at: String,
@@ -93,7 +128,7 @@ pub struct Document {
 #[derive(Debug, Clone, Default)]
 pub struct DocumentFilter {
     pub category: Option<String>,
-    pub sender: Option<String>,
+    pub issuer: Option<String>,
     pub status: Option<String>,
     pub date_from: Option<String>,
     pub date_to: Option<String>,
@@ -193,6 +228,24 @@ pub struct Rule {
     pub encrypt: bool,
     pub enabled: bool,
     pub is_default: bool,
+    /// Deterministic gate evaluated before LLM-based classification applies this rule.
+    /// W1 stores this only; evaluation is a later work-item.
+    #[serde(default)]
+    pub conditions: Option<ConditionNode>,
+    /// When this evaluates true, the rule match is negated.
+    /// W1 stores this only; evaluation is a later work-item.
+    #[serde(default)]
+    pub exceptions: Option<ConditionNode>,
+    /// Explicit ordering key — lower values sort first. Default 0.
+    #[serde(default)]
+    pub order: i64,
+    /// When true, stop evaluating subsequent rules after this one matches.
+    #[serde(default)]
+    pub stop_processing: bool,
+    /// Additional destination IDs to copy the document to.
+    /// W1 stores as opaque strings; resolution is a later work-item.
+    #[serde(default)]
+    pub copy_to: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -203,7 +256,7 @@ pub struct Rule {
 pub struct Classification {
     pub category: String,
     pub confidence: f64,
-    pub sender: String,
+    pub issuer: String,
     pub description: String,
     pub doc_date: String,
     pub tags: Vec<String>,

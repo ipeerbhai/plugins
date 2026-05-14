@@ -103,6 +103,19 @@ pub fn place_on_disk(
     doc_date: &str,
     rename_pattern: Option<&str>,
 ) -> VaultResult<PathBuf> {
+    place_on_disk_with_issuer(vault_path, file_path, subfolder, doc_date, rename_pattern, "")
+}
+
+/// Extended variant of `place_on_disk` that also accepts an `issuer` value for
+/// template expansion (`{issuer}` / `{sender}` tokens in `rename_pattern`).
+pub fn place_on_disk_with_issuer(
+    vault_path: &str,
+    file_path: &str,
+    subfolder: &str,
+    doc_date: &str,
+    rename_pattern: Option<&str>,
+    issuer: &str,
+) -> VaultResult<PathBuf> {
     // Resolve disk_root.
     let (_, disk_root) = get_destination(vault_path)?;
     if disk_root.is_empty() {
@@ -120,7 +133,7 @@ pub fn place_on_disk(
     };
 
     // Resolve and sanitise subfolder.
-    let resolved_subfolder = resolve_and_sanitise(subfolder, &year_val, &date_val)?;
+    let resolved_subfolder = resolve_and_sanitise(subfolder, &year_val, &date_val, issuer)?;
 
     // Build target directory.
     let target_dir = if resolved_subfolder.is_empty() {
@@ -148,7 +161,7 @@ pub fn place_on_disk(
 
     // Determine the base name (without extension).
     let base_stem: String = match rename_pattern.filter(|p| !p.is_empty()) {
-        Some(pattern) => resolve_and_sanitise(pattern, &year_val, &date_val)?,
+        Some(pattern) => resolve_and_sanitise(pattern, &year_val, &date_val, issuer)?,
         None => src_path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -255,13 +268,19 @@ fn parse_year(doc_date: &str) -> String {
     }
 }
 
-/// Apply `{year}` / `{date}` templates to `s`, then sanitise each `/`-delimited
-/// path component so no component is `..` or contains a literal `/`.
+/// Apply `{year}` / `{date}` / `{issuer}` templates to `s`, then sanitise each
+/// `/`-delimited path component so no component is `..` or contains a literal `/`.
+///
+/// `{sender}` is accepted as a backward-compat alias for `{issuer}`.
 ///
 /// We split on `/`, resolve templates in each component, reject traversal, and
 /// rejoin with the OS separator.
-fn resolve_and_sanitise(s: &str, year: &str, date: &str) -> VaultResult<String> {
-    let replaced = s.replace("{year}", year).replace("{date}", date);
+fn resolve_and_sanitise(s: &str, year: &str, date: &str, issuer: &str) -> VaultResult<String> {
+    let replaced = s
+        .replace("{year}", year)
+        .replace("{date}", date)
+        .replace("{issuer}", issuer)
+        .replace("{sender}", issuer); // backward-compat alias
 
     // Validate each path component.
     let mut parts: Vec<String> = Vec::new();

@@ -125,8 +125,10 @@ pub fn parse_response(response_text: &str, rules: &[Rule]) -> Classification {
         .get("confidence")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
-    let sender = parsed
-        .get("sender")
+    // Accept "issuer" (new) with "sender" as backward-compat alias.
+    let issuer = parsed
+        .get("issuer")
+        .or_else(|| parsed.get("sender"))
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
@@ -154,7 +156,7 @@ pub fn parse_response(response_text: &str, rules: &[Rule]) -> Classification {
     Classification {
         category,
         confidence,
-        sender,
+        issuer,
         description,
         doc_date,
         tags,
@@ -171,7 +173,7 @@ fn fallback_result(raw: &str, reason: &str, rules: &[Rule]) -> Classification {
     Classification {
         category: rules::default_category(rules).to_string(),
         confidence: 0.1,
-        sender: "unknown".to_string(),
+        issuer: "unknown".to_string(),
         description: "unclassified".to_string(),
         doc_date: String::new(),
         tags: Vec::new(),

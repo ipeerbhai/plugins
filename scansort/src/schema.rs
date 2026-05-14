@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS documents (
     file_ext TEXT,
     category TEXT,
     confidence REAL,
-    sender TEXT,
+    issuer TEXT,
     description TEXT,
     doc_date TEXT,
     classified_at TEXT,
@@ -132,6 +132,18 @@ pub fn migrate(conn: &Connection) -> VaultResult<()> {
             "ALTER TABLE documents ADD COLUMN rule_snapshot TEXT DEFAULT ''",
             [],
         )?;
+    }
+
+    // Rename sender → issuer (idempotent: only runs when the legacy column name
+    // is still present, i.e. the column is named "sender" not yet "issuer").
+    // Re-read cols in case ADD COLUMN above changed the set.
+    let cols_now: Vec<String> = conn
+        .prepare("PRAGMA table_info(documents)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if cols_now.contains(&"sender".to_string()) && !cols_now.contains(&"issuer".to_string()) {
+        conn.execute("ALTER TABLE documents RENAME COLUMN sender TO issuer", [])?;
     }
 
     // Version bump: 1.0.0 → 1.1.0 marks rules storage as external. The legacy
