@@ -43,10 +43,11 @@ extends MinervaPluginPanel
 ## Preload the password dialog script (off-tree: no class_name).
 const _PasswordDialog: Script = preload("password_dialog.gd")
 
-## R2 view scripts (off-tree: no class_name on any of these).
-const _FileTree:    Script = preload("file_tree.gd")
-const _VaultView:   Script = preload("vault_view.gd")
-const _StatusPanel: Script = preload("status_panel.gd")
+## U4: unified scan-tree component + providers (off-tree: no class_name).
+const _ScanTree:       Script = preload("scan_tree.gd")
+const _SourceProvider: Script = preload("scan_tree_source_provider.gd")
+const _VaultProvider:  Script = preload("scan_tree_vault_provider.gd")
+const _StatusPanel:    Script = preload("status_panel.gd")
 
 ## R3: add-document dialog (off-tree: no class_name).
 const _AddDocumentDialog: Script = preload("add_document_dialog.gd")
@@ -107,16 +108,19 @@ var _chrome_popup: PopupMenu = null
 
 ## R7: No internal toolbar. The File menu is returned via get_editor_actions()
 ## and lives in the editor chrome bar.
-var _split: HSplitContainer = null
-var _left_pane: Panel = null
-var _right_pane: Panel = null
-
-## File dialog (reused for open and create).
-## R2 view instances (created in _build_ui, populated on vault_opened).
-var _file_tree:    Tree        = null
-var _vault_view:   Control     = null
+##
+## U4: 3-column layout — SourcePane | Action column | DestPane. Each side
+## pane hosts a unified scan_tree bound to a provider; the centre action
+## column carries the Process/Stop buttons and the status panel.
+var _source_tree: Tree = null
+var _dest_tree:   Tree = null
+var _source_provider: Object = null
+var _dest_provider:   Object = null
+var _process_btn: Button = null
+var _stop_btn:    Button = null
 var _status_panel: HBoxContainer = null
 
+## File dialog (reused for open and create).
 var _file_dialog: FileDialog = null
 
 ## Password dialog instance (created once, reused).
@@ -161,55 +165,62 @@ func _build_ui() -> void:
 	anchor_right = 1.0
 	anchor_bottom = 1.0
 
-	var vbox := VBoxContainer.new()
-	vbox.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	add_child(vbox)
-
-	# --- Split panes ---
-	# R7: Toolbar removed. File menu is contributed to the editor chrome bar
+	# U4: 3-column layout — SourcePane | Action column | DestPane.
+	# R7: no internal toolbar; the File menu lives in the editor chrome bar
 	# via get_editor_actions().
-	_split = HSplitContainer.new()
-	_split.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	_split.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var columns := HBoxContainer.new()
+	columns.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	columns.add_theme_constant_override("separation", 4)
+	add_child(columns)
 
-	_left_pane = Panel.new()
-	_left_pane.name = "LeftPane"
-	_left_pane.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_left_pane.custom_minimum_size.x = 200
-	_split.add_child(_left_pane)
+	# --- Left column: source pane ---
+	var source_col := VBoxContainer.new()
+	source_col.name = "SourcePane"
+	source_col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	source_col.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	source_col.custom_minimum_size.x = 200
+	var source_header := Label.new()
+	source_header.text = "Source"
+	source_col.add_child(source_header)
+	_source_tree = _ScanTree.new()
+	source_col.add_child(_source_tree)
+	columns.add_child(source_col)
 
-	_right_pane = Panel.new()
-	_right_pane.name = "RightPane"
-	_right_pane.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_right_pane.custom_minimum_size.x = 200
-	_split.add_child(_right_pane)
-
-	vbox.add_child(_split)
-
-	# --- R2: file tree in LeftPane ---
-	_file_tree = _FileTree.new()
-	_file_tree.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	_file_tree.size_flags_vertical  = Control.SIZE_EXPAND_FILL
-	_file_tree.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_left_pane.add_child(_file_tree)
-
-	# --- R2: vault view in RightPane ---
-	_vault_view = _VaultView.new()
-	_vault_view.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	_vault_view.size_flags_vertical  = Control.SIZE_EXPAND_FILL
-	_vault_view.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_right_pane.add_child(_vault_view)
-
-	# --- R2: status bar at bottom of vbox ---
+	# --- Centre column: action column (Process/Stop + status) ---
+	var action_col := VBoxContainer.new()
+	action_col.name = "ActionColumn"
+	action_col.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	action_col.custom_minimum_size.x = 150
+	_process_btn = Button.new()
+	_process_btn.text = "Process All"
+	_process_btn.tooltip_text = "Extract, classify and file every source document (wired in U5)."
+	_process_btn.disabled = true  # U5 wires the batch pipeline; placeholder for now.
+	action_col.add_child(_process_btn)
+	_stop_btn = Button.new()
+	_stop_btn.text = "Stop"
+	_stop_btn.tooltip_text = "Stop the running batch (wired in U5)."
+	_stop_btn.disabled = true
+	action_col.add_child(_stop_btn)
+	var action_spacer := Control.new()
+	action_spacer.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	action_col.add_child(action_spacer)
 	_status_panel = _StatusPanel.new()
 	_status_panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	vbox.add_child(_status_panel)
+	action_col.add_child(_status_panel)
+	columns.add_child(action_col)
 
-	# Wire file_tree selection → vault_view detail.
-	_file_tree.document_selected.connect(_vault_view.on_document_selected)
-
-	# R4: wire vault_view edit button → panel handler.
-	_vault_view.edit_details_requested.connect(_on_edit_doc_pressed)
+	# --- Right column: destination (vault) pane ---
+	var dest_col := VBoxContainer.new()
+	dest_col.name = "DestPane"
+	dest_col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	dest_col.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	dest_col.custom_minimum_size.x = 200
+	var dest_header := Label.new()
+	dest_header.text = "Vault"
+	dest_col.add_child(dest_header)
+	_dest_tree = _ScanTree.new()
+	dest_col.add_child(_dest_tree)
+	columns.add_child(dest_col)
 
 # ---------------------------------------------------------------------------
 # Menu handling
@@ -481,22 +492,36 @@ func _on_vault_opened_r2(path: String, open_result: Dictionary) -> void:
 	# open_vault returns {ok, info: {name, ...}} — name is nested, not flat.
 	var vault_info: Dictionary = open_result.get("info", {})
 	var vault_name: String = vault_info.get("name", path.get_file())
-	# Init views — each will call refresh() internally.
-	if _file_tree != null and is_instance_valid(_file_tree):
-		_file_tree.init(conn, path, "")
-	if _vault_view != null and is_instance_valid(_vault_view):
-		_vault_view.init(conn, path, "")
+
+	# U4: bind the source + vault providers to their scan_trees and refresh.
+	# The source provider takes the vault path so it can flag in-vault files.
+	_source_provider = _SourceProvider.new()
+	_source_provider.init(conn, path)
+	if _source_tree != null and is_instance_valid(_source_tree):
+		_source_tree.set_provider(_source_provider)
+		await _source_tree.refresh()
+
+	_dest_provider = _VaultProvider.new()
+	_dest_provider.init(conn, path)
+	if _dest_tree != null and is_instance_valid(_dest_tree):
+		_dest_tree.set_provider(_dest_provider)
+		await _dest_tree.refresh()
+
 	if _status_panel != null and is_instance_valid(_status_panel):
 		_status_panel.init(conn)
 		_status_panel.set_vault(vault_name, 0)
-		_status_panel.set_status("Loading…")
+		_status_panel.set_status("Idle")
 
 
 func _on_vault_closed_r2() -> void:
-	if _file_tree != null and is_instance_valid(_file_tree):
-		_file_tree.clear_vault()
-	if _vault_view != null and is_instance_valid(_vault_view):
-		_vault_view.clear()
+	if _source_tree != null and is_instance_valid(_source_tree):
+		_source_tree.set_provider(null)
+		_source_tree.populate([])
+	if _dest_tree != null and is_instance_valid(_dest_tree):
+		_dest_tree.set_provider(null)
+		_dest_tree.populate([])
+	_source_provider = null
+	_dest_provider = null
 	if _status_panel != null and is_instance_valid(_status_panel):
 		_status_panel.clear()
 
@@ -712,11 +737,12 @@ func _on_add_dialog_accepted(
 		_status_panel.set_status("Idle")
 	set_status("Document added to vault.")
 
-	# Refresh views.
-	if _file_tree != null and is_instance_valid(_file_tree):
-		_file_tree.refresh()
-	if _vault_view != null and is_instance_valid(_vault_view):
-		_vault_view.refresh()
+	# Refresh the destination pane so the new document shows up, and re-scan
+	# the source pane so the just-ingested file shows its in-vault mark.
+	if _dest_tree != null and is_instance_valid(_dest_tree):
+		await _dest_tree.refresh()
+	if _source_tree != null and is_instance_valid(_source_tree):
+		await _source_tree.refresh()
 
 
 func _on_add_dialog_cancelled() -> void:
@@ -746,9 +772,11 @@ func _show_pipeline_info(msg: String) -> void:
 # R4: Edit Document flow
 # ---------------------------------------------------------------------------
 
-## Called when vault_view emits edit_details_requested(doc_id).
+## Edit Document flow. Currently unwired after the U4 layout rewrite — the
+## old trigger (vault_view's edit_details_requested) is gone; a right-click
+## re-entry point is Tier-2 work. Kept intact so that re-wiring is trivial.
 ## Fetches the full document, loads rules for the category dropdown, then
-## shows EditDetailsDialog.  On accept, calls update_document and refreshes.
+## shows EditDetailsDialog. On accept, calls update_document and refreshes.
 func _on_edit_doc_pressed(doc_id: int) -> void:
 	if not _vault_is_open:
 		set_status("No vault open.")
@@ -818,11 +846,9 @@ func _on_edit_dialog_accepted(doc_id: int, updated_fields: Dictionary) -> void:
 		return
 
 	set_status("Document updated.")
-	# Refresh both views so the updated metadata is visible.
-	if _file_tree != null and is_instance_valid(_file_tree):
-		_file_tree.refresh()
-	if _vault_view != null and is_instance_valid(_vault_view):
-		_vault_view.refresh()
+	# Refresh the destination pane so the updated metadata is visible.
+	if _dest_tree != null and is_instance_valid(_dest_tree):
+		await _dest_tree.refresh()
 
 
 # ---------------------------------------------------------------------------
