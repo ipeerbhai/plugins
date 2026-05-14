@@ -60,8 +60,9 @@ const _RulesEditorDialog: Script  = preload("rules_editor_dialog.gd")
 const _VaultRegistryDialog: Script = preload("vault_registry_dialog.gd")
 
 ## R6: checklist dialog (off-tree: no class_name).
-const _ChecklistDialog: Script = preload("checklist_dialog.gd")
-const _SettingsDialog: Script  = preload("settings_dialog.gd")
+const _ChecklistDialog: Script      = preload("checklist_dialog.gd")
+const _SettingsDialog: Script       = preload("settings_dialog.gd")
+const _RecoverySheetDialog: Script  = preload("recovery_sheet_dialog.gd")
 const _UiScale: Script         = preload("ui_scale.gd")
 
 ## U7: disk tree provider (off-tree: no class_name).
@@ -292,6 +293,7 @@ func _on_file_menu_id_pressed(id: int) -> void:
 		10: _on_use_library_rules_pressed()
 		11: _on_settings_pressed()
 		12: _on_export_marked_pressed()
+		13: _on_recovery_sheet_pressed()
 
 
 func _on_new_vault_pressed() -> void:
@@ -1403,6 +1405,30 @@ func _on_checklist_pressed() -> void:
 	dlg.popup_centered(Vector2i(660, 560))
 
 
+## Called when user picks "Recovery Sheet…" from the File menu.
+func _on_recovery_sheet_pressed() -> void:
+	if not _vault_is_open:
+		set_status("Open a vault first.")
+		return
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+
+	var dlg = _RecoverySheetDialog.new()
+	add_child(dlg)
+	dlg.init(conn, _active_vault_path, _vault_password)
+	dlg.recovery_changed.connect(
+		func() -> void:
+			set_status("Recovery sheet metadata saved.")
+	)
+	dlg.closed.connect(
+		func() -> void:
+			dlg.queue_free()
+	)
+	dlg.popup_centered(Vector2i(660, 560))
+
+
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
@@ -1470,6 +1496,7 @@ func get_editor_actions() -> Array:
 	popup.add_item("Settings...", 11)
 	popup.add_separator()
 	popup.add_item("Export Marked to Disk...", 12)
+	popup.add_item("Recovery Sheet...", 13)
 	popup.add_separator()
 	popup.add_item("Close Vault", 2)
 	popup.id_pressed.connect(_on_file_menu_id_pressed)
@@ -1493,7 +1520,7 @@ func get_editor_actions() -> Array:
 func _refresh_chrome_menu_state() -> void:
 	if _chrome_popup == null or not is_instance_valid(_chrome_popup):
 		return
-	var vault_gated: Array[int] = [2, 3, 4, 7, 9, 10, 12]
+	var vault_gated: Array[int] = [2, 3, 4, 7, 9, 10, 12, 13]
 	for item_id in vault_gated:
 		var idx: int = _chrome_popup.get_item_index(item_id)
 		if idx >= 0:

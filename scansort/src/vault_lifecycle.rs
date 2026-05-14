@@ -160,3 +160,66 @@ pub fn update_project_key(path: &str, key: &str, value: &str) -> VaultResult<()>
     db::set_project_key(&conn, key, value)?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// get_project_keys
+// ---------------------------------------------------------------------------
+
+/// Read multiple project keys from a vault. Missing keys map to an empty string.
+pub fn get_project_keys(
+    path: &str,
+    keys: &[String],
+) -> VaultResult<std::collections::BTreeMap<String, String>> {
+    let conn = db::connect_readonly(path)?;
+    let mut result = std::collections::BTreeMap::new();
+    for key in keys {
+        let value = db::get_project_key(&conn, key)?.unwrap_or_default();
+        result.insert(key.clone(), value);
+    }
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_tmp(prefix: &str) -> std::path::PathBuf {
+        let pid = std::process::id();
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("scansort-lifecycle-{prefix}-{pid}-{ts}-{n}"))
+    }
+
+    #[test]
+    fn get_project_keys_returns_set_value_and_empty_for_missing() {
+        let base = unique_tmp("gpk");
+        std::fs::create_dir_all(&base).unwrap();
+        let vault = base.join("v.ssort");
+        let vp = vault.to_str().unwrap();
+
+        create_vault(vp, "test-vault").unwrap();
+        update_project_key(vp, "emergency_contact_name", "Alice Smith").unwrap();
+
+        let keys = vec![
+            "emergency_contact_name".to_string(),
+            "nonexistent_key".to_string(),
+        ];
+        let got = get_project_keys(vp, &keys).unwrap();
+
+        assert_eq!(got.get("emergency_contact_name").map(String::as_str), Some("Alice Smith"));
+        assert_eq!(got.get("nonexistent_key").map(String::as_str), Some(""));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+}

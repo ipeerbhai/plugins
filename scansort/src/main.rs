@@ -290,6 +290,28 @@ fn handle_update_project_key(params: &Value, id: Value) -> RpcResponse {
     }
 }
 
+fn handle_get_project_keys(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let vault_path = args.get("vault_path").and_then(|v| v.as_str()).unwrap_or("");
+    if vault_path.is_empty() {
+        return ok_response(id, tool_err("vault_path is required"));
+    }
+    let keys: Vec<String> = match args.get("keys").and_then(|v| v.as_array()) {
+        Some(arr) => arr.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+        None => return ok_response(id, tool_err("keys is required and must be an array")),
+    };
+    match vault_lifecycle::get_project_keys(vault_path, &keys) {
+        Ok(map) => {
+            let values: serde_json::Map<String, Value> = map
+                .into_iter()
+                .map(|(k, v)| (k, Value::String(v)))
+                .collect();
+            ok_response(id, tool_ok(json!({"ok": true, "values": Value::Object(values)})))
+        }
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
 fn handle_registry_list(params: &Value, id: Value) -> RpcResponse {
     let args = params.get("arguments").unwrap_or(params);
     let registry_path = args.get("registry_path").and_then(|v| v.as_str());
@@ -1420,6 +1442,18 @@ fn main() {
                         },
                     },
                     {
+                        "name": "minerva_scansort_get_project_keys",
+                        "description": "Read multiple project metadata keys from a vault in one call. Missing keys map to an empty string. Returns {ok, values: {<key>: <value>, ...}}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "vault_path": {"type": "string", "description": "Absolute path to the vault file."},
+                                "keys": {"type": "array", "items": {"type": "string"}, "description": "List of project key names to read."},
+                            },
+                            "required": ["vault_path", "keys"],
+                        },
+                    },
+                    {
                         "name": "minerva_scansort_registry_list",
                         "description": "List entries in a vault registry.",
                         "inputSchema": {
@@ -1913,6 +1947,9 @@ fn main() {
                     }
                     "minerva_scansort_update_project_key" => {
                         handle_update_project_key(&req.params, req.id)
+                    }
+                    "minerva_scansort_get_project_keys" => {
+                        handle_get_project_keys(&req.params, req.id)
                     }
                     "minerva_scansort_registry_list" => {
                         handle_registry_list(&req.params, req.id)
