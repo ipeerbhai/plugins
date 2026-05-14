@@ -1,10 +1,9 @@
 extends AcceptDialog
 ## Extract-target picker dialog — W5g.
 ##
-## Shows the registered directory destinations as a list the user can pick from,
-## plus a "Browse…" button to pick any local directory.  Emits `target_chosen`
-## with the resolved absolute directory path, or `cancelled` if the user
-## dismisses without choosing.
+## Shows registered directory destinations as the only valid targets. Emits
+## `target_chosen` with the resolved absolute directory path, or `cancelled`
+## if the user dismisses without choosing.
 ##
 ## Usage:
 ##   var dlg = preload("extract_target_dialog.gd").new()
@@ -16,7 +15,7 @@ extends AcceptDialog
 ##
 ## No class_name — off-tree plugin script; use preload().
 
-## Emitted when the user picks a target directory (registered or browsed).
+## Emitted when the user picks a registered target directory.
 ## path: absolute filesystem directory path.
 signal target_chosen(path: String)
 
@@ -34,7 +33,6 @@ var _chosen_path: String = ""
 ## Widgets.
 var _list: ItemList         = null
 var _path_label: Label      = null
-var _browse_btn: Button     = null
 var _ok_btn: Button         = null
 
 
@@ -64,18 +62,12 @@ func _build_ui() -> void:
 	_list = ItemList.new()
 	_list.custom_minimum_size = Vector2(440, 140)
 	_list.item_selected.connect(_on_item_selected)
+	_list.item_activated.connect(func(_idx: int) -> void:
+		if _ok_btn != null and not _ok_btn.disabled:
+			_on_confirmed()
+			hide()
+	)
 	vbox.add_child(_list)
-
-	var browse_row := HBoxContainer.new()
-	var sep_lbl := Label.new()
-	sep_lbl.text = "Or pick a custom folder:"
-	sep_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	browse_row.add_child(sep_lbl)
-	_browse_btn = Button.new()
-	_browse_btn.text = "Browse…"
-	_browse_btn.pressed.connect(_on_browse_pressed)
-	browse_row.add_child(_browse_btn)
-	vbox.add_child(browse_row)
 
 	_path_label = Label.new()
 	_path_label.text = ""
@@ -101,6 +93,10 @@ func _populate_list() -> void:
 	if _list == null:
 		return
 	_list.clear()
+	if _destinations.is_empty():
+		_list.add_item("No directory destinations registered")
+		_list.set_item_disabled(0, true)
+		return
 	for dest: Dictionary in _destinations:
 		var label: String = str(dest.get("label", dest.get("path", str(dest.get("id", "?")))))
 		var path: String  = str(dest.get("path", ""))
@@ -114,26 +110,6 @@ func _on_item_selected(idx: int) -> void:
 	_path_label.text = _chosen_path
 	if _ok_btn != null:
 		_ok_btn.disabled = _chosen_path.is_empty()
-
-
-func _on_browse_pressed() -> void:
-	var picker := FileDialog.new()
-	_UiScale.apply_to(picker)
-	picker.access = FileDialog.ACCESS_FILESYSTEM
-	picker.file_mode = FileDialog.FILE_MODE_OPEN_DIR
-	picker.title = "Select Export Directory"
-	picker.dir_selected.connect(func(p: String) -> void:
-		_chosen_path = p
-		_path_label.text = p
-		if _list != null:
-			_list.deselect_all()
-		if _ok_btn != null:
-			_ok_btn.disabled = false
-		picker.queue_free()
-	)
-	picker.canceled.connect(func() -> void: picker.queue_free())
-	add_child(picker)
-	picker.popup_centered(Vector2i(700, 500))
 
 
 func _on_confirmed() -> void:

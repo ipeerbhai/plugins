@@ -178,6 +178,14 @@ var _dir_area_provider: Object = null
 var _process_btn: Button = null
 var _stop_btn:    Button = null
 
+## Header-level destination menu for controlled batch extraction.
+var _extract_marked_menu: MenuButton = null
+var _context_menu: PopupMenu = null
+var _context_menu_key: String = ""
+var _context_menu_kind: String = ""
+var _context_menu_role: String = ""
+var _context_menu_dirs: Array = []
+
 # ---------------------------------------------------------------------------
 # U5: batch pipeline session state
 # ---------------------------------------------------------------------------
@@ -266,6 +274,8 @@ func _on_panel_unload() -> void:
 		_file_dialog.queue_free()
 	if _password_dialog != null and is_instance_valid(_password_dialog):
 		_password_dialog.queue_free()
+	if _context_menu != null and is_instance_valid(_context_menu):
+		_context_menu.queue_free()
 
 # ---------------------------------------------------------------------------
 # UI construction
@@ -327,13 +337,14 @@ func _build_ui() -> void:
 	vault_hdr_lbl.text = "Vaults"
 	vault_hdr_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	vault_hdr.add_child(vault_hdr_lbl)
-	# W5h: a discoverable control to extract checked documents to a directory
-	# (previously only reachable via the buried File-menu item).
-	var vault_extract_btn := Button.new()
-	vault_extract_btn.text = "Extract Marked…"
-	vault_extract_btn.tooltip_text = "Extract checked documents to a directory…"
-	vault_extract_btn.pressed.connect(_on_export_marked_pressed)
-	vault_hdr.add_child(vault_extract_btn)
+	_extract_marked_menu = MenuButton.new()
+	_extract_marked_menu.text = "Extract Marked To"
+	_extract_marked_menu.tooltip_text = "Extract checked vault documents to a registered directory destination."
+	_extract_marked_menu.disabled = true
+	var extract_popup := _extract_marked_menu.get_popup()
+	extract_popup.about_to_popup.connect(_populate_extract_marked_popup)
+	extract_popup.id_pressed.connect(_on_extract_marked_menu_id_pressed)
+	vault_hdr.add_child(_extract_marked_menu)
 	var vault_add_btn := Button.new()
 	vault_add_btn.text = "+"
 	vault_add_btn.tooltip_text = "Add a vault destination…"
@@ -355,6 +366,7 @@ func _build_ui() -> void:
 		func(key: String) -> void:
 			_on_area_tree_file_activated(key)
 	)
+	_vault_area_tree.context_requested.connect(_on_area_tree_context_requested)
 	vault_area.add_child(_vault_area_tree)
 	dest_split.add_child(vault_area)
 
@@ -391,6 +403,7 @@ func _build_ui() -> void:
 		func(key: String) -> void:
 			_on_area_tree_file_activated(key)
 	)
+	_dir_area_tree.context_requested.connect(_on_area_tree_context_requested)
 	dir_area.add_child(_dir_area_tree)
 	dest_split.add_child(dir_area)
 
@@ -1091,6 +1104,86 @@ func _on_area_tree_file_activated(key: String) -> void:
 			return
 		set_status("Opening: %s" % key.get_file())
 		OS.shell_open(key)
+
+
+func _on_area_tree_context_requested(key: String, global_position: Vector2, kind: String, role: String) -> void:
+	if key.is_empty():
+		return
+	if _context_menu == null or not is_instance_valid(_context_menu):
+		_context_menu = PopupMenu.new()
+		_context_menu.id_pressed.connect(_on_context_menu_id_pressed)
+		add_child(_context_menu)
+	_context_menu.clear()
+	_context_menu_key = key
+	_context_menu_kind = kind
+	_context_menu_role = role
+	_context_menu_dirs = _directory_destinations()
+
+	if role == "dest:vault" and key.begins_with("doc:"):
+		_context_menu.add_item("Open", 0)
+		_context_menu.add_item("Edit Details...", 1)
+		var item: TreeItem = _find_item_by_key(_vault_area_tree, key) if _vault_area_tree != null else null
+		var encrypted: bool = bool(item.get_meta("encrypted", false)) if item != null else false
+		_context_menu.add_item("Decrypt" if encrypted else "Encrypt", 3 if encrypted else 2)
+		_context_menu.add_separator()
+		if _context_menu_dirs.is_empty():
+			_context_menu.add_item("Add a directory destination first", 900)
+		else:
+			for i in range(_context_menu_dirs.size()):
+				var dest: Dictionary = _context_menu_dirs[i]
+				var label: String = str(dest.get("label", dest.get("path", "Directory")))
+				_context_menu.add_item("Extract To %s" % label, 1000 + i)
+			_context_menu.add_separator()
+			_context_menu.add_item("Add Directory Destination...", 900)
+	elif role == "dest:directory":
+		if kind == "file":
+			_context_menu.add_item("Open", 0)
+		else:
+			_context_menu.add_item("Extract Marked Here", 5)
+			_context_menu.add_item("Open Folder", 6)
+	else:
+		return
+
+	_context_menu.position = Vector2i(int(global_position.x), int(global_position.y))
+	_context_menu.popup()
+
+
+func _on_context_menu_id_pressed(id: int) -> void:
+	if id == 900:
+		_on_dest_add_for_kind("directory")
+		return
+	if id == 0:
+		if _context_menu_role == "dest:directory" and _context_menu_kind == "folder":
+			var dir_path: String = _resolve_dir_path_from_key(_context_menu_key)
+			if not dir_path.is_empty():
+				OS.shell_open(dir_path)
+		else:
+			_on_area_tree_file_activated(_context_menu_key)
+		return
+	if id == 1:
+		if _context_menu_key.begins_with("doc:"):
+			_on_edit_doc_pressed(int(_context_menu_key.substr(4)))
+		return
+	if id == 2 or id == 3:
+		_on_doc_encrypt_toggle(_context_menu_key, id == 2)
+		return
+	if id == 5:
+		var dest_dir: String = _resolve_dir_path_from_key(_context_menu_key)
+		await _extract_checked_to_directory(dest_dir, dest_dir.get_file())
+		return
+	if id == 6:
+		var dir_path: String = _resolve_dir_path_from_key(_context_menu_key)
+		if not dir_path.is_empty():
+			OS.shell_open(dir_path)
+		return
+	if id >= 1000:
+		var idx := id - 1000
+		if idx < 0 or idx >= _context_menu_dirs.size():
+			return
+		var dest: Dictionary = _context_menu_dirs[idx]
+		var path: String = str(dest.get("path", ""))
+		var label: String = str(dest.get("label", path.get_file()))
+		await _extract_doc_keys_to_directory([_context_menu_key], path, label)
 
 
 ## W5d: walk both area trees to find the vault_path meta on the item with the given key.
@@ -2011,6 +2104,8 @@ func _on_process_all_pressed() -> void:
 	# Restore button states.
 	if _process_btn != null and is_instance_valid(_process_btn):
 		_process_btn.disabled = not _vault_is_open
+	if _extract_marked_menu != null and is_instance_valid(_extract_marked_menu):
+		_extract_marked_menu.disabled = not _vault_is_open
 	if _stop_btn != null and is_instance_valid(_stop_btn):
 		_stop_btn.disabled = true
 
@@ -2792,7 +2887,7 @@ func get_editor_actions() -> Array:
 	popup.add_separator()
 	popup.add_item("Settings...", 11)
 	popup.add_separator()
-	popup.add_item("Extract Marked...", 12)
+	popup.add_item("Extract Marked To...", 12)
 	popup.add_item("Recovery Sheet...", 13)
 	popup.add_separator()
 	popup.add_item("Close Vault", 2)
@@ -2825,6 +2920,8 @@ func _refresh_chrome_menu_state() -> void:
 	# U5: enable Process All when a vault is open (and no run is in progress).
 	if _process_btn != null and is_instance_valid(_process_btn):
 		_process_btn.disabled = not _vault_is_open
+	if _extract_marked_menu != null and is_instance_valid(_extract_marked_menu):
+		_extract_marked_menu.disabled = not _vault_is_open
 
 
 # ---------------------------------------------------------------------------
@@ -2941,12 +3038,102 @@ func _on_tree_file_dropped(drag_data: Dictionary, target_key: String, _target_ki
 
 
 # ---------------------------------------------------------------------------
-# U6: Export Marked to Disk
+# U6: Extract vault documents to directory destinations
 # ---------------------------------------------------------------------------
 
-## W5g: Extracts every checked vault document to a user-chosen directory.
-## One failure does NOT abort the loop — counts are summarised at the end.
-## Checkboxes are left as-is (they clear naturally on the next tree refresh).
+func _directory_destinations() -> Array:
+	var result: Array = []
+	var seen: Dictionary = {}
+	if _dir_area_provider != null and "last_destinations" in _dir_area_provider:
+		for d: Dictionary in _dir_area_provider.get("last_destinations"):
+			if str(d.get("kind", "")) != "directory":
+				continue
+			var id_key: String = str(d.get("id", d.get("path", "")))
+			if id_key.is_empty() or seen.has(id_key):
+				continue
+			seen[id_key] = true
+			result.append(d)
+	for d: Dictionary in _dest_registry:
+		if str(d.get("kind", "")) != "directory":
+			continue
+		var id_key: String = str(d.get("id", d.get("path", "")))
+		if id_key.is_empty() or seen.has(id_key):
+			continue
+		seen[id_key] = true
+		result.append(d)
+	return result
+
+
+func _get_checked_vault_doc_keys() -> Array:
+	var keys: Array = []
+	if _vault_area_tree == null or not is_instance_valid(_vault_area_tree):
+		return keys
+	for k: String in _vault_area_tree.get_checked_keys():
+		if k.begins_with("doc:"):
+			keys.append(k)
+	return keys
+
+
+func _count_encrypted_doc_keys(keys: Array) -> int:
+	var count := 0
+	for key: String in keys:
+		var item: TreeItem = _find_item_by_key(_vault_area_tree, key) if _vault_area_tree != null else null
+		if item != null and bool(item.get_meta("encrypted", false)):
+			count += 1
+	return count
+
+
+func _populate_extract_marked_popup() -> void:
+	if _extract_marked_menu == null or not is_instance_valid(_extract_marked_menu):
+		return
+	var popup: PopupMenu = _extract_marked_menu.get_popup()
+	popup.clear()
+	var keys: Array = _get_checked_vault_doc_keys()
+	var dirs: Array = _directory_destinations()
+	if keys.is_empty():
+		popup.add_item("No vault documents marked", -1)
+		popup.set_item_disabled(0, true)
+		return
+	if dirs.is_empty():
+		popup.add_item("Add a directory destination first", 900)
+		return
+	for i in range(dirs.size()):
+		var dest: Dictionary = dirs[i]
+		var label: String = str(dest.get("label", dest.get("path", "Directory")))
+		var path: String = str(dest.get("path", ""))
+		popup.add_item("%s  [%s]" % [label, path], 1000 + i)
+		popup.set_item_metadata(popup.item_count - 1, dest)
+	popup.add_separator()
+	popup.add_item("Add Directory Destination...", 900)
+
+
+func _on_extract_marked_menu_id_pressed(id: int) -> void:
+	if id == 900:
+		_on_dest_add_for_kind("directory")
+		return
+	if id < 1000:
+		return
+	var idx := id - 1000
+	var dirs: Array = _directory_destinations()
+	if idx < 0 or idx >= dirs.size():
+		return
+	var dest: Dictionary = dirs[idx]
+	var path: String = str(dest.get("path", ""))
+	var label: String = str(dest.get("label", path.get_file()))
+	await _extract_checked_to_directory(path, label)
+
+
+func _extract_checked_to_directory(dest_path: String, dest_label: String) -> void:
+	var keys: Array = _get_checked_vault_doc_keys()
+	if keys.is_empty():
+		set_status("No documents marked for extraction.")
+		return
+	await _extract_doc_keys_to_directory(keys, dest_path, dest_label)
+
+
+## W5i: Extracts checked vault documents to a registered directory destination.
+## If invoked from the File menu and multiple directory destinations exist, the
+## modal picker lists only those destinations; it no longer browses arbitrary paths.
 func _on_export_marked_pressed() -> void:
 	if not _vault_is_open:
 		set_status("Open a vault first.")
@@ -2955,25 +3142,19 @@ func _on_export_marked_pressed() -> void:
 	if conn == null:
 		set_status("ERROR: scansort plugin not running.")
 		return
-
-	# W5g: collect checked keys from the VISIBLE vault area tree.
-	var all_keys: Array = []
-	if _vault_area_tree != null and is_instance_valid(_vault_area_tree):
-		all_keys = _vault_area_tree.get_checked_keys()
-	var keys: Array = []
-	for k: String in all_keys:
-		if k.begins_with("doc:"):
-			keys.append(k)
+	var keys: Array = _get_checked_vault_doc_keys()
 	if keys.is_empty():
 		set_status("No documents marked for extraction.")
 		return
 
-	# W5g: show target picker — registered directory destinations + Browse.
-	var dir_dests: Array = []
-	if _dir_area_provider != null and "last_destinations" in _dir_area_provider:
-		for d: Dictionary in _dir_area_provider.get("last_destinations"):
-			if str(d.get("kind", "")) == "directory":
-				dir_dests.append(d)
+	var dir_dests: Array = _directory_destinations()
+	if dir_dests.is_empty():
+		set_status("Add a directory destination before extracting.")
+		return
+	if dir_dests.size() == 1:
+		var only: Dictionary = dir_dests[0]
+		await _extract_doc_keys_to_directory(keys, str(only.get("path", "")), str(only.get("label", only.get("path", "Directory"))))
+		return
 
 	var dlg: AcceptDialog = _ExtractTargetDialog.new()
 	(dlg as Object).call("set_destinations", dir_dests)
@@ -3002,7 +3183,28 @@ func _on_export_marked_pressed() -> void:
 	if chosen_path.is_empty():
 		return  # user cancelled
 
-	# Extract each checked document to the chosen directory.
+	await _extract_doc_keys_to_directory(keys, chosen_path, chosen_path.get_file())
+
+
+func _extract_doc_keys_to_directory(keys: Array, chosen_path: String, dest_label: String) -> void:
+	if chosen_path.is_empty():
+		set_status("Cannot extract: target directory is empty.")
+		return
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+
+	var encrypted_count: int = _count_encrypted_doc_keys(keys)
+	if encrypted_count > 0 and _vault_password.is_empty():
+		set_status("Unlock the vault before extracting encrypted documents.")
+		return
+	set_status("Extracting %d document(s)%s to %s..." % [
+		keys.size(),
+		" (%d encrypted)" % encrypted_count if encrypted_count > 0 else "",
+		dest_label if not dest_label.is_empty() else chosen_path,
+	])
+
 	var extracted: int = 0
 	var failed: int    = 0
 
@@ -3036,7 +3238,6 @@ func _on_export_marked_pressed() -> void:
 			extracted += 1
 
 	set_status("Extracted %d, %d failed" % [extracted, failed])
-	# Refresh directory tree so new files appear.
 	if _dir_area_tree != null and is_instance_valid(_dir_area_tree):
 		await _dir_area_tree.refresh()
 

@@ -29,6 +29,10 @@ signal check_toggled
 ## target_kind: always "folder" (only folder rows accept drops).
 signal file_dropped(drag_data: Dictionary, target_key: String, target_kind: String)
 
+## Emitted when the user right-clicks a rendered row.
+## key is the node key, kind is "folder" or "file", role is this tree's tree_role.
+signal context_requested(key: String, global_position: Vector2, kind: String, role: String)
+
 ## W5b: Emitted when one of the inline row buttons on a top-level destination row
 ## is clicked.  dest_id is the "dest:<id>" key without the prefix stripped, and
 ## action is one of "remove", "reprocess", or "lock_toggle".
@@ -350,6 +354,18 @@ func _on_gui_input(event: InputEvent) -> void:
 	if not event is InputEventMouseButton:
 		return
 	var mb: InputEventMouseButton = event
+	if mb.pressed and mb.button_index == MOUSE_BUTTON_RIGHT:
+		var context_item: TreeItem = get_item_at_position(mb.position)
+		if context_item == null:
+			return
+		context_requested.emit(
+			str(context_item.get_metadata(COL_NAME)),
+			get_global_mouse_position(),
+			str(context_item.get_meta("kind", "file")),
+			tree_role
+		)
+		accept_event()
+		return
 	if not mb.pressed or not mb.double_click or mb.button_index != MOUSE_BUTTON_LEFT:
 		return
 	var item: TreeItem = get_item_at_position(mb.position)
