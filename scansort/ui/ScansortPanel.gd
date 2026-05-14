@@ -68,6 +68,9 @@ const _UiScale: Script         = preload("ui_scale.gd")
 ## U7: disk tree provider (off-tree: no class_name).
 const _DiskProvider: Script = preload("scan_tree_disk_provider.gd")
 
+## W5: destination registry provider — vault or directory destination.
+const _DestinationProvider: Script = preload("scan_tree_destination_provider.gd")
+
 # ---------------------------------------------------------------------------
 # Signals
 # ---------------------------------------------------------------------------
@@ -117,13 +120,41 @@ var _chrome_popup: PopupMenu = null
 ## scan_tree bound to a provider, with the status panel as a bottom bar.
 ## Process All / Stop live in the editor chrome bar (get_editor_actions),
 ## not in the panel.
-## U7: DestPane is stacked: Vault tree (top) + Disk tree (bottom).
+## W5: DestPane is dynamic: N stacked scan_tree sub-trees, one per registered
+##     destination (from minerva_scansort_destination_list). The old fixed
+##     vault+disk pair is replaced by the destination registry.
 var _source_tree: Tree = null
+## W5: No longer used for main vault tree — kept for backward-compat reads in
+##     tests that check "_dest_tree". Points to the first dest tree or null.
 var _dest_tree:   Tree = null
+## W5: No longer the fixed disk tree. Kept as null; tests that check "_disk_tree"
+##     should migrate to the destinations array.
 var _disk_tree:   Tree = null
 var _source_provider: Object = null
+## W5: U7's fixed dest/disk providers are subsumed by the per-destination
+## _dest_providers array; these two stay declared (null) for smoke-test
+## member checks (R195) — the dynamic model replaces their function.
 var _dest_provider:   Object = null
 var _disk_provider:   Object = null
+
+## W5: per-registered-destination state. Parallel arrays indexed by position.
+##   _dest_registry      — Array[Dictionary]  — destination dicts from destination_list
+##   _dest_trees         — Array[Tree]         — one scan_tree per destination
+##   _dest_providers     — Array[Object]       — one DestinationProvider per destination
+##   _dest_containers    — Array[VBoxContainer] — one section container per destination
+## All four are rebuilt together in _refresh_dest_pane().
+var _dest_registry:    Array = []
+var _dest_trees:       Array = []
+var _dest_providers:   Array = []
+var _dest_containers:  Array = []
+
+## W5: The VBoxContainer that holds all destination sections + the add button.
+## Child of the DestPane column, created in _build_ui().
+var _dest_scroll_content: VBoxContainer = null
+
+## W5: registry_path required by destination_add/list/remove tools.
+## Provided at vault-open time (or via settings). Empty = feature unavailable.
+var _registry_path: String = ""
 ## Chrome-bar buttons — created in get_editor_actions(); the editor owns and
 ## frees them on teardown, so guard with is_instance_valid before use.
 var _process_btn: Button = null
@@ -236,29 +267,36 @@ func _build_ui() -> void:
 	source_col.add_child(_source_tree)
 	columns.add_child(source_col)
 
-	# --- Right column: destination pane (stacked: Vault + Disk) ---
+	# --- Right column: destination pane (W5: dynamic N-destination stack) ---
 	var dest_col := VBoxContainer.new()
 	dest_col.name = "DestPane"
 	dest_col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	dest_col.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	dest_col.custom_minimum_size.x = 200
 
-	# Vault section.
-	var dest_header := Label.new()
-	dest_header.text = "Vault"
-	dest_col.add_child(dest_header)
-	_dest_tree = _ScanTree.new()
-	_dest_tree.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	dest_col.add_child(_dest_tree)
+	# Column header row: "Destinations" label + "+" add button.
+	var dest_header_row := HBoxContainer.new()
+	var dest_header_lbl := Label.new()
+	dest_header_lbl.text = "Destinations"
+	dest_header_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	dest_header_row.add_child(dest_header_lbl)
+	var dest_add_btn := Button.new()
+	dest_add_btn.text = "+"
+	dest_add_btn.tooltip_text = "Add a destination…"
+	dest_add_btn.flat = false
+	dest_add_btn.pressed.connect(_on_dest_add_pressed)
+	dest_header_row.add_child(dest_add_btn)
+	dest_col.add_child(dest_header_row)
 
-	# Disk section (U7).
-	var disk_header := Label.new()
-	disk_header.text = "Disk"
-	dest_col.add_child(disk_header)
-	_disk_tree = _ScanTree.new()
-	_disk_tree.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	_disk_tree.tree_role = "disk"
-	dest_col.add_child(_disk_tree)
+	# Scrollable content area holding the per-destination sections.
+	var dest_scroll := ScrollContainer.new()
+	dest_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	dest_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	dest_col.add_child(dest_scroll)
+
+	_dest_scroll_content = VBoxContainer.new()
+	_dest_scroll_content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	dest_scroll.add_child(_dest_scroll_content)
 
 	columns.add_child(dest_col)
 
@@ -267,11 +305,8 @@ func _build_ui() -> void:
 	_status_panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	layout.add_child(_status_panel)
 
-	# U6: assign roles for drag context and wire signals.
+	# U6: assign source role for drag context.
 	_source_tree.tree_role = "source"
-	_dest_tree.tree_role   = "vault"
-	# Only the vault tree receives drops (source has no folder rows to land on).
-	_dest_tree.file_dropped.connect(_on_tree_file_dropped)
 	# Rebuild inject payload whenever source checkboxes change.
 	_source_tree.check_toggled.connect(_on_source_check_toggled)
 
@@ -548,7 +583,7 @@ func _on_vault_opened_r2(path: String, open_result: Dictionary) -> void:
 	var vault_info: Dictionary = open_result.get("info", {})
 	var vault_name: String = vault_info.get("name", path.get_file())
 
-	# U4: bind the source + vault providers to their scan_trees and refresh.
+	# U4: bind the source provider to its scan_tree and refresh.
 	# The source provider takes the vault path so it can flag in-vault files.
 	_source_provider = _SourceProvider.new()
 	_source_provider.init(conn, path)
@@ -556,18 +591,13 @@ func _on_vault_opened_r2(path: String, open_result: Dictionary) -> void:
 		_source_tree.set_provider(_source_provider)
 		await _source_tree.refresh()
 
-	_dest_provider = _VaultProvider.new()
-	_dest_provider.init(conn, path)
-	if _dest_tree != null and is_instance_valid(_dest_tree):
-		_dest_tree.set_provider(_dest_provider)
-		await _dest_tree.refresh()
+	# W5: derive registry_path from vault path (sibling .registry.json).
+	var base_dir: String = path.get_base_dir()
+	var stem: String     = path.get_file().get_basename()
+	_registry_path = "%s/%s.registry.json" % [base_dir, stem]
 
-	# U7: bind disk provider and refresh the disk tree.
-	_disk_provider = _DiskProvider.new()
-	_disk_provider.init(conn, path)
-	if _disk_tree != null and is_instance_valid(_disk_tree):
-		_disk_tree.set_provider(_disk_provider)
-		await _disk_tree.refresh()
+	# W5: load destinations and build the dynamic right column.
+	await _refresh_dest_pane(conn)
 
 	if _status_panel != null and is_instance_valid(_status_panel):
 		_status_panel.init(conn)
@@ -579,17 +609,280 @@ func _on_vault_closed_r2() -> void:
 	if _source_tree != null and is_instance_valid(_source_tree):
 		_source_tree.set_provider(null)
 		_source_tree.populate([])
-	if _dest_tree != null and is_instance_valid(_dest_tree):
-		_dest_tree.set_provider(null)
-		_dest_tree.populate([])
-	if _disk_tree != null and is_instance_valid(_disk_tree):
-		_disk_tree.set_provider(null)
-		_disk_tree.populate([])
+	# W5: clear all destination trees.
+	_clear_dest_pane()
 	_source_provider = null
-	_dest_provider = null
-	_disk_provider = null
+	_registry_path = ""
 	if _status_panel != null and is_instance_valid(_status_panel):
 		_status_panel.clear()
+
+
+# ---------------------------------------------------------------------------
+# W5: destination registry UI — build / refresh / add / remove
+# ---------------------------------------------------------------------------
+
+## Remove all destination section nodes from the scroll content and clear
+## the parallel arrays. Does NOT free the providers (RefCounted — auto-freed).
+func _clear_dest_pane() -> void:
+	for container in _dest_containers:
+		if container != null and is_instance_valid(container):
+			container.queue_free()
+	_dest_registry.clear()
+	_dest_trees.clear()
+	_dest_providers.clear()
+	_dest_containers.clear()
+	_dest_tree = null
+	_disk_tree = null
+
+
+## Fetch destination_list and rebuild the stacked sub-trees.
+## Async — awaits an MCP call then awaits each tree's refresh().
+func _refresh_dest_pane(conn: Object) -> void:
+	_clear_dest_pane()
+	if _dest_scroll_content == null or not is_instance_valid(_dest_scroll_content):
+		return
+	if conn == null:
+		return
+	if _registry_path.is_empty():
+		return
+
+	var result: Dictionary = await conn.call_tool(
+		"minerva_scansort_destination_list",
+		{"registry_path": _registry_path},
+	)
+	if not result.get("ok", false):
+		push_warning("[ScansortPanel] destination_list failed: %s" % result.get("error", "unknown"))
+		return
+
+	var destinations: Array = result.get("destinations", [])
+	_dest_registry = destinations.duplicate(true)
+
+	for dest: Dictionary in destinations:
+		_add_dest_section(conn, dest)
+
+	# Back-compat: _dest_tree points to first destination tree (if any) so tests
+	# that check panel._dest_tree still see a non-null Tree after open.
+	if _dest_trees.size() > 0:
+		_dest_tree = _dest_trees[0]
+
+	# Refresh each destination tree sequentially so the UI settles before return.
+	for i: int in range(_dest_trees.size()):
+		var tree: Tree = _dest_trees[i]
+		if tree != null and is_instance_valid(tree):
+			await (tree as Object).call("refresh")
+
+
+## Build one destination section: header row (label + remove button) + scan_tree.
+func _add_dest_section(conn: Object, dest: Dictionary) -> void:
+	if _dest_scroll_content == null or not is_instance_valid(_dest_scroll_content):
+		return
+
+	var dest_id: String = str(dest.get("id", ""))
+	var label: String   = str(dest.get("label", dest.get("path", dest_id)))
+	var kind: String    = str(dest.get("kind", ""))
+
+	var section := VBoxContainer.new()
+	section.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	section.add_theme_constant_override("separation", 2)
+	_dest_scroll_content.add_child(section)
+
+	# Header: "[kind icon] label" + "×" remove button.
+	var hdr := HBoxContainer.new()
+	var hdr_lbl := Label.new()
+	var kind_icon: String = "V:" if kind == "vault" else "D:"
+	hdr_lbl.text = "%s %s" % [kind_icon, label]
+	hdr_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	hdr_lbl.add_theme_font_size_override("font_size", 11)
+	hdr.add_child(hdr_lbl)
+
+	var remove_btn := Button.new()
+	remove_btn.text = "×"
+	remove_btn.tooltip_text = "Remove this destination from the registry"
+	remove_btn.flat = true
+	# Capture dest_id by value for the closure.
+	var captured_id := dest_id
+	remove_btn.pressed.connect(func() -> void:
+		_on_dest_remove_pressed(captured_id)
+	)
+	hdr.add_child(remove_btn)
+	section.add_child(hdr)
+
+	# Scan tree for this destination.
+	var st: Tree = _ScanTree.new()
+	st.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	st.custom_minimum_size.y = 80
+	st.tree_role = "dest:%s" % dest_id
+	section.add_child(st)
+
+	# Provider.
+	var provider: Object = _DestinationProvider.new()
+	provider.init(conn, _registry_path, dest)
+	st.set_provider(provider)
+
+	# Wire drop handler: pass dest_id so the handler knows which destination.
+	var captured_dest := dest.duplicate(true)
+	st.file_dropped.connect(func(drag_data: Dictionary, target_key: String, target_kind: String) -> void:
+		_on_tree_file_dropped(drag_data, target_key, target_kind, captured_dest)
+	)
+
+	_dest_trees.append(st)
+	_dest_providers.append(provider)
+	_dest_containers.append(section)
+
+
+## Refresh all existing destination trees from their providers.
+func _refresh_all_dest_trees() -> void:
+	for tree in _dest_trees:
+		if tree != null and is_instance_valid(tree):
+			await (tree as Object).call("refresh")
+
+
+## "+" add-destination button handler. Shows a simple dialog to pick kind + path.
+func _on_dest_add_pressed() -> void:
+	if not _vault_is_open:
+		set_status("Open a vault first.")
+		return
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+	if _registry_path.is_empty():
+		set_status("No registry path — open a vault first.")
+		return
+
+	# Build a simple inline add-destination dialog (AcceptDialog + VBoxContainer).
+	var dlg := AcceptDialog.new()
+	dlg.title = "Add Destination"
+	dlg.min_size = Vector2i(440, 220)
+	_UiScale.apply_to(dlg)
+
+	var vbox := VBoxContainer.new()
+	dlg.add_child(vbox)
+
+	# Kind selector.
+	var kind_row := HBoxContainer.new()
+	var kind_lbl := Label.new()
+	kind_lbl.text = "Kind:"
+	kind_row.add_child(kind_lbl)
+	var kind_opt := OptionButton.new()
+	kind_opt.add_item("Vault (.ssort)")
+	kind_opt.add_item("Directory")
+	kind_row.add_child(kind_opt)
+	vbox.add_child(kind_row)
+
+	# Label field.
+	var label_row := HBoxContainer.new()
+	var label_lbl := Label.new()
+	label_lbl.text = "Label:"
+	label_row.add_child(label_lbl)
+	var label_edit := LineEdit.new()
+	label_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	label_edit.placeholder_text = "e.g. Archived Invoices"
+	label_row.add_child(label_edit)
+	vbox.add_child(label_row)
+
+	# Path field + browse button.
+	var path_row := HBoxContainer.new()
+	var path_lbl := Label.new()
+	path_lbl.text = "Path:"
+	path_row.add_child(path_lbl)
+	var path_edit := LineEdit.new()
+	path_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	path_edit.placeholder_text = "/absolute/path/to/vault.ssort or /directory"
+	path_row.add_child(path_edit)
+	var browse_btn := Button.new()
+	browse_btn.text = "…"
+	browse_btn.tooltip_text = "Browse for a vault or directory"
+	path_row.add_child(browse_btn)
+	vbox.add_child(path_row)
+
+	add_child(dlg)
+
+	# Browse button opens a file/directory picker.
+	browse_btn.pressed.connect(func() -> void:
+		var picker := FileDialog.new()
+		_UiScale.apply_to(picker)
+		picker.access = FileDialog.ACCESS_FILESYSTEM
+		if kind_opt.selected == 0:
+			picker.file_mode = FileDialog.FILE_MODE_OPEN_FILE
+			picker.filters = PackedStringArray(["*.ssort ; Scansort Vault"])
+			picker.title = "Select Vault File"
+		else:
+			picker.file_mode = FileDialog.FILE_MODE_OPEN_DIR
+			picker.title = "Select Directory"
+		picker.file_selected.connect(func(p: String) -> void:
+			path_edit.text = p
+			picker.queue_free()
+		)
+		picker.dir_selected.connect(func(p: String) -> void:
+			path_edit.text = p
+			picker.queue_free()
+		)
+		picker.canceled.connect(func() -> void: picker.queue_free())
+		add_child(picker)
+		picker.popup_centered(Vector2i(700, 500))
+	)
+
+	dlg.confirmed.connect(func() -> void:
+		var kind_str: String = "vault" if kind_opt.selected == 0 else "directory"
+		var dest_path: String = path_edit.text.strip_edges()
+		var dest_label: String = label_edit.text.strip_edges()
+		if dest_path.is_empty():
+			set_status("Add destination: path is required.")
+			dlg.queue_free()
+			return
+		if dest_label.is_empty():
+			dest_label = dest_path.get_file()
+		_do_add_destination(conn, kind_str, dest_path, dest_label)
+		dlg.queue_free()
+	)
+	dlg.canceled.connect(func() -> void: dlg.queue_free())
+
+	dlg.popup_centered()
+
+
+## Call destination_add then refresh the pane.
+func _do_add_destination(conn: Object, kind: String, path: String, label: String) -> void:
+	set_status("Adding destination…")
+	var result: Dictionary = await conn.call_tool(
+		"minerva_scansort_destination_add",
+		{
+			"registry_path": _registry_path,
+			"kind":          kind,
+			"path":          path,
+			"label":         label,
+		},
+	)
+	if not result.get("ok", false):
+		set_status("ERROR: destination_add failed — %s" % result.get("error", "unknown"))
+		return
+	set_status("Destination added.")
+	await _refresh_dest_pane(conn)
+
+
+## "×" remove-destination button handler.
+func _on_dest_remove_pressed(dest_id: String) -> void:
+	if not _vault_is_open:
+		return
+	var conn = _get_connection()
+	if conn == null:
+		return
+	if _registry_path.is_empty():
+		return
+
+	set_status("Removing destination…")
+	var result: Dictionary = await conn.call_tool(
+		"minerva_scansort_destination_remove",
+		{
+			"registry_path": _registry_path,
+			"id":            dest_id,
+		},
+	)
+	if not result.get("ok", false):
+		set_status("ERROR: destination_remove failed — %s" % result.get("error", "unknown"))
+		return
+	set_status("Destination removed.")
+	await _refresh_dest_pane(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -803,12 +1096,9 @@ func _on_add_dialog_accepted(
 		_status_panel.set_status("Idle")
 	set_status("Document added to vault.")
 
-	# Refresh the destination pane so the new document shows up, and re-scan
-	# the source pane so the just-ingested file shows its in-vault mark.
-	if _dest_tree != null and is_instance_valid(_dest_tree):
-		await _dest_tree.refresh()
-	if _disk_tree != null and is_instance_valid(_disk_tree):
-		await _disk_tree.refresh()
+	# W5: refresh all destination trees so the new document shows up,
+	# and re-scan the source pane so the just-ingested file shows its in-vault mark.
+	await _refresh_all_dest_trees()
 	if _source_tree != null and is_instance_valid(_source_tree):
 		await _source_tree.refresh()
 
@@ -883,10 +1173,8 @@ func _on_process_all_pressed() -> void:
 			await get_tree().process_frame
 
 	# Run finished (or cancelled) — refresh trees.
-	if _dest_tree != null and is_instance_valid(_dest_tree):
-		await _dest_tree.refresh()
-	if _disk_tree != null and is_instance_valid(_disk_tree):
-		await _disk_tree.refresh()
+	# W5: refresh all destination trees then the source pane.
+	await _refresh_all_dest_trees()
 	if _source_tree != null and is_instance_valid(_source_tree):
 		await _source_tree.refresh()
 
@@ -1167,9 +1455,8 @@ func _on_edit_dialog_accepted(doc_id: int, updated_fields: Dictionary) -> void:
 		return
 
 	set_status("Document updated.")
-	# Refresh the destination pane so the updated metadata is visible.
-	if _dest_tree != null and is_instance_valid(_dest_tree):
-		await _dest_tree.refresh()
+	# W5: refresh all destination trees so updated metadata is visible.
+	await _refresh_all_dest_trees()
 
 
 # ---------------------------------------------------------------------------
@@ -1534,10 +1821,13 @@ func _refresh_chrome_menu_state() -> void:
 # U6: drag-to-classify / drag-to-reclassify
 # ---------------------------------------------------------------------------
 
-## Handles drops from either tree onto a vault category folder.
+## Handles drops from any tree onto a destination folder row.
+## W5: dest_context is the destination dict for the tree that received the drop
+##     (may be empty if called from a non-registry path, though that no longer
+##     occurs with the new wiring).
 ## drag_data.role == "source"  → classify source file into target category.
-## drag_data.role == "vault"   → reclassify vault document to target category.
-func _on_tree_file_dropped(drag_data: Dictionary, target_key: String, _target_kind: String) -> void:
+## drag_data.role starts with "dest:"  → reclassify within that destination.
+func _on_tree_file_dropped(drag_data: Dictionary, target_key: String, _target_kind: String, dest_context: Dictionary = {}) -> void:
 	if not _vault_is_open:
 		set_status("Open a vault first.")
 		return
@@ -1545,6 +1835,13 @@ func _on_tree_file_dropped(drag_data: Dictionary, target_key: String, _target_ki
 	if conn == null:
 		set_status("ERROR: scansort plugin not running.")
 		return
+
+	# Determine which vault to use: prefer dest_context's vault path (for vault
+	# destinations), fall back to the open vault.
+	var dest_kind: String    = str(dest_context.get("kind", ""))
+	var dest_vault: String   = _active_vault_path
+	if dest_kind == "vault":
+		dest_vault = str(dest_context.get("path", _active_vault_path))
 
 	var category: String = target_key.substr(4)  # strip "cat:" prefix
 	var role: String     = str(drag_data.get("role", ""))
@@ -1567,10 +1864,10 @@ func _on_tree_file_dropped(drag_data: Dictionary, target_key: String, _target_ki
 		var simhash: String = str(extract_res.get("simhash", "0000000000000000"))
 		var dhash:   String = str(extract_res.get("dhash",   "0000000000000000"))
 
-		# Dedup check.
+		# Dedup check against the target destination vault.
 		var dup_res: Dictionary = await conn.call_tool(
 			"minerva_scansort_check_sha256",
-			{"vault_path": _active_vault_path, "sha256": sha256}
+			{"vault_path": dest_vault, "sha256": sha256}
 		)
 		if dup_res.get("found", false):
 			set_status("Already in vault.")
@@ -1578,7 +1875,7 @@ func _on_tree_file_dropped(drag_data: Dictionary, target_key: String, _target_ki
 
 		# Insert with user-assigned category (no AI classify step).
 		var insert_args: Dictionary = {
-			"vault_path":    _active_vault_path,
+			"vault_path":    dest_vault,
 			"file_path":     drag_key,
 			"category":      category,
 			"confidence":    1.0,
@@ -1604,18 +1901,16 @@ func _on_tree_file_dropped(drag_data: Dictionary, target_key: String, _target_ki
 			return
 
 		set_status("Filed %s → %s" % [fname, category])
-		if _dest_tree != null and is_instance_valid(_dest_tree):
-			await _dest_tree.refresh()
-		if _disk_tree != null and is_instance_valid(_disk_tree):
-			await _disk_tree.refresh()
+		# W5: refresh all destination trees + source.
+		await _refresh_all_dest_trees()
 		if _source_tree != null and is_instance_valid(_source_tree):
 			await _source_tree.refresh()
 
-	elif role == "vault":
-		# Drag-to-reclassify: doc:<id> → update category.
+	elif role == "vault" or role.begins_with("dest:"):
+		# Drag-to-reclassify: doc:<id> → update category in the destination vault.
 		var doc_id: int = int(drag_key.substr(4))  # strip "doc:" prefix
 		var upd_args: Dictionary = {
-			"vault_path": _active_vault_path,
+			"vault_path": dest_vault,
 			"doc_id":     doc_id,
 			"category":   category,
 		}
@@ -1631,10 +1926,8 @@ func _on_tree_file_dropped(drag_data: Dictionary, target_key: String, _target_ki
 			return
 
 		set_status("Reclassified → %s" % category)
-		if _dest_tree != null and is_instance_valid(_dest_tree):
-			await _dest_tree.refresh()
-		if _disk_tree != null and is_instance_valid(_disk_tree):
-			await _disk_tree.refresh()
+		# W5: refresh all destination trees.
+		await _refresh_all_dest_trees()
 
 
 # ---------------------------------------------------------------------------
@@ -1653,7 +1946,11 @@ func _on_export_marked_pressed() -> void:
 		set_status("ERROR: scansort plugin not running.")
 		return
 
-	var keys: Array = _dest_tree.get_checked_keys() if _dest_tree != null and is_instance_valid(_dest_tree) else []
+	# W5: collect checked keys from all destination trees.
+	var keys: Array = []
+	for tree in _dest_trees:
+		if tree != null and is_instance_valid(tree):
+			keys.append_array((tree as Object).call("get_checked_keys"))
 	if keys.is_empty():
 		set_status("No documents marked for export.")
 		return
@@ -1710,8 +2007,8 @@ func _on_export_marked_pressed() -> void:
 		exported += 1
 
 	set_status("Exported %d, %d failed, %d skipped" % [exported, failed, skipped])
-	if _disk_tree != null and is_instance_valid(_disk_tree):
-		await _disk_tree.refresh()
+	# W5: refresh all destination trees after export.
+	await _refresh_all_dest_trees()
 
 
 # ---------------------------------------------------------------------------
