@@ -340,6 +340,11 @@ func _build_ui() -> void:
 		func(dest_id: String, action: String) -> void:
 			_on_area_dest_button_pressed(dest_id, action)
 	)
+	# W5d: wire file_activated so double-click / open button opens the document.
+	_vault_area_tree.file_activated.connect(
+		func(key: String) -> void:
+			_on_area_tree_file_activated(key)
+	)
 	vault_area.add_child(_vault_area_tree)
 	dest_split.add_child(vault_area)
 
@@ -370,6 +375,11 @@ func _build_ui() -> void:
 	_dir_area_tree.dest_button_pressed.connect(
 		func(dest_id: String, action: String) -> void:
 			_on_area_dest_button_pressed(dest_id, action)
+	)
+	# W5d: wire file_activated for directory file rows (open directly via shell).
+	_dir_area_tree.file_activated.connect(
+		func(key: String) -> void:
+			_on_area_tree_file_activated(key)
 	)
 	dir_area.add_child(_dir_area_tree)
 	dest_split.add_child(dir_area)
@@ -924,12 +934,20 @@ func _on_area_dest_button_pressed(dest_id: String, action: String) -> void:
 
 	match action:
 		"remove":
+			# W5d: disallow removing the currently-open vault (it is the primary context).
+			var dest_path: String = str(dest_dict.get("path", ""))
+			if not dest_path.is_empty() and dest_path == _active_vault_path:
+				set_status("Cannot remove the currently-open vault destination.")
+				return
 			_on_dest_remove_pressed(dest_id)
 		"reprocess":
 			_on_dest_reprocess_pressed(dest_id, dest_label)
 		"lock_toggle":
 			# Toggle locked state; pass null for the reprocess_btn (not available here).
 			_on_dest_locked_toggled(dest_id, not is_locked, null)
+		"settings":
+			# W5d: vault-level settings popup — "Set/Change Password…" and other vault ops.
+			_on_vault_dest_settings_pressed(dest_id, dest_dict)
 
 
 ## W5b: find a destination dict from the area providers' last_destinations cache.
@@ -951,6 +969,99 @@ func _find_dest_by_id(dest_id: String) -> Dictionary:
 		if str(d.get("id", "")) == dest_id:
 			return d
 	return {}
+
+
+## W5d: handler for file_activated emitted by either area tree.
+## key starts with "doc:" → vault document: extract to temp dir then shell_open.
+## key is an absolute path → directory file: shell_open directly.
+func _on_area_tree_file_activated(key: String) -> void:
+	if key.begins_with("doc:"):
+		# Vault document — need to extract it first.
+		var doc_id: int = int(key.substr(4))
+		# Find the vault_path this doc belongs to by scanning the active tree item metas.
+		# We look up the item in both area trees and read the vault_path meta set by scan_tree.
+		var vault_path: String = _find_vault_path_for_doc_key(key)
+		if vault_path.is_empty():
+			# Fall back to the open vault path (most documents live there).
+			vault_path = _active_vault_path
+		if vault_path.is_empty():
+			set_status("Cannot open document: vault path unknown.")
+			return
+		var conn = _get_connection()
+		if conn == null:
+			set_status("ERROR: scansort plugin not running.")
+			return
+		# Extract to a temp subdir under the user data dir.
+		var tmp_dir: String = OS.get_user_data_dir().path_join("scansort_preview")
+		DirAccess.make_dir_recursive_absolute(tmp_dir)
+		set_status("Extracting document…")
+		var result: Dictionary = await conn.call_tool(
+			"minerva_scansort_extract_document",
+			{"vault_path": vault_path, "doc_id": doc_id, "dest": tmp_dir}
+		)
+		# extract_document returns {ok: true, path: "/abs/path/to/file"} on success.
+		if not result.get("ok", false):
+			set_status("ERROR: extract_document failed — %s" % result.get("error", "unknown"))
+			return
+		var out_path: String = str(result.get("path", ""))
+		if out_path.is_empty():
+			set_status("ERROR: extract_document returned no path.")
+			return
+		set_status("Opening: %s" % out_path.get_file())
+		OS.shell_open(out_path)
+	else:
+		# Directory file — absolute path, open directly.
+		if key.is_empty():
+			return
+		set_status("Opening: %s" % key.get_file())
+		OS.shell_open(key)
+
+
+## W5d: walk both area trees to find the vault_path meta on the item with the given key.
+## Returns "" if not found (caller falls back to _active_vault_path).
+func _find_vault_path_for_doc_key(key: String) -> String:
+	for tree in [_vault_area_tree, _dir_area_tree]:
+		if tree == null or not is_instance_valid(tree):
+			continue
+		var found: TreeItem = _find_item_by_key(tree as Tree, key)
+		if found != null and found.has_meta("vault_path"):
+			var vp: String = str(found.get_meta("vault_path", ""))
+			if not vp.is_empty():
+				return vp
+	return ""
+
+
+## W5d: vault destination [Settings] button → PopupMenu with vault-level actions.
+## Shows "Set/Change Password…" (reuses existing password dialog flow).
+func _on_vault_dest_settings_pressed(dest_id: String, dest_dict: Dictionary) -> void:
+	var dest_path: String = str(dest_dict.get("path", ""))
+	# Only support settings for the open vault for now (the only vault with a live conn).
+	if dest_path != _active_vault_path:
+		set_status("Settings are only available for the currently-open vault.")
+		return
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+
+	# Build a one-item PopupMenu anchored to the mouse position.
+	var menu := PopupMenu.new()
+	menu.add_item("Set / Change Password…", 0)
+	add_child(menu)
+	menu.id_pressed.connect(func(id: int) -> void:
+		match id:
+			0:
+				# Reuse the existing set-password dialog flow.
+				_pending_vault_path = _active_vault_path
+				_pending_password_action = "create"
+				_show_password_dialog_set()
+		if is_instance_valid(menu):
+			menu.queue_free()
+	)
+	menu.popup_on_parent(Rect2i(
+		int(get_viewport().get_mouse_position().x),
+		int(get_viewport().get_mouse_position().y),
+		0, 0))
 
 
 ## W5b: file_dropped handler wired to both area trees.

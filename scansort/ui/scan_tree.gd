@@ -42,10 +42,13 @@ const COL_DATE := 2
 const COLOR_FOLDER := Color(0.9, 0.85, 0.6)   # warm yellow
 const COLOR_FILE := Color(0.78, 0.85, 0.78)   # soft green
 
-# W5b: inline button IDs for destination rows.
+# W5b/W5d: inline button IDs for destination and document rows.
 const BTN_ID_REMOVE     := 0
 const BTN_ID_REPROCESS  := 1
 const BTN_ID_LOCK       := 2
+## W5d: additional button IDs.
+const BTN_ID_OPEN       := 3
+const BTN_ID_SETTINGS   := 4
 
 var _provider: Object = null
 
@@ -139,19 +142,33 @@ func _add_node(parent: TreeItem, node: Dictionary) -> void:
 		var children: Array = node.get("children", []) if node.get("children") is Array else []
 		for child: Dictionary in children:
 			_add_node(item, child)
-		# W5b: add inline action buttons on top-level destination rows.
+		# W5b/W5d: add inline action buttons on top-level destination rows.
 		# A destination row carries a "dest_id" field in its node dict.
+		# W5d: node_role ("vault_dest" / "dir_dest") controls which buttons appear.
+		# If node_role is absent (legacy test data), fall back to the old 3-button set.
 		var dest_id: String = str(node.get("dest_id", ""))
 		if not dest_id.is_empty():
 			var is_locked: bool = bool(node.get("locked", false))
-			# Use short text labels — cross-platform, no icon loading required.
-			item.add_button(COL_DATE, _make_icon_texture(), BTN_ID_REMOVE, false, "Remove destination")
-			item.add_button(COL_DATE, _make_icon_texture(), BTN_ID_REPROCESS, false, "Reprocess destination")
-			item.add_button(COL_DATE, _make_icon_texture(), BTN_ID_LOCK, false,
-				"Locked — click to unlock" if is_locked else "Unlocked — click to lock")
-			# Store dest_id + locked on the item for the button handler.
+			var node_role: String = str(node.get("node_role", ""))
 			item.set_meta("dest_id", dest_id)
 			item.set_meta("dest_locked", is_locked)
+			item.set_meta("node_role", node_role)
+			if node_role == "vault_dest":
+				# Vault destination: [Settings] + [Remove]
+				item.add_button(COL_DATE, _make_icon_settings(), BTN_ID_SETTINGS, false, "Vault settings")
+				item.add_button(COL_DATE, _make_icon_remove(), BTN_ID_REMOVE, false, "Remove destination")
+			elif node_role == "dir_dest":
+				# Directory destination: [Reprocess] + [Lock] + [Remove]
+				item.add_button(COL_DATE, _make_icon_reprocess(), BTN_ID_REPROCESS, false, "Reprocess destination")
+				item.add_button(COL_DATE, _make_icon_lock(is_locked), BTN_ID_LOCK, false,
+					"Locked — click to unlock" if is_locked else "Unlocked — click to lock")
+				item.add_button(COL_DATE, _make_icon_remove(), BTN_ID_REMOVE, false, "Remove destination")
+			else:
+				# Legacy / untagged: keep old 3-button set so existing tests pass.
+				item.add_button(COL_DATE, _make_icon_remove(),    BTN_ID_REMOVE,    false, "Remove destination")
+				item.add_button(COL_DATE, _make_icon_reprocess(), BTN_ID_REPROCESS, false, "Reprocess destination")
+				item.add_button(COL_DATE, _make_icon_lock(is_locked), BTN_ID_LOCK,  false,
+					"Locked — click to unlock" if is_locked else "Unlocked — click to lock")
 	else:
 		item.set_cell_mode(COL_CHECK, TreeItem.CELL_MODE_CHECK)
 		item.set_checked(COL_CHECK, false)
@@ -162,14 +179,131 @@ func _add_node(parent: TreeItem, node: Dictionary) -> void:
 		var tooltip: String = str(node.get("tooltip", ""))
 		if not tooltip.is_empty():
 			item.set_tooltip_text(COL_NAME, tooltip)
+		# W5d: document rows get an [Open] button; clicking it fires file_activated.
+		var file_node_role: String = str(node.get("node_role", ""))
+		if file_node_role == "document":
+			item.add_button(COL_DATE, _make_icon_open(), BTN_ID_OPEN, false, "Open document")
+			# vault_path needed by the panel to call extract_document.
+			item.set_meta("vault_path", str(node.get("vault_path", "")))
 
 
-## W5b: build a minimal 1×1 placeholder Texture2D for inline buttons.
-## We use text tooltips to distinguish button roles — cross-platform, no icon
-## file dependency. A real icon can be swapped in here later.
-func _make_icon_texture() -> Texture2D:
-	var img := Image.create(12, 12, false, Image.FORMAT_RGBA8)
-	img.fill(Color(0.7, 0.7, 0.7, 0.9))
+## W5d: programmatic 14×14 icons — visually distinct per action.
+## Technique: draw shapes onto Image, convert to ImageTexture.
+
+## Remove (X): two diagonal lines on a reddish background.
+func _make_icon_remove() -> Texture2D:
+	var img := Image.create(14, 14, false, Image.FORMAT_RGBA8)
+	img.fill(Color(0.0, 0.0, 0.0, 0.0))
+	var c := Color(0.9, 0.35, 0.35, 1.0)
+	for i in range(14):
+		img.set_pixel(i, i, c)
+		img.set_pixel(i, 13 - i, c)
+		if i > 0:
+			img.set_pixel(i - 1, i, c)
+			img.set_pixel(i - 1, 13 - i, c)
+	return ImageTexture.create_from_image(img)
+
+
+## Reprocess (circular arrow): arc of dots forming a clockwise sweep.
+func _make_icon_reprocess() -> Texture2D:
+	var img := Image.create(14, 14, false, Image.FORMAT_RGBA8)
+	img.fill(Color(0.0, 0.0, 0.0, 0.0))
+	var c := Color(0.4, 0.75, 0.95, 1.0)
+	var cx: float = 6.5
+	var cy: float = 6.5
+	var r: float  = 5.0
+	# Draw 270-degree arc (skip the bottom-right quadrant to suggest an open arrow).
+	for deg in range(45, 315):
+		var rad: float = deg * PI / 180.0
+		var px: int = int(cx + r * cos(rad))
+		var py: int = int(cy + r * sin(rad))
+		if px >= 0 and px < 14 and py >= 0 and py < 14:
+			img.set_pixel(px, py, c)
+	# Arrowhead at the break (pointing clockwise = down-right at ~315°).
+	img.set_pixel(11, 9, c)
+	img.set_pixel(12, 8, c)
+	img.set_pixel(11, 10, c)
+	return ImageTexture.create_from_image(img)
+
+
+## Lock (padlock): a rectangle body with an arc shackle on top.
+## is_locked: true = filled shackle (closed), false = open shackle.
+func _make_icon_lock(is_locked: bool) -> Texture2D:
+	var img := Image.create(14, 14, false, Image.FORMAT_RGBA8)
+	img.fill(Color(0.0, 0.0, 0.0, 0.0))
+	var body_col := Color(0.85, 0.75, 0.25, 1.0)   # gold body
+	var shackle_col := Color(0.85, 0.75, 0.25, 1.0) if is_locked else Color(0.6, 0.6, 0.6, 1.0)
+	# Body: 4×5 rectangle at bottom.
+	for x in range(4, 10):
+		for y in range(7, 13):
+			img.set_pixel(x, y, body_col)
+	# Keyhole: small dark dot in body centre.
+	img.set_pixel(6, 9, Color(0.2, 0.2, 0.2, 1.0))
+	img.set_pixel(7, 9, Color(0.2, 0.2, 0.2, 1.0))
+	# Shackle: U-shape arc at top.
+	img.set_pixel(4, 6, shackle_col)
+	img.set_pixel(9, 6, shackle_col)
+	img.set_pixel(4, 5, shackle_col)
+	img.set_pixel(9, 5, shackle_col)
+	if is_locked:
+		img.set_pixel(4, 4, shackle_col)
+		img.set_pixel(9, 4, shackle_col)
+		img.set_pixel(5, 3, shackle_col)
+		img.set_pixel(6, 3, shackle_col)
+		img.set_pixel(7, 3, shackle_col)
+		img.set_pixel(8, 3, shackle_col)
+	else:
+		# Open shackle: right side only.
+		img.set_pixel(9, 4, shackle_col)
+		img.set_pixel(9, 3, shackle_col)
+		img.set_pixel(8, 2, shackle_col)
+	return ImageTexture.create_from_image(img)
+
+
+## Open / external-link (up-right arrow): diagonal arrow.
+func _make_icon_open() -> Texture2D:
+	var img := Image.create(14, 14, false, Image.FORMAT_RGBA8)
+	img.fill(Color(0.0, 0.0, 0.0, 0.0))
+	var c := Color(0.45, 0.85, 0.55, 1.0)  # green-ish
+	# Arrow shaft: diagonal from bottom-left to top-right.
+	for i in range(7):
+		img.set_pixel(2 + i, 10 - i, c)
+	# Arrowhead at top-right (8,3).
+	img.set_pixel(8, 3, c)
+	img.set_pixel(9, 3, c)
+	img.set_pixel(10, 3, c)
+	img.set_pixel(10, 4, c)
+	img.set_pixel(10, 5, c)
+	# Box outline (partial) for "external link" look.
+	for x in range(3, 9):
+		img.set_pixel(x, 11, c)
+	for y in range(5, 12):
+		img.set_pixel(3, y, c)
+	return ImageTexture.create_from_image(img)
+
+
+## Settings (gear): octagon with a filled centre.
+func _make_icon_settings() -> Texture2D:
+	var img := Image.create(14, 14, false, Image.FORMAT_RGBA8)
+	img.fill(Color(0.0, 0.0, 0.0, 0.0))
+	var c := Color(0.75, 0.75, 0.85, 1.0)  # light purple-grey
+	# Gear teeth: 8 bumps around centre.
+	var cx: float = 6.5
+	var cy: float = 6.5
+	for tooth in range(8):
+		var a: float = tooth * PI / 4.0
+		for r in [4.5, 5.5]:
+			var px: int = int(cx + r * cos(a))
+			var py: int = int(cy + r * sin(a))
+			if px >= 0 and px < 14 and py >= 0 and py < 14:
+				img.set_pixel(px, py, c)
+	# Filled centre circle radius ~2.
+	for x in range(4, 10):
+		for y in range(4, 10):
+			var dx: float = x - cx + 0.5
+			var dy: float = y - cy + 0.5
+			if dx * dx + dy * dy <= 6.5:
+				img.set_pixel(x, y, c)
 	return ImageTexture.create_from_image(img)
 
 
@@ -225,6 +359,13 @@ func _on_gui_input(event: InputEvent) -> void:
 # ---------------------------------------------------------------------------
 
 func _on_button_clicked(item: TreeItem, _column: int, btn_id: int, _mouse_button: int) -> void:
+	# W5d: [Open] button on document rows fires file_activated (same path as double-click).
+	if btn_id == BTN_ID_OPEN:
+		var file_key: String = str(item.get_metadata(COL_NAME))
+		if not file_key.is_empty():
+			file_activated.emit(file_key)
+		return
+
 	var dest_id: String = str(item.get_meta("dest_id", ""))
 	if dest_id.is_empty():
 		return
@@ -235,6 +376,8 @@ func _on_button_clicked(item: TreeItem, _column: int, btn_id: int, _mouse_button
 			dest_button_pressed.emit(dest_id, "reprocess")
 		BTN_ID_LOCK:
 			dest_button_pressed.emit(dest_id, "lock_toggle")
+		BTN_ID_SETTINGS:
+			dest_button_pressed.emit(dest_id, "settings")
 
 
 # ---------------------------------------------------------------------------

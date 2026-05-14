@@ -34,6 +34,10 @@ var _open_vault_path: String = ""
 ## Latest destination list fetched (used by the panel to resolve dest_id from key).
 var last_destinations: Array = []
 
+## W5d: vault path currently being built into category nodes (threaded through
+## _build_category_nodes so doc rows can carry vault_path for extract_document).
+var _building_vault_path: String = ""
+
 
 ## Attach connection + registry path + area kind.  Call before get_tree_data().
 ## open_vault_path: for vault areas, pass the currently-open vault path so it
@@ -97,14 +101,15 @@ func get_tree_data() -> Array:
 		var open_children: Array = await _get_vault_children_by_path(_open_vault_path)
 
 		nodes.append({
-			"kind":     "folder",
-			"name":     open_label,
-			"key":      "dest:%s" % (open_dest_id if not open_dest_id.is_empty() else _open_vault_path),
-			"date":     "",
-			"tooltip":  _open_vault_path,
-			"children": open_children,
-			"dest_id":  open_dest_id,
-			"locked":   open_locked,
+			"kind":      "folder",
+			"name":      open_label,
+			"key":       "dest:%s" % (open_dest_id if not open_dest_id.is_empty() else _open_vault_path),
+			"date":      "",
+			"tooltip":   _open_vault_path,
+			"children":  open_children,
+			"dest_id":   open_dest_id,
+			"locked":    open_locked,
+			"node_role": "vault_dest",
 		})
 
 		# Append any OTHER registry vault destinations (deduped: skip open vault).
@@ -120,14 +125,15 @@ func get_tree_data() -> Array:
 			var is_locked: bool  = bool(dest.get("locked", false))
 			var children: Array  = await _get_vault_children(dest)
 			nodes.append({
-				"kind":     "folder",
-				"name":     label,
-				"key":      "dest:%s" % dest_id,
-				"date":     "",
-				"tooltip":  label,
-				"children": children,
-				"dest_id":  dest_id,
-				"locked":   is_locked,
+				"kind":      "folder",
+				"name":      label,
+				"key":       "dest:%s" % dest_id,
+				"date":      "",
+				"tooltip":   label,
+				"children":  children,
+				"dest_id":   dest_id,
+				"locked":    is_locked,
+				"node_role": "vault_dest",
 			})
 	else:
 		# Directory area: registry-driven (unchanged from W5b).
@@ -140,14 +146,15 @@ func get_tree_data() -> Array:
 			var is_locked: bool  = bool(dest.get("locked", false))
 			var children: Array  = await _get_directory_children(dest)
 			nodes.append({
-				"kind":     "folder",
-				"name":     label,
-				"key":      "dest:%s" % dest_id,
-				"date":     "",
-				"tooltip":  label,
-				"children": children,
-				"dest_id":  dest_id,
-				"locked":   is_locked,
+				"kind":      "folder",
+				"name":      label,
+				"key":       "dest:%s" % dest_id,
+				"date":      "",
+				"tooltip":   label,
+				"children":  children,
+				"dest_id":   dest_id,
+				"locked":    is_locked,
+				"node_role": "dir_dest",
 			})
 
 	return nodes
@@ -171,6 +178,7 @@ func _get_vault_children_by_path(vault_path: String) -> Array:
 		push_warning("[AreaProvider] open vault query_documents failed: %s" % result.get("error", "unknown"))
 		return []
 
+	_building_vault_path = vault_path
 	return _build_category_nodes(result.get("documents", []))
 
 
@@ -187,6 +195,7 @@ func _get_vault_children(dest: Dictionary) -> Array:
 		push_warning("[AreaProvider] vault query_documents failed: %s" % result.get("error", "unknown"))
 		return []
 
+	_building_vault_path = vault_path
 	return _build_category_nodes(result.get("documents", []))
 
 
@@ -218,12 +227,14 @@ func _build_category_nodes(docs: Array) -> Array:
 			var sender: String = str(doc.get("sender", ""))
 			var desc: String = str(doc.get("description", ""))
 			children.append({
-				"kind":    "file",
-				"name":    display,
-				"key":     "doc:%d" % doc_id,
-				"date":    str(doc.get("doc_date", "")),
-				"tooltip": "%s\nSender: %s\n%s" % [display, sender, desc],
-				"children": [],
+				"kind":       "file",
+				"name":       display,
+				"key":        "doc:%d" % doc_id,
+				"date":       str(doc.get("doc_date", "")),
+				"tooltip":    "%s\nSender: %s\n%s" % [display, sender, desc],
+				"children":   [],
+				"node_role":  "document",
+				"vault_path": _building_vault_path,
 			})
 		nodes.append({
 			"kind":     "folder",
@@ -286,12 +297,13 @@ func _get_directory_children(dest: Dictionary) -> Array:
 			var rel: String   = str(f.get("rel_path", fname))
 			var size: int     = int(f.get("size", 0))
 			children.append({
-				"kind":     "file",
-				"name":     fname,
-				"key":      fpath,
-				"date":     "",
-				"tooltip":  "%s\nSize: %d bytes" % [rel, size],
-				"children": [],
+				"kind":      "file",
+				"name":      fname,
+				"key":       fpath,
+				"date":      "",
+				"tooltip":   "%s\nSize: %d bytes" % [rel, size],
+				"children":  [],
+				"node_role": "document",
 			})
 		nodes.append({
 			"kind":     "folder",
