@@ -226,6 +226,9 @@ func _on_file_menu_id_pressed(id: int) -> void:
 		4: _on_rules_editor_pressed()
 		5: _on_vault_registry_pressed()
 		7: _on_checklist_pressed()
+		8: _on_library_rules_editor_pressed()
+		9: _on_create_vault_rules_pressed()
+		10: _on_use_library_rules_pressed()
 
 
 func _on_new_vault_pressed() -> void:
@@ -825,7 +828,24 @@ func _on_edit_dialog_accepted(doc_id: int, updated_fields: Dictionary) -> void:
 # R4: Rules Editor flow
 # ---------------------------------------------------------------------------
 
-## Called when user picks "Rules Editor…" from the File menu.
+## Sibling rules path for the currently-open vault.
+## /a/b/foo.ssort → /a/b/foo.rules.json. Empty if no vault is open.
+func _vault_rules_path() -> String:
+	if _active_vault_path.is_empty():
+		return ""
+	var base_dir: String = _active_vault_path.get_base_dir()
+	var stem: String     = _active_vault_path.get_file().get_basename()
+	return "%s/%s.rules.json" % [base_dir, stem]
+
+
+## User-level library rules path. Lives in the Minerva per-user data dir so
+## it survives across vaults and across project tree moves.
+func _library_rules_path() -> String:
+	return OS.get_user_data_dir() + "/scansort_rules.json"
+
+
+## Called when user picks "Vault Rules Editor…" from the File menu (id 4).
+## Edits the sibling .rules.json of the currently-open vault.
 func _on_rules_editor_pressed() -> void:
 	if not _vault_is_open:
 		set_status("Open a vault first.")
@@ -835,20 +855,92 @@ func _on_rules_editor_pressed() -> void:
 		set_status("ERROR: scansort plugin not running.")
 		return
 
+	var rules_path: String = _vault_rules_path()
+	var label: String = "Vault rules: " + rules_path.get_file()
+
 	var dlg = _RulesEditorDialog.new()
 	add_child(dlg)
-	dlg.init(conn, _active_vault_path, _vault_password)
-	# rules_changed is a no-op for now (panel does not cache a rules list).
-	# If a cached rules list is added in R5/R6, connect here.
+	dlg.init_with_rules_path(conn, rules_path, label)
 	dlg.rules_changed.connect(
 		func() -> void:
-			pass  # no-op: panel has no cached rules list to invalidate in R4
+			pass  # panel has no cached rules list to invalidate
 	)
 	dlg.closed.connect(
 		func() -> void:
 			dlg.queue_free()
 	)
 	dlg.popup_centered(Vector2i(880, 580))
+
+
+## Called when user picks "Library Rules Editor…" from the File menu (id 8).
+## Edits the user-level scansort_rules.json. Available without a vault open.
+func _on_library_rules_editor_pressed() -> void:
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+
+	var rules_path: String = _library_rules_path()
+	var label: String = "Library rules"
+
+	var dlg = _RulesEditorDialog.new()
+	add_child(dlg)
+	dlg.init_with_rules_path(conn, rules_path, label)
+	dlg.rules_changed.connect(
+		func() -> void:
+			pass
+	)
+	dlg.closed.connect(
+		func() -> void:
+			dlg.queue_free()
+	)
+	dlg.popup_centered(Vector2i(880, 580))
+
+
+## Create a vault-specific rules file by copying the library file to the
+## sibling location. Only meaningful when a vault is open.
+func _on_create_vault_rules_pressed() -> void:
+	if not _vault_is_open:
+		set_status("Open a vault first.")
+		return
+	var sibling: String = _vault_rules_path()
+	if FileAccess.file_exists(sibling):
+		set_status("Vault already has its own rules file: " + sibling.get_file())
+		return
+	var library: String = _library_rules_path()
+	if not FileAccess.file_exists(library):
+		set_status("No library rules file to seed from. Use 'Library Rules Editor' first.")
+		return
+	var src := FileAccess.open(library, FileAccess.READ)
+	if src == null:
+		set_status("Could not read library rules: " + library)
+		return
+	var content: String = src.get_as_text()
+	src.close()
+	var dst := FileAccess.open(sibling, FileAccess.WRITE)
+	if dst == null:
+		set_status("Could not write sibling rules: " + sibling)
+		return
+	dst.store_string(content)
+	dst.close()
+	set_status("Created vault-specific rules: " + sibling.get_file())
+
+
+## Delete the sibling rules file so the vault falls back to the library file.
+## Only meaningful when a vault is open and a sibling rules file exists.
+func _on_use_library_rules_pressed() -> void:
+	if not _vault_is_open:
+		set_status("Open a vault first.")
+		return
+	var sibling: String = _vault_rules_path()
+	if not FileAccess.file_exists(sibling):
+		set_status("No vault-specific rules file to remove.")
+		return
+	var err := DirAccess.remove_absolute(sibling)
+	if err != OK:
+		set_status("Could not remove sibling rules file (error %d): %s" % [err, sibling])
+		return
+	set_status("Removed vault-specific rules; library rules will be used.")
 
 
 # ---------------------------------------------------------------------------
@@ -970,7 +1062,11 @@ func get_editor_actions() -> Array:
 	popup.add_item("Open Vault...", 1)
 	popup.add_separator()
 	popup.add_item("Add Document...", 3)
-	popup.add_item("Rules Editor...", 4)
+	popup.add_item("Vault Rules Editor...", 4)
+	popup.add_item("Library Rules Editor...", 8)
+	popup.add_separator()
+	popup.add_item("Create Vault-Specific Rules", 9)
+	popup.add_item("Use Library Rules (remove sibling)", 10)
 	popup.add_separator()
 	popup.add_item("Vault Registry...", 5)
 	popup.add_item("Checklist...", 7)
@@ -1014,12 +1110,15 @@ func get_editor_actions() -> Array:
 
 
 ## Disable File-menu items that require an open vault when no vault is open.
-## Always enabled: New Vault (0), Open Vault (1), Vault Registry (5).
-## Vault-gated: Close (2), Add Document (3), Rules Editor (4), Checklist (7).
+## Always enabled: New Vault (0), Open Vault (1), Vault Registry (5),
+##                 Library Rules Editor (8).
+## Vault-gated: Close (2), Add Document (3), Vault Rules Editor (4),
+##              Checklist (7), Create Vault-Specific Rules (9),
+##              Use Library Rules (10).
 func _refresh_chrome_menu_state() -> void:
 	if _chrome_popup == null or not is_instance_valid(_chrome_popup):
 		return
-	var vault_gated: Array[int] = [2, 3, 4, 7]
+	var vault_gated: Array[int] = [2, 3, 4, 7, 9, 10]
 	for item_id in vault_gated:
 		var idx: int = _chrome_popup.get_item_index(item_id)
 		if idx >= 0:

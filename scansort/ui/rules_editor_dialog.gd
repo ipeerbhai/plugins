@@ -1,13 +1,21 @@
 extends AcceptDialog
-## Classification Rules Editor dialog — T7 R4.
+## Classification Rules Editor dialog — T7 R4 / Rules-File R6.
 ##
-## Full CRUD for vault classification rules.  Unlike edit_details_dialog, this
-## dialog calls MCP tools directly (it holds the plugin connection + vault
-## credentials) so the panel only needs to connect rules_changed.
+## Full CRUD for classification rules. As of R6 the dialog operates on an
+## external rules JSON file (`rules_path`) rather than the vault's embedded
+## rules table — the embedded table is deprecated and read-only.
+##
+## Two entry points:
+##
+##   # Preferred — pass an explicit rules file path:
+##   dlg.init_with_rules_path(conn, rules_path, source_label)
+##
+##   # Back-compat — derive sibling path from vault_path:
+##   dlg.init(conn, vault_path, vault_password)   # password unused
 ##
 ## Usage:
 ##   var dlg = preload("rules_editor_dialog.gd").new()
-##   dlg.init(conn, vault_path, vault_password)
+##   dlg.init_with_rules_path(conn, "/path/to/rules.json", "Vault rules")
 ##   add_child(dlg)
 ##   dlg.rules_changed.connect(_on_rules_changed)
 ##   dlg.popup_centered(Vector2(860, 560))
@@ -26,6 +34,9 @@ signal closed
 # ---------------------------------------------------------------------------
 
 var _conn: Object  = null
+var _rules_path:   String = ""    # external rules JSON file (R6)
+var _source_label: String = ""    # human-readable origin (e.g. "Library rules", "Vault rules")
+# Retained for back-compat callers; not forwarded to MCP after R4.
 var _vault_path:   String = ""
 var _vault_password: String = ""   # never logged
 
@@ -59,7 +70,10 @@ var _export_dialog: FileDialog = null
 
 
 func _ready() -> void:
-	title = "Classification Rules"
+	if _source_label.is_empty():
+		title = "Classification Rules"
+	else:
+		title = "Classification Rules — %s" % _source_label
 	min_size = Vector2(860, 560)
 	# AcceptDialog OK button → save changes.
 	ok_button_text = "Save Changes"
@@ -69,13 +83,37 @@ func _ready() -> void:
 	_build_ui()
 
 
-## Inject vault connection + credentials, then load rules.
+## Preferred (R6+) init: explicit rules file path + label.
+##
+## rules_path:   absolute path to the JSON file (e.g. <vault>.rules.json sibling
+##               or a user-level library file). Created on first save if absent.
+## source_label: short string shown in the dialog title to identify the source
+##               (e.g. "Library rules", "Vault rules: testvault.rules.json").
+func init_with_rules_path(conn: Object, rules_path: String, source_label: String) -> void:
+	_conn         = conn
+	_rules_path   = rules_path
+	_source_label = source_label
+	# refresh() requires the scene tree — defer until after add_child().
+	call_deferred("refresh")
+
+
+## Back-compat init (T7 R4 era): derives the sibling rules file path from the
+## vault path. `vault_password` is retained in the signature for ABI stability
+## but unused — rule operations no longer require the vault password.
 func init(conn: Object, vault_path: String, vault_password: String) -> void:
 	_conn          = conn
 	_vault_path    = vault_path
 	_vault_password = vault_password
-	# refresh() requires the scene tree — defer until after add_child().
-	call_deferred("refresh")
+	# Derive sibling: /a/b/foo.ssort  →  /a/b/foo.rules.json
+	var rules_path: String = ""
+	if not vault_path.is_empty():
+		var base_dir: String = vault_path.get_base_dir()
+		var stem: String     = vault_path.get_file().get_basename()
+		rules_path = "%s/%s.rules.json" % [base_dir, stem]
+	var label: String = "Vault rules"
+	if not rules_path.is_empty():
+		label += ": " + rules_path.get_file()
+	init_with_rules_path(conn, rules_path, label)
 
 
 # ---------------------------------------------------------------------------
@@ -222,16 +260,15 @@ func _build_ui() -> void:
 # Public API
 # ---------------------------------------------------------------------------
 
-## Reload rules from the vault and repopulate the list.
+## Reload rules from the rules file and repopulate the list.
 func refresh() -> void:
-	if _conn == null or _vault_path.is_empty():
+	if _conn == null or _rules_path.is_empty():
 		return
 
-	var args: Dictionary = {"path": _vault_path}
-	if not _vault_password.is_empty():
-		args["password"] = _vault_password
-
-	var result: Dictionary = await _conn.call_tool("minerva_scansort_list_rules", args)
+	var result: Dictionary = await _conn.call_tool(
+		"minerva_scansort_list_rules",
+		{"rules_path": _rules_path},
+	)
 	if not result.get("ok", false):
 		_show_error("list_rules failed: %s" % result.get("error", "unknown"))
 		return
@@ -394,11 +431,10 @@ func _execute_delete() -> void:
 		_show_error("Cannot delete: rule has no label.")
 		return
 
-	var args: Dictionary = {"path": _vault_path, "label": rule_label}
-	if not _vault_password.is_empty():
-		args["password"] = _vault_password
-
-	var result: Dictionary = await conn.call_tool("minerva_scansort_delete_rule", args)
+	var result: Dictionary = await conn.call_tool(
+		"minerva_scansort_delete_rule",
+		{"rules_path": _rules_path, "label": rule_label},
+	)
 	if not result.get("ok", false):
 		_show_error("delete_rule failed: %s" % result.get("error", "unknown"))
 		return
@@ -431,44 +467,39 @@ func _on_save_pressed() -> void:
 		_show_error("Label is required.")
 		return
 
-	var base_args: Dictionary = {"path": _vault_path}
-	if not _vault_password.is_empty():
-		base_args["password"] = _vault_password
-
 	if _is_new_rule:
-		# Insert.
-		var ins_args: Dictionary = base_args.duplicate()
-		ins_args["label"]                = rule_label
-		ins_args["name"]                 = str(rule.get("name", ""))
-		ins_args["instruction"]          = str(rule.get("instruction", ""))
-		ins_args["signals"]              = rule.get("signals", [])
-		ins_args["subfolder"]            = str(rule.get("subfolder", ""))
-		ins_args["confidence_threshold"] = float(rule.get("confidence_threshold", 0.6))
-		ins_args["enabled"]              = rule.get("enabled", true)
-		ins_args["encrypt"]              = rule.get("encrypt", false)
-
+		# Insert (upserts in R4 file-mode if label already exists).
+		var ins_args: Dictionary = {
+			"rules_path":           _rules_path,
+			"label":                rule_label,
+			"name":                 str(rule.get("name", "")),
+			"instruction":          str(rule.get("instruction", "")),
+			"signals":              rule.get("signals", []),
+			"subfolder":            str(rule.get("subfolder", "")),
+			"confidence_threshold": float(rule.get("confidence_threshold", 0.6)),
+			"enabled":              rule.get("enabled", true),
+			"encrypt":              rule.get("encrypt", false),
+		}
 		var ins_result: Dictionary = await conn.call_tool("minerva_scansort_insert_rule", ins_args)
 		if not ins_result.get("ok", false):
 			_show_error("insert_rule failed: %s" % ins_result.get("error", "unknown"))
 			return
 		_is_new_rule = false
-		# Store the server-assigned rule_id back into our in-memory copy.
-		if ins_result.has("rule_id"):
-			_rules[_current_index]["rule_id"] = ins_result["rule_id"]
 	else:
 		# Update — send the whole rule as the updates dict.
-		var upd_args: Dictionary = base_args.duplicate()
-		upd_args["label"]   = rule_label
-		upd_args["updates"] = {
-			"name":                 rule.get("name", ""),
-			"instruction":          rule.get("instruction", ""),
-			"signals":              rule.get("signals", []),
-			"subfolder":            rule.get("subfolder", ""),
-			"confidence_threshold": float(rule.get("confidence_threshold", 0.6)),
-			"enabled":              rule.get("enabled", true),
-			"encrypt":              rule.get("encrypt", false),
+		var upd_args: Dictionary = {
+			"rules_path": _rules_path,
+			"label":      rule_label,
+			"updates": {
+				"name":                 rule.get("name", ""),
+				"instruction":          rule.get("instruction", ""),
+				"signals":              rule.get("signals", []),
+				"subfolder":            rule.get("subfolder", ""),
+				"confidence_threshold": float(rule.get("confidence_threshold", 0.6)),
+				"enabled":              rule.get("enabled", true),
+				"encrypt":              rule.get("encrypt", false),
+			},
 		}
-
 		var upd_result: Dictionary = await conn.call_tool("minerva_scansort_update_rule", upd_args)
 		if not upd_result.get("ok", false):
 			_show_error("update_rule failed: %s" % upd_result.get("error", "unknown"))
@@ -510,11 +541,10 @@ func _on_import_file_selected(file_path: String) -> void:
 	var json_text: String = fa.get_as_text()
 	fa.close()
 
-	var args: Dictionary = {"path": _vault_path, "json_text": json_text}
-	if not _vault_password.is_empty():
-		args["password"] = _vault_password
-
-	var result: Dictionary = await conn.call_tool("minerva_scansort_import_rules_from_json", args)
+	var result: Dictionary = await conn.call_tool(
+		"minerva_scansort_import_rules_from_json",
+		{"rules_path": _rules_path, "json_text": json_text},
+	)
 	if not result.get("ok", false):
 		_show_error("import_rules failed: %s" % result.get("error", "unknown"))
 		return
@@ -549,11 +579,10 @@ func _on_export_file_selected(file_path: String) -> void:
 		_show_error("Plugin not connected.")
 		return
 
-	var args: Dictionary = {"path": _vault_path}
-	if not _vault_password.is_empty():
-		args["password"] = _vault_password
-
-	var result: Dictionary = await conn.call_tool("minerva_scansort_list_rules", args)
+	var result: Dictionary = await conn.call_tool(
+		"minerva_scansort_list_rules",
+		{"rules_path": _rules_path},
+	)
 	if not result.get("ok", false):
 		_show_error("list_rules failed: %s" % result.get("error", "unknown"))
 		return
