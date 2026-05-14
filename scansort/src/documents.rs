@@ -31,6 +31,7 @@ pub fn insert_document(
     simhash: &str,
     dhash: &str,
     source_path: &str,
+    rule_snapshot: &str,
 ) -> VaultResult<i64> {
     let fp = Path::new(file_path);
     if !fp.exists() {
@@ -85,8 +86,8 @@ pub fn insert_document(
         "INSERT INTO documents \
          (original_filename, file_ext, category, confidence, sender, \
           description, doc_date, classified_at, sha256, simhash, dhash, \
-          status, file_data, file_size, compression, source_path) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'zstd', ?15)",
+          status, file_data, file_size, compression, source_path, rule_snapshot) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'zstd', ?15, ?16)",
         params![
             original_filename,
             file_ext,
@@ -103,6 +104,7 @@ pub fn insert_document(
             compressed,
             original_size,
             effective_source,
+            rule_snapshot,
         ],
     ) {
         Ok(_) => conn.last_insert_rowid(),
@@ -214,7 +216,7 @@ pub fn query_documents(path: &str, filter: &DocumentFilter) -> VaultResult<Vec<D
         "SELECT doc_id, original_filename, file_ext, category, confidence, sender, \
          description, doc_date, classified_at, sha256, simhash, dhash, \
          status, file_size, compression, encryption_iv, source_path, \
-         display_name, tags \
+         display_name, tags, rule_snapshot \
          FROM documents {where_clause} ORDER BY classified_at DESC"
     );
 
@@ -254,6 +256,7 @@ pub fn query_documents(path: &str, filter: &DocumentFilter) -> VaultResult<Vec<D
             encrypted,
             tags,
             source_path: db::get_string(row, "source_path"),
+            rule_snapshot: db::get_string(row, "rule_snapshot"),
         })
     })?;
 
@@ -457,7 +460,7 @@ pub fn vault_inventory(path: &str) -> VaultResult<Vec<Document>> {
         "SELECT doc_id, original_filename, file_ext, category, confidence, sender, \
          description, doc_date, classified_at, sha256, simhash, dhash, \
          status, file_size, compression, encryption_iv, source_path, \
-         display_name, tags \
+         display_name, tags, rule_snapshot \
          FROM documents ORDER BY doc_id",
     )?;
 
@@ -493,6 +496,7 @@ pub fn vault_inventory(path: &str) -> VaultResult<Vec<Document>> {
             encrypted,
             tags,
             source_path: db::get_string(row, "source_path"),
+            rule_snapshot: db::get_string(row, "rule_snapshot"),
         })
     })?;
 

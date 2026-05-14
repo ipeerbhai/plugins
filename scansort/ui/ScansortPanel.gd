@@ -638,6 +638,9 @@ func _ingest_pipeline(file_path: String) -> void:
 	classification["simhash"]     = simhash
 	classification["dhash"]       = dhash
 	classification["source_file"] = file_path
+	# Carry rule_snapshot through the dialog so the vault keeps a per-doc record
+	# of the rule revision that produced this classification (vault v1.1.0+).
+	classification["rule_snapshot"] = classify_res.get("rule_snapshot", "")
 
 	# -- Step 4: Show dialog so user can review / edit --
 	var dlg = _AddDocumentDialog.new()
@@ -686,6 +689,7 @@ func _on_add_dialog_accepted(
 		"simhash":      simhash,
 		"dhash":        dhash,
 		"source_path":  file_path,
+		"rule_snapshot": str(final.get("rule_snapshot", "")),
 	}
 	# Pass password only if set.
 	if not _vault_password.is_empty():

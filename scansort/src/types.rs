@@ -80,6 +80,10 @@ pub struct Document {
     pub encrypted: bool,
     pub tags: Vec<String>,
     pub source_path: String,
+    /// JSON snapshot of the rule that classified this document (empty if none).
+    /// Populated by classify_document and persisted on insert (vault v1.1.0+).
+    #[serde(default)]
+    pub rule_snapshot: String,
 }
 
 // ---------------------------------------------------------------------------

@@ -384,9 +384,11 @@ fn handle_insert_document(params: &Value, id: Value) -> RpcResponse {
     let simhash = args.get("simhash").and_then(|v| v.as_str()).unwrap_or("");
     let dhash = args.get("dhash").and_then(|v| v.as_str()).unwrap_or("");
     let source_path = args.get("source_path").and_then(|v| v.as_str()).unwrap_or("");
+    let rule_snapshot = args.get("rule_snapshot").and_then(|v| v.as_str()).unwrap_or("");
     match documents::insert_document(
         vault_path, file_path, category, confidence, sender,
         description, doc_date, status, sha256, simhash, dhash, source_path,
+        rule_snapshot,
     ) {
         Ok(doc_id) => ok_response(id, tool_ok(json!({"ok": true, "doc_id": doc_id}))),
         Err(e) => ok_response(id, tool_err(&e.message)),
@@ -688,12 +690,26 @@ fn handle_classify_document(
         .unwrap_or("default");
     let model_spec = args.get("model_spec").cloned();
     let vault_id = args.get("vault_id").and_then(|v| v.as_str());
+    // Optional user-level rules path (host-provided). Layer 1 (sibling) is
+    // resolved automatically from vault_path. If both layers miss, classify
+    // errors out with a clear "no rules file" message.
+    let user_rules_path: Option<std::path::PathBuf> = args
+        .get("user_rules_path")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from);
 
-    // 1. Load rules
-    let rule_list = match rules::list_rules(vault_path, password) {
-        Ok(r) => r,
+    // 1. Load rules from external file (sibling > user-level fallback).
+    //    Suppresses use of the legacy embedded `rules` table for new classifies.
+    let rules_file_doc = match rules_file::load_for_vault(
+        std::path::Path::new(vault_path),
+        user_rules_path.as_deref(),
+    ) {
+        Ok((_, f)) => f,
         Err(e) => return ok_response(id, tool_err(&format!("Failed to load rules: {}", e.message))),
     };
+    let rule_list: Vec<types::Rule> = rules_file_doc.to_rules();
+    let _ = password; // legacy param accepted for back-compat but no longer used here
 
     // 2. Build messages
     let messages: Vec<Value> = match mode {
@@ -761,10 +777,21 @@ fn handle_classify_document(
         return ok_response(id, tool_err("Empty response from LLM"));
     }
 
-    // 5. Parse and return
+    // 5. Parse and build a rule_snapshot for the resolved category
     let classification = classifier::parse_response(response_text, &rule_list);
+    let rule_snapshot = rules_file::find_by_label(&rules_file_doc.rules, &classification.category)
+        .map(rules_file::build_snapshot)
+        .unwrap_or_default();
+
     match serde_json::to_value(&classification) {
-        Ok(v) => ok_response(id, tool_ok(json!({"ok": true, "classification": v}))),
+        Ok(v) => ok_response(
+            id,
+            tool_ok(json!({
+                "ok": true,
+                "classification": v,
+                "rule_snapshot": rule_snapshot,
+            })),
+        ),
         Err(e) => ok_response(id, tool_err(&e.to_string())),
     }
 }
@@ -1113,6 +1140,7 @@ fn main() {
                                 "simhash": {"type": "string", "description": "SimHash hex string."},
                                 "dhash": {"type": "string", "description": "dHash hex string."},
                                 "source_path": {"type": "string", "description": "Original source path (defaults to file_path)."},
+                                "rule_snapshot": {"type": "string", "description": "JSON blob from classify_document.rule_snapshot — captures the rule revision that produced this classification. Optional; empty means \"no rule recorded\"."},
                             },
                             "required": ["vault_path", "file_path"],
                         },
@@ -1297,12 +1325,13 @@ fn main() {
                     },
                     {
                         "name": "minerva_scansort_classify_document",
-                        "description": "Classify a document using LLM via host.providers.chat. Loads rules from the vault, builds classification messages, calls the LLM, and returns a Classification result with category, confidence, sender, description, doc_date, and tags.",
+                        "description": "Classify a document using LLM via host.providers.chat. Loads rules from a sibling <vault-stem>.rules.json or a host-provided user_rules_path (in that order), builds classification messages, calls the LLM, and returns {ok, classification, rule_snapshot}. The rule_snapshot JSON should be passed to insert_document so the vault stays self-describing.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "vault_path": {"type": "string", "description": "Absolute path to the vault file (for loading rules)."},
-                                "password": {"type": "string", "description": "Vault password (optional)."},
+                                "vault_path": {"type": "string", "description": "Absolute path to the vault file (used to resolve sibling <stem>.rules.json)."},
+                                "password": {"type": "string", "description": "Vault password (accepted for back-compat; no longer used for rule loading)."},
+                                "user_rules_path": {"type": "string", "description": "Optional user-level rules JSON path (layer 2 fallback if no sibling exists)."},
                                 "mode": {"type": "string", "description": "'text' (default) or 'vision'."},
                                 "document_text": {"type": "string", "description": "Extracted document text (required for text mode)."},
                                 "page_images": {"type": "array", "description": "Array of {page_num, base64} objects (required for vision mode).", "items": {"type": "object"}},

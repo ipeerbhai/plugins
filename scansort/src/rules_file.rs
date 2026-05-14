@@ -217,6 +217,88 @@ pub fn load_for_vault(
 }
 
 // ---------------------------------------------------------------------------
+// Snapshot construction
+// ---------------------------------------------------------------------------
+
+/// Find a rule by label in the loaded file (case-sensitive exact match).
+pub fn find_by_label<'a>(rules: &'a [FileRule], label: &str) -> Option<&'a FileRule> {
+    rules.iter().find(|r| r.label == label)
+}
+
+/// Build the `documents.rule_snapshot` JSON for a resolved rule.
+///
+/// Output shape (single-line JSON, stable field order via the inline struct):
+/// ```json
+/// {
+///   "label": "...",
+///   "name": "...",
+///   "instruction": "...",
+///   "signals": [...],
+///   "subfolder": "...",
+///   "confidence_threshold": 0.7,
+///   "snapshot_hash": "<sha256 hex>",
+///   "snapshot_at": "<iso>"
+/// }
+/// ```
+///
+/// `snapshot_hash` is SHA-256 of the canonical JSON of the rule's
+/// content fields (label..confidence_threshold). It is stable across runs and
+/// across machines, so two documents classified by the same rule revision
+/// share a hash.
+pub fn build_snapshot(rule: &FileRule) -> String {
+    use sha2::{Digest, Sha256};
+
+    // Canonical content blob — drives the hash. Field order is fixed by the
+    // struct definition, which acts as the canonicalization rule.
+    #[derive(serde::Serialize)]
+    struct Canonical<'a> {
+        label: &'a str,
+        name: &'a str,
+        instruction: &'a str,
+        signals: &'a [String],
+        subfolder: &'a str,
+        confidence_threshold: f64,
+    }
+    let canon = Canonical {
+        label: &rule.label,
+        name: &rule.name,
+        instruction: &rule.instruction,
+        signals: &rule.signals,
+        subfolder: &rule.subfolder,
+        confidence_threshold: rule.confidence_threshold,
+    };
+    let canon_json =
+        serde_json::to_string(&canon).unwrap_or_else(|_| String::from("{}"));
+    let hash = Sha256::digest(canon_json.as_bytes());
+    let snapshot_hash = format!("{:x}", hash);
+    let snapshot_at = crate::types::now_iso();
+
+    // Output blob — includes the hash and timestamp on top of the canonical fields.
+    #[derive(serde::Serialize)]
+    struct Snapshot<'a> {
+        label: &'a str,
+        name: &'a str,
+        instruction: &'a str,
+        signals: &'a [String],
+        subfolder: &'a str,
+        confidence_threshold: f64,
+        snapshot_hash: String,
+        snapshot_at: String,
+    }
+    let snap = Snapshot {
+        label: &rule.label,
+        name: &rule.name,
+        instruction: &rule.instruction,
+        signals: &rule.signals,
+        subfolder: &rule.subfolder,
+        confidence_threshold: rule.confidence_threshold,
+        snapshot_hash,
+        snapshot_at,
+    };
+    serde_json::to_string(&snap).unwrap_or_else(|_| String::from("{}"))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -427,5 +509,71 @@ mod tests {
         save(&path, &sample_file()).expect("save with nested dirs");
         assert!(path.exists());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn find_by_label_returns_matching_rule() {
+        let f = sample_file();
+        let found = find_by_label(&f.rules, "tax_w2").expect("found");
+        assert_eq!(found.label, "tax_w2");
+    }
+
+    #[test]
+    fn find_by_label_returns_none_for_unknown_label() {
+        let f = sample_file();
+        assert!(find_by_label(&f.rules, "no_such_thing").is_none());
+    }
+
+    #[test]
+    fn build_snapshot_yields_valid_json_with_expected_fields() {
+        let r = sample_rule("tax_w2");
+        let snap = build_snapshot(&r);
+        let v: serde_json::Value = serde_json::from_str(&snap).expect("parse snapshot");
+        assert_eq!(v["label"], "tax_w2");
+        assert_eq!(v["name"], "Rule tax_w2");
+        assert_eq!(v["confidence_threshold"], 0.7);
+        assert!(v["signals"].is_array());
+        let hash = v["snapshot_hash"].as_str().expect("snapshot_hash");
+        assert_eq!(hash.len(), 64, "sha256 hex should be 64 chars");
+        let ts = v["snapshot_at"].as_str().expect("snapshot_at");
+        assert!(!ts.is_empty());
+    }
+
+    #[test]
+    fn build_snapshot_hash_is_stable_across_calls_for_same_rule() {
+        let r = sample_rule("tax_w2");
+        let s1: serde_json::Value = serde_json::from_str(&build_snapshot(&r)).unwrap();
+        let s2: serde_json::Value = serde_json::from_str(&build_snapshot(&r)).unwrap();
+        assert_eq!(
+            s1["snapshot_hash"], s2["snapshot_hash"],
+            "identical rule must produce identical snapshot_hash across calls"
+        );
+        // snapshot_at differs across calls — that's by design.
+    }
+
+    #[test]
+    fn build_snapshot_hash_differs_for_different_rules() {
+        let r1 = sample_rule("tax_w2");
+        let r2 = sample_rule("memories");
+        let s1: serde_json::Value = serde_json::from_str(&build_snapshot(&r1)).unwrap();
+        let s2: serde_json::Value = serde_json::from_str(&build_snapshot(&r2)).unwrap();
+        assert_ne!(s1["snapshot_hash"], s2["snapshot_hash"]);
+    }
+
+    #[test]
+    fn build_snapshot_hash_changes_when_instruction_changes() {
+        let mut r = sample_rule("tax_w2");
+        let h1 = serde_json::from_str::<serde_json::Value>(&build_snapshot(&r))
+            .unwrap()["snapshot_hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        r.instruction = format!("{} more text", r.instruction);
+        let h2 = serde_json::from_str::<serde_json::Value>(&build_snapshot(&r))
+            .unwrap()["snapshot_hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(h1, h2, "editing instruction must change the hash");
     }
 }
