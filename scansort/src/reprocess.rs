@@ -514,6 +514,7 @@ mod tests {
             "0000000000000000",
             "",
             "",
+            "",
         )
         .expect("insert_document");
         assert!(doc_id > 0);

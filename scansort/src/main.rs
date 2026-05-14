@@ -419,10 +419,11 @@ fn handle_insert_document(params: &Value, id: Value) -> RpcResponse {
     let dhash = args.get("dhash").and_then(|v| v.as_str()).unwrap_or("");
     let source_path = args.get("source_path").and_then(|v| v.as_str()).unwrap_or("");
     let rule_snapshot = args.get("rule_snapshot").and_then(|v| v.as_str()).unwrap_or("");
+    let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
     match documents::insert_document(
         vault_path, file_path, category, confidence, issuer,
         description, doc_date, status, sha256, simhash, dhash, source_path,
-        rule_snapshot,
+        rule_snapshot, password,
     ) {
         Ok(doc_id) => ok_response(id, tool_ok(json!({"ok": true, "doc_id": doc_id}))),
         Err(e) => ok_response(id, tool_err(&e.message)),
@@ -493,7 +494,8 @@ fn handle_extract_document(params: &Value, id: Value) -> RpcResponse {
     if dest.is_empty() {
         return ok_response(id, tool_err("dest is required"));
     }
-    match documents::extract_document(vault_path, doc_id, dest) {
+    let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
+    match documents::extract_document(vault_path, doc_id, dest, password) {
         Ok(out_path) => ok_response(id, tool_ok(json!({"ok": true, "path": out_path}))),
         Err(e) => ok_response(id, tool_err(&e.message)),
     }
@@ -2108,7 +2110,7 @@ fn main() {
                     },
                     {
                         "name": "minerva_scansort_insert_document",
-                        "description": "Read a file from disk, compress with zstd, and insert it into the vault's documents table.",
+                        "description": "Read a file from disk, compress with zstd, optionally encrypt with AES-256-GCM, and insert it into the vault's documents table.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -2125,6 +2127,7 @@ fn main() {
                                 "dhash": {"type": "string", "description": "dHash hex string."},
                                 "source_path": {"type": "string", "description": "Original source path (defaults to file_path)."},
                                 "rule_snapshot": {"type": "string", "description": "JSON blob from classify_document.rule_snapshot — captures the rule revision that produced this classification. Optional; empty means \"no rule recorded\"."},
+                                "password": {"type": "string", "description": "Optional vault password. If set, the compressed blob is encrypted with AES-256-GCM using the vault's stored KDF + salt. The vault must already have a password set."},
                             },
                             "required": ["vault_path", "file_path"],
                         },
@@ -2162,13 +2165,14 @@ fn main() {
                     },
                     {
                         "name": "minerva_scansort_extract_document",
-                        "description": "Extract a document from the vault to the filesystem, decompressing zstd.",
+                        "description": "Extract a document from the vault to the filesystem: decrypt if encrypted (requires password), then decompress zstd.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "vault_path": {"type": "string", "description": "Absolute path to the vault file."},
                                 "doc_id": {"type": "integer", "description": "Document ID to extract."},
                                 "dest": {"type": "string", "description": "Destination path or directory for the extracted file."},
+                                "password": {"type": "string", "description": "Vault password. Required if the document is encrypted; ignored for plaintext documents."},
                             },
                             "required": ["vault_path", "doc_id", "dest"],
                         },

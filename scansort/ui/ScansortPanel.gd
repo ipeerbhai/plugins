@@ -994,14 +994,36 @@ func _on_area_tree_file_activated(key: String) -> void:
 		# Extract to a temp subdir under the user data dir.
 		var tmp_dir: String = OS.get_user_data_dir().path_join("scansort_preview")
 		DirAccess.make_dir_recursive_absolute(tmp_dir)
+		# W5f: pass the cached vault password so encrypted documents can be
+		# decrypted on extract. The password is only cached for the currently
+		# open vault — a document that lives in a different (non-open) vault
+		# has no password available here, so an encrypted doc there cannot be
+		# opened until that vault is opened.
+		var extract_args: Dictionary = {
+			"vault_path": vault_path, "doc_id": doc_id, "dest": tmp_dir,
+		}
+		if vault_path == _active_vault_path and not _vault_password.is_empty():
+			extract_args["password"] = _vault_password
 		set_status("Extracting document…")
 		var result: Dictionary = await conn.call_tool(
 			"minerva_scansort_extract_document",
-			{"vault_path": vault_path, "doc_id": doc_id, "dest": tmp_dir}
+			extract_args
 		)
 		# extract_document returns {ok: true, path: "/abs/path/to/file"} on success.
 		if not result.get("ok", false):
-			set_status("ERROR: extract_document failed — %s" % result.get("error", "unknown"))
+			var err_msg: String = str(result.get("error", "unknown"))
+			# W5f: encrypted document in a vault that isn't the open one — the
+			# password isn't cached, so give the user a clear, actionable hint
+			# instead of a raw backend error.
+			if vault_path != _active_vault_path and (
+				err_msg.to_lower().contains("encrypt")
+				or err_msg.to_lower().contains("password")
+			):
+				set_status(
+					"This document is encrypted. Open its vault first to unlock it."
+				)
+			else:
+				set_status("ERROR: extract_document failed — %s" % err_msg)
 			return
 		var out_path: String = str(result.get("path", ""))
 		if out_path.is_empty():

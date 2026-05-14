@@ -418,6 +418,10 @@ pub fn fan_out(
                     &meta.dhash,
                     &meta.source_path,
                     &rule_snapshot,
+                    // W5f: encryption at fan-out time is not wired here; the
+                    // `encrypt` flag is recorded in rule_snapshot only. Pass an
+                    // empty password so the blob is stored plaintext-compressed.
+                    "",
                 ) {
                     Ok(doc_id) => {
                         results.push(PlacementResult {

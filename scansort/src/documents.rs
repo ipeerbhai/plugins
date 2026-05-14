@@ -4,6 +4,7 @@
 //! path as the first argument. Uses db.rs helpers for row extraction and
 //! types.rs structs for return values.
 
+use crate::crypto;
 use crate::db;
 use crate::types::*;
 use rusqlite::params;
@@ -14,8 +15,13 @@ use std::path::Path;
 // insert_document
 // ---------------------------------------------------------------------------
 
-/// Read a file from disk, compress with zstd, compute SHA-256, and insert
-/// into the documents and fingerprints tables.
+/// Read a file from disk, compress with zstd, optionally encrypt with
+/// AES-256-GCM, and insert into the documents and fingerprints tables.
+///
+/// `password` controls encryption: if non-empty the vault must already have a
+/// password set (via `crypto::set_password`); the same KDF + salt stored in
+/// the vault's project table is used to derive the key.  Ordering mirrors the
+/// Python reference implementation: **compress → encrypt → store**.
 ///
 /// Returns the new `doc_id` on success.
 pub fn insert_document(
@@ -32,6 +38,7 @@ pub fn insert_document(
     dhash: &str,
     source_path: &str,
     rule_snapshot: &str,
+    password: &str,
 ) -> VaultResult<i64> {
     let fp = Path::new(file_path);
     if !fp.exists() {
@@ -46,6 +53,16 @@ pub fn insert_document(
     let compressed = zstd::encode_all(raw_data.as_slice(), 3)
         .map_err(|e| VaultError::new(format!("Compression failed: {e}")))?;
     let compressed_size = compressed.len();
+
+    // Optionally encrypt the compressed bytes (compress → encrypt, same as Python).
+    let (stored_data, enc_iv, enc_tag): (Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>) =
+        if !password.is_empty() {
+            let key = crypto::vault_key(path, password)?;
+            let (ct, iv, tag) = crypto::encrypt_bytes(&key, &compressed)?;
+            (ct, Some(iv), Some(tag))
+        } else {
+            (compressed, None, None)
+        };
 
     // Compute SHA-256 if not provided
     let sha256_val = if sha256.is_empty() {
@@ -86,8 +103,10 @@ pub fn insert_document(
         "INSERT INTO documents \
          (original_filename, file_ext, category, confidence, issuer, \
           description, doc_date, classified_at, sha256, simhash, dhash, \
-          status, file_data, file_size, compression, source_path, rule_snapshot) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'zstd', ?15, ?16)",
+          status, file_data, file_size, compression, encryption_iv, encryption_tag, \
+          source_path, rule_snapshot) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'zstd', \
+                 ?15, ?16, ?17, ?18)",
         params![
             original_filename,
             file_ext,
@@ -101,8 +120,10 @@ pub fn insert_document(
             simhash,
             dhash,
             effective_status,
-            compressed,
+            stored_data,
             original_size,
+            enc_iv,
+            enc_tag,
             effective_source,
             rule_snapshot,
         ],
@@ -294,30 +315,43 @@ pub fn get_document(path: &str, doc_id: i64) -> VaultResult<Document> {
 
 /// Extract a document from the vault to the filesystem.
 ///
-/// Reads the file_data blob, decompresses zstd, and writes to `dest`.
-/// If `dest` is a directory, the original filename is appended.
+/// Reads the file_data blob, decrypts if the document is encrypted (requires
+/// `password`), decompresses zstd, and writes to `dest`.  If `dest` is a
+/// directory the original filename is appended.
+///
+/// Ordering mirrors the Python reference implementation (and the inverse of
+/// `insert_document`): stored blob = encrypt(compress(raw)), so extract does
+/// **decrypt → decompress → write**.
+///
+/// * Plaintext doc + any password: works (password ignored).
+/// * Encrypted doc + correct password: decrypts and extracts.
+/// * Encrypted doc + empty password: returns a clear "password required" error.
+/// * Encrypted doc + wrong password: returns a clear "incorrect password" error,
+///   never panics (GCM tag mismatch is caught).
 ///
 /// Returns the final output path on success.
-pub fn extract_document(path: &str, doc_id: i64, dest: &str) -> VaultResult<String> {
+pub fn extract_document(path: &str, doc_id: i64, dest: &str, password: &str) -> VaultResult<String> {
     let conn = db::connect(path)?;
 
     let mut stmt = conn.prepare(
-        "SELECT original_filename, file_data, compression, encryption_iv \
+        "SELECT original_filename, file_data, compression, encryption_iv, encryption_tag \
          FROM documents WHERE doc_id = ?",
     )?;
 
-    let (original_filename, file_data, compression, has_encryption): (
+    let (original_filename, file_data, compression, enc_iv, enc_tag): (
         String,
         Option<Vec<u8>>,
         String,
-        bool,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
     ) = stmt
         .query_row(params![doc_id], |row| {
             Ok((
                 db::get_string(row, "original_filename"),
                 db::get_blob(row, "file_data"),
                 db::get_string(row, "compression"),
-                db::get_blob(row, "encryption_iv").is_some(),
+                db::get_blob(row, "encryption_iv"),
+                db::get_blob(row, "encryption_tag"),
             ))
         })
         .map_err(|e| match e {
@@ -327,21 +361,37 @@ pub fn extract_document(path: &str, doc_id: i64, dest: &str) -> VaultResult<Stri
             other => VaultError::from(other),
         })?;
 
-    // Reject encrypted documents until Phase D
-    if has_encryption {
-        return Err(VaultError::new(
-            "Document is encrypted. Decryption is not yet implemented.",
-        ));
-    }
-
     let raw_blob = file_data.ok_or_else(|| VaultError::new("Document has no file data"))?;
+
+    // Decrypt if the document was stored encrypted (compression then encryption).
+    let decompressable: Vec<u8> = if let (Some(iv), Some(tag)) = (enc_iv, enc_tag) {
+        // Document is encrypted — password is required.
+        if password.is_empty() {
+            return Err(VaultError::new(
+                "Document is encrypted — a vault password is required to open it.",
+            ));
+        }
+        // Derive the vault key using the same KDF + salt used at insert time.
+        let key = crypto::vault_key(path, password).map_err(|e| {
+            VaultError::new(format!("Failed to derive vault key: {}", e.message))
+        })?;
+        // Decrypt.  GCM tag mismatch means wrong password.
+        crypto::decrypt_bytes(&key, &raw_blob, &iv, &tag).map_err(|_| {
+            VaultError::new(
+                "Incorrect vault password — could not decrypt the document.",
+            )
+        })?
+    } else {
+        // Plaintext document — use blob as-is.
+        raw_blob
+    };
 
     // Decompress
     let decompressed = if compression == "zstd" {
-        zstd::decode_all(raw_blob.as_slice())
+        zstd::decode_all(decompressable.as_slice())
             .map_err(|e| VaultError::new(format!("Decompression failed: {e}")))?
     } else {
-        raw_blob
+        decompressable
     };
 
     // Resolve destination path
@@ -506,4 +556,198 @@ pub fn vault_inventory(path: &str) -> VaultResult<Vec<Document>> {
     }
 
     Ok(docs)
+}
+
+// ===========================================================================
+// Tests (W5f) — encrypted-document round-trip via insert_document /
+// extract_document.
+// ===========================================================================
+#[cfg(test)]
+mod tests {
+    use crate::crypto;
+    use crate::documents::{extract_document, insert_document};
+    use crate::vault_lifecycle;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_tmp(prefix: &str) -> std::path::PathBuf {
+        let pid = std::process::id();
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("scansort-documents-{prefix}-{pid}-{ts}-{n}"))
+    }
+
+    /// Build a vault + a source file, returning (dir, vault_path, src_file).
+    fn setup(prefix: &str, body: &[u8]) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let dir = unique_tmp(prefix);
+        std::fs::create_dir_all(&dir).unwrap();
+        let vault_path = dir.join("archive.ssort");
+        vault_lifecycle::create_vault(vault_path.to_str().unwrap(), "TestArchive")
+            .expect("create vault");
+        let src_file = dir.join("sample.txt");
+        std::fs::write(&src_file, body).unwrap();
+        (dir, vault_path, src_file)
+    }
+
+    fn insert(
+        vault_path: &std::path::Path,
+        src_file: &std::path::Path,
+        password: &str,
+    ) -> i64 {
+        insert_document(
+            vault_path.to_str().unwrap(),
+            src_file.to_str().unwrap(),
+            "test",
+            0.9,
+            "tester",
+            "test doc",
+            "2024-01-01",
+            "classified",
+            "",
+            "0000000000000000",
+            "0000000000000000",
+            "",
+            "",
+            password,
+        )
+        .expect("insert_document")
+    }
+
+    // -----------------------------------------------------------------------
+    // 1. Encrypted doc + correct password → round-trips, bytes match.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn encrypted_doc_correct_password_round_trips() {
+        let body = b"top secret contents for the encrypted round trip test";
+        let (dir, vault_path, src_file) = setup("enc-ok", body);
+        let pw = "correct horse battery staple";
+
+        crypto::set_password(vault_path.to_str().unwrap(), pw).expect("set_password");
+        let doc_id = insert(&vault_path, &src_file, pw);
+        assert!(doc_id > 0);
+
+        let out = dir.join("extracted.txt");
+        let out_path = extract_document(
+            vault_path.to_str().unwrap(),
+            doc_id,
+            out.to_str().unwrap(),
+            pw,
+        )
+        .expect("extract_document with correct password");
+
+        let got = std::fs::read(&out_path).expect("read extracted file");
+        assert_eq!(got.as_slice(), body, "decrypted bytes must match original");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. Encrypted doc + wrong password → clear error, no panic.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn encrypted_doc_wrong_password_clear_error() {
+        let body = b"contents guarded by a password";
+        let (dir, vault_path, src_file) = setup("enc-wrong", body);
+        let pw = "the real password";
+
+        crypto::set_password(vault_path.to_str().unwrap(), pw).expect("set_password");
+        let doc_id = insert(&vault_path, &src_file, pw);
+
+        let out = dir.join("extracted.txt");
+        let res = extract_document(
+            vault_path.to_str().unwrap(),
+            doc_id,
+            out.to_str().unwrap(),
+            "the WRONG password",
+        );
+        assert!(res.is_err(), "wrong password must return Err, not panic");
+        let msg = res.unwrap_err().message.to_lowercase();
+        assert!(
+            msg.contains("password") || msg.contains("decrypt"),
+            "error should mention password/decrypt, got: {msg}"
+        );
+        assert!(!out.exists(), "no output file should be written on failure");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. Encrypted doc + empty password → "password required" error.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn encrypted_doc_empty_password_required_error() {
+        let body = b"contents that need a password to read";
+        let (dir, vault_path, src_file) = setup("enc-empty", body);
+        let pw = "a vault password";
+
+        crypto::set_password(vault_path.to_str().unwrap(), pw).expect("set_password");
+        let doc_id = insert(&vault_path, &src_file, pw);
+
+        let out = dir.join("extracted.txt");
+        let res = extract_document(
+            vault_path.to_str().unwrap(),
+            doc_id,
+            out.to_str().unwrap(),
+            "",
+        );
+        assert!(res.is_err(), "empty password on encrypted doc must return Err");
+        let msg = res.unwrap_err().message.to_lowercase();
+        assert!(
+            msg.contains("password") && msg.contains("required"),
+            "error should say a password is required, got: {msg}"
+        );
+        assert!(!out.exists(), "no output file should be written on failure");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // 4. Plaintext doc still extracts (password ignored).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn plaintext_doc_still_extracts() {
+        let body = b"ordinary unencrypted document body";
+        let (dir, vault_path, src_file) = setup("plain", body);
+
+        // No set_password, no password passed to insert → stored compressed-only.
+        let doc_id = insert(&vault_path, &src_file, "");
+        assert!(doc_id > 0);
+
+        // Extract with empty password works.
+        let out = dir.join("extracted-empty.txt");
+        let out_path = extract_document(
+            vault_path.to_str().unwrap(),
+            doc_id,
+            out.to_str().unwrap(),
+            "",
+        )
+        .expect("extract plaintext doc with empty password");
+        assert_eq!(
+            std::fs::read(&out_path).unwrap().as_slice(),
+            body,
+            "plaintext extract must match original"
+        );
+
+        // Extract with a non-empty password also works (password ignored).
+        let out2 = dir.join("extracted-pw.txt");
+        let out_path2 = extract_document(
+            vault_path.to_str().unwrap(),
+            doc_id,
+            out2.to_str().unwrap(),
+            "irrelevant password",
+        )
+        .expect("extract plaintext doc with a password (ignored)");
+        assert_eq!(
+            std::fs::read(&out_path2).unwrap().as_slice(),
+            body,
+            "plaintext extract must match original even when a password is supplied"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

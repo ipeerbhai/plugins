@@ -252,8 +252,10 @@ pub fn check_vault_has_password(path: &str) -> VaultResult<(bool, String)> {
 }
 
 /// Derive the encryption key for a vault (reads salt + verifier, derives key).
-#[allow(dead_code)]
-fn vault_key(path: &str, password: &str) -> VaultResult<[u8; KEY_SIZE]> {
+///
+/// Exposed as `pub` so `documents` can reuse the same KDF when encrypting or
+/// decrypting document blobs (W5f).
+pub fn vault_key(path: &str, password: &str) -> VaultResult<[u8; KEY_SIZE]> {
     let conn = db::connect(path)?;
 
     let salt_hex = db::get_project_key(&conn, "encryption_salt")?
