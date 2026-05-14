@@ -99,10 +99,6 @@ var _doc_file_dialog: FileDialog = null
 ## is the editor's — guarded with is_instance_valid before every access.
 var _chrome_popup: PopupMenu = null
 
-## R9: Model OptionButton returned via get_editor_actions(). Lives in the
-## editor chrome bar. Null until get_editor_actions() is first called.
-var _model_dropdown: OptionButton = null
-
 # ---------------------------------------------------------------------------
 # UI widgets
 # ---------------------------------------------------------------------------
@@ -979,21 +975,22 @@ func _on_vault_registry_pressed() -> void:
 
 ## R9: Resolve the model spec to use for classify_document calls.
 ## Returns {model_spec: Dictionary} — reads from the chrome OptionButton
-## (_model_dropdown) when available.
-## Falls back to {model_spec: {}} if the dropdown isn't wired yet (panel
-## queried before chrome mounts). The caller should pass model: "default"
-## alongside an empty spec to preserve the safe Core/TurnRock fallback.
+## Inherits the chat panel's currently-selected model spec.
+##
+## Returns {"model_spec": Dictionary} — empty Dict when chat isn't initialized
+## (headless tests / SingletonObject absent) or no model is selected. The
+## caller's classify call site guards against an empty spec to preserve the
+## broker's safe-fallback behavior.
 func _resolve_chat_model_for_classify() -> Dictionary:
-	if _model_dropdown == null or not is_instance_valid(_model_dropdown):
+	var so = Engine.get_main_loop().root.get_node_or_null("SingletonObject") if Engine.get_main_loop() != null else null
+	if so == null:
 		return {"model_spec": {}}
-	var idx: int = _model_dropdown.get_selected()
-	if idx < 0:
+	var chats = so.get("Chats") if "Chats" in so else null
+	if chats == null or not chats.has_method("get_active_model_spec"):
 		return {"model_spec": {}}
-	var metadata = _model_dropdown.get_item_metadata(idx)
-	if metadata == null:
-		return {"model_spec": {}}
-	var spec: Dictionary = metadata as Dictionary if metadata is Dictionary else {}
-	return {"model_spec": spec}
+	var spec = chats.get_active_model_spec()
+	var dict_spec: Dictionary = spec as Dictionary if spec is Dictionary else {}
+	return {"model_spec": dict_spec}
 
 
 # ---------------------------------------------------------------------------
@@ -1077,36 +1074,10 @@ func get_editor_actions() -> Array:
 	_chrome_popup = popup
 	_refresh_chrome_menu_state()
 
-	# R9: Model OptionButton — populated from ChatPane.get_available_models().
-	var dropdown := OptionButton.new()
-	dropdown.tooltip_text = "Model used for document classification"
-	dropdown.flat = false
-
-	# Reach ChatPane via SingletonObject.Chats.
-	var model_list: Array = []
-	var so = Engine.get_main_loop().root.get_node_or_null("SingletonObject") if Engine.get_main_loop() != null else null
-	if so != null:
-		var chats = so.get("Chats") if "Chats" in so else null
-		if chats != null and chats.has_method("get_available_models"):
-			model_list = chats.get_available_models()
-
-	if model_list.is_empty():
-		# Headless / no chat init — add a single fallback entry.
-		dropdown.add_item("default", 0)
-		dropdown.set_item_metadata(0, {})
-	else:
-		var default_idx: int = 0
-		for i in range(model_list.size()):
-			var entry: Dictionary = model_list[i]
-			dropdown.add_item(str(entry.get("display_name", "?")), i)
-			var spec: Dictionary = entry.get("spec", {}) as Dictionary if entry.get("spec") is Dictionary else {}
-			dropdown.set_item_metadata(i, spec)
-			if entry.get("selected", false):
-				default_idx = i
-		dropdown.select(default_idx)
-
-	_model_dropdown = dropdown
-	return [menu, dropdown]
+	# Scansort inherits the chat panel's model selection at classify time via
+	# _resolve_chat_model_for_classify() → ChatPane.get_active_model_spec().
+	# No per-panel model picker — keep the chrome single-purpose (File menu).
+	return [menu]
 
 
 ## Disable File-menu items that require an open vault when no vault is open.

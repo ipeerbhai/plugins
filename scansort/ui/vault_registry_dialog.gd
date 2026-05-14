@@ -132,12 +132,14 @@ func refresh() -> void:
 		var path:       String = str(entry.get("path",      ""))
 		var doc_count:  int    = int(entry.get("doc_count", -1))
 		var added_at:   String = str(entry.get("added_at",  ""))
+		# Trim ISO8601 timestamp to the date portion for the display ("2026-05-13").
+		var added_date: String = added_at.substr(0, 10) if added_at.length() >= 10 else added_at
 
 		var display: String
 		if doc_count < 0:
-			display = "%s (unavailable) — %s" % [vault_name, path]
+			display = "%s (unavailable, added %s) — %s" % [vault_name, added_date, path]
 		else:
-			display = "%s (%d docs) — %s" % [vault_name, doc_count, path]
+			display = "%s (%d docs, added %s) — %s" % [vault_name, doc_count, added_date, path]
 
 		var idx: int = _item_list.add_item(display)
 		# Store both path and name in metadata as a dict.
