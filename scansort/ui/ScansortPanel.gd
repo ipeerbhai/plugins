@@ -77,6 +77,9 @@ const _AreaProvider: Script = preload("scan_tree_area_provider.gd")
 ## W7: dedup disposition dialog (off-tree: no class_name).
 const _DedupDispositionDialog: Script = preload("dedup_disposition_dialog.gd")
 
+## W5g: extract-target picker dialog (off-tree: no class_name).
+const _ExtractTargetDialog: Script = preload("extract_target_dialog.gd")
+
 # ---------------------------------------------------------------------------
 # Signals
 # ---------------------------------------------------------------------------
@@ -1090,10 +1093,21 @@ func _on_vault_dest_settings_pressed(dest_id: String, dest_dict: Dictionary) -> 
 ## Resolves the destination from the drop target key (which is either "dest:<id>"
 ## for a top-level row, or a category/file key nested inside a destination).
 ## Walks up the item's parent chain to find the "dest:<id>" ancestor.
+## W5g: vault-doc drops (role "dest:vault") onto directory rows are intercepted
+## here and routed to _on_vault_doc_dropped_to_dir instead of classify logic.
 func _on_area_tree_file_dropped(drag_data: Dictionary, target_key: String, target_kind: String) -> void:
-	# Resolve which destination this drop landed in by walking up to the
-	# top-level "dest:<id>" row.  If the target IS a top-level dest row,
-	# target_key is already "dest:<id>".
+	var role: String = str(drag_data.get("role", ""))
+
+	# W5g: vault-doc → directory extract gesture.
+	# A drag_data whose role is "dest:vault" carries a vault document key ("doc:<id>")
+	# and vault_path.  The target is a row in the directory area tree (a dest:<id>
+	# directory destination row or a dir:<name> subfolder row).
+	if role == "dest:vault":
+		await _on_vault_doc_dropped_to_dir(drag_data, target_key)
+		return
+
+	# Original classify / reclassify path — resolve which vault destination the
+	# target row belongs to, then delegate to _on_tree_file_dropped.
 	var dest_id: String = ""
 	var dest_dict: Dictionary = {}
 
@@ -1129,6 +1143,106 @@ func _on_area_tree_file_dropped(drag_data: Dictionary, target_key: String, targe
 
 	# Delegate to the main drop handler with the resolved dest context.
 	_on_tree_file_dropped(drag_data, target_key, target_kind, dest_dict)
+
+
+## W5g: handle a vault doc row dropped onto a directory tree row.
+## Resolves the filesystem directory path from target_key and calls extract_document.
+func _on_vault_doc_dropped_to_dir(drag_data: Dictionary, target_key: String) -> void:
+	if not _vault_is_open:
+		set_status("Open a vault first.")
+		return
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+
+	var drag_key: String = str(drag_data.get("key", ""))
+	if not drag_key.begins_with("doc:"):
+		return  # unexpected — only doc rows should have role dest:vault
+	var doc_id: int = int(drag_key.substr(4))
+
+	# vault_path is embedded in drag data by _get_drag_data (W5g).
+	var vault_path: String = str(drag_data.get("vault_path", ""))
+	if vault_path.is_empty():
+		vault_path = _find_vault_path_for_doc_key(drag_key)
+	if vault_path.is_empty():
+		vault_path = _active_vault_path
+	if vault_path.is_empty():
+		set_status("Cannot extract: vault path unknown.")
+		return
+
+	# Resolve the target filesystem directory from target_key.
+	# target_key may be:
+	#   "dest:<id>"   — top-level directory destination row → use dest.path
+	#   "dir:<name>"  — subfolder row → walk up to the "dest:<id>" ancestor + append name
+	var dest_dir: String = _resolve_dir_path_from_key(target_key)
+	if dest_dir.is_empty():
+		set_status("Cannot extract: could not resolve target directory.")
+		return
+
+	var extract_args: Dictionary = {
+		"vault_path": vault_path,
+		"doc_id":     doc_id,
+		"dest":       dest_dir,
+	}
+	if vault_path == _active_vault_path and not _vault_password.is_empty():
+		extract_args["password"] = _vault_password
+
+	set_status("Extracting…")
+	var result: Dictionary = await conn.call_tool(
+		"minerva_scansort_extract_document",
+		extract_args
+	)
+	if not result.get("ok", false):
+		var err: String = str(result.get("error", "unknown"))
+		push_warning("[ScansortPanel] drag-extract: doc_id %d failed — %s" % [doc_id, err])
+		set_status("Extract failed: %s" % err)
+		return
+
+	var out_file: String = str(result.get("path", ""))
+	set_status("Extracted %s → %s" % [out_file.get_file(), dest_dir])
+
+	# Refresh the directory tree so the new file shows up.
+	if _dir_area_tree != null and is_instance_valid(_dir_area_tree):
+		await _dir_area_tree.refresh()
+
+
+## W5g: resolve an absolute filesystem directory path from a dir-area tree key.
+## "dest:<id>"  → look up destination.path in the dir provider's last_destinations.
+## "dir:<name>" → walk up the dir tree to find the dest:<id> ancestor, then
+##                 append the subfolder name.
+func _resolve_dir_path_from_key(key: String) -> String:
+	if key.begins_with("dest:"):
+		var dest_id: String = key.substr(5)
+		var dest_dict: Dictionary = _find_dest_by_id(dest_id)
+		return str(dest_dict.get("path", ""))
+
+	if key.begins_with("dir:"):
+		var subfolder: String = key.substr(4)
+		# Walk the dir area tree to find the parent dest:<id> ancestor.
+		if _dir_area_tree == null or not is_instance_valid(_dir_area_tree):
+			return ""
+		var item: TreeItem = _find_item_by_key(_dir_area_tree, key)
+		if item == null:
+			return ""
+		# Walk upward until we hit a "dest:…" key.
+		var ancestor: TreeItem = item.get_parent()
+		while ancestor != null and ancestor != _dir_area_tree.get_root():
+			var anc_key: String = str(ancestor.get_metadata(1))
+			if anc_key.begins_with("dest:"):
+				var dest_id: String = anc_key.substr(5)
+				var dest_dict: Dictionary = _find_dest_by_id(dest_id)
+				var base_path: String = str(dest_dict.get("path", ""))
+				if base_path.is_empty():
+					return ""
+				# Only append if subfolder is not the virtual "(root)" marker.
+				if subfolder == "(root)":
+					return base_path
+				return base_path.path_join(subfolder)
+			ancestor = ancestor.get_parent()
+		return ""
+
+	return ""
 
 
 ## W5b: helper — find a TreeItem by its COL_NAME metadata key, searching from root.
@@ -2779,7 +2893,7 @@ func _on_tree_file_dropped(drag_data: Dictionary, target_key: String, _target_ki
 # U6: Export Marked to Disk
 # ---------------------------------------------------------------------------
 
-## Copies every checked vault document to the configured disk root.
+## W5g: Extracts every checked vault document to a user-chosen directory.
 ## One failure does NOT abort the loop — counts are summarised at the end.
 ## Checkboxes are left as-is (they clear naturally on the next tree refresh).
 func _on_export_marked_pressed() -> void:
@@ -2791,69 +2905,89 @@ func _on_export_marked_pressed() -> void:
 		set_status("ERROR: scansort plugin not running.")
 		return
 
-	# W5: collect checked keys from all destination trees.
+	# W5g: collect checked keys from the VISIBLE vault area tree.
+	var all_keys: Array = []
+	if _vault_area_tree != null and is_instance_valid(_vault_area_tree):
+		all_keys = _vault_area_tree.get_checked_keys()
 	var keys: Array = []
-	for tree in _dest_trees:
-		if tree != null and is_instance_valid(tree):
-			keys.append_array((tree as Object).call("get_checked_keys"))
+	for k: String in all_keys:
+		if k.begins_with("doc:"):
+			keys.append(k)
 	if keys.is_empty():
-		set_status("No documents marked for export.")
+		set_status("No documents marked for extraction.")
 		return
 
-	var exported: int = 0
-	var failed: int   = 0
-	var skipped: int  = 0
+	# W5g: show target picker — registered directory destinations + Browse.
+	var dir_dests: Array = []
+	if _dir_area_provider != null and "last_destinations" in _dir_area_provider:
+		for d: Dictionary in _dir_area_provider.get("last_destinations"):
+			if str(d.get("kind", "")) == "directory":
+				dir_dests.append(d)
+
+	var dlg: AcceptDialog = _ExtractTargetDialog.new()
+	(dlg as Object).call("set_destinations", dir_dests)
+	add_child(dlg)
+
+	var chosen_path: String = ""
+	var got_choice: bool = false
+
+	(dlg as Object).target_chosen.connect(func(p: String) -> void:
+		chosen_path = p
+		got_choice  = true
+	)
+	(dlg as Object).cancelled.connect(func() -> void:
+		got_choice = true  # signal received, path stays empty
+	)
+
+	dlg.popup_centered(Vector2i(500, 320))
+
+	# Wait until the dialog emits one of its signals.
+	while not got_choice:
+		await Engine.get_main_loop().process_frame
+
+	if is_instance_valid(dlg):
+		dlg.queue_free()
+
+	if chosen_path.is_empty():
+		return  # user cancelled
+
+	# Extract each checked document to the chosen directory.
+	var extracted: int = 0
+	var failed: int    = 0
 
 	for key: String in keys:
-		if not key.begins_with("doc:"):
-			skipped += 1
-			continue
 		var doc_id: int = int(key.substr(4))
-
-		# Fetch document metadata for source_path and doc_date.
-		var doc_args: Dictionary = {"vault_path": _active_vault_path, "doc_id": doc_id}
-		if not _vault_password.is_empty():
-			doc_args["password"] = _vault_password
-
-		var doc_res: Dictionary = await conn.call_tool("minerva_scansort_get_document", doc_args)
-		if not doc_res.get("ok", false):
-			push_warning("[ScansortPanel] export: get_document failed for doc_id %d: %s" % [
-				doc_id, str(doc_res.get("error", "unknown"))
-			])
+		var vault_path: String = _find_vault_path_for_doc_key(key)
+		if vault_path.is_empty():
+			vault_path = _active_vault_path
+		if vault_path.is_empty():
+			push_warning("[ScansortPanel] extract_marked: no vault_path for key %s" % key)
 			failed += 1
 			continue
 
-		var document: Dictionary = doc_res.get("document", {})
-		var source_path: String  = str(document.get("source_path", ""))
-		var doc_date: String     = str(document.get("doc_date", ""))
-
-		if source_path.is_empty():
-			# Original file gone — can't export.
-			skipped += 1
-			continue
-
-		var place_args: Dictionary = {
-			"vault_path": _active_vault_path,
-			"file_path":  source_path,
-			"subfolder":  "{year}",
-			"doc_date":   doc_date,
+		var extract_args: Dictionary = {
+			"vault_path": vault_path,
+			"doc_id":     doc_id,
+			"dest":       chosen_path,
 		}
-		if not _vault_password.is_empty():
-			place_args["password"] = _vault_password
+		if vault_path == _active_vault_path and not _vault_password.is_empty():
+			extract_args["password"] = _vault_password
 
-		var place_res: Dictionary = await conn.call_tool("minerva_scansort_place_on_disk", place_args)
-		if place_res.has("error"):
-			push_warning("[ScansortPanel] export: place_on_disk failed for doc %d: %s" % [
-				doc_id, str(place_res.get("error", "unknown"))
-			])
+		var result: Dictionary = await conn.call_tool(
+			"minerva_scansort_extract_document",
+			extract_args
+		)
+		if not result.get("ok", false):
+			var err: String = str(result.get("error", "unknown"))
+			push_warning("[ScansortPanel] extract_marked: doc_id %d failed — %s" % [doc_id, err])
 			failed += 1
-			continue
+		else:
+			extracted += 1
 
-		exported += 1
-
-	set_status("Exported %d, %d failed, %d skipped" % [exported, failed, skipped])
-	# W5: refresh all destination trees after export.
-	await _refresh_all_dest_trees()
+	set_status("Extracted %d, %d failed" % [extracted, failed])
+	# Refresh directory tree so new files appear.
+	if _dir_area_tree != null and is_instance_valid(_dir_area_tree):
+		await _dir_area_tree.refresh()
 
 
 # ---------------------------------------------------------------------------

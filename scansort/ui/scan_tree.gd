@@ -397,6 +397,12 @@ func _get_drag_data(at_position: Vector2) -> Variant:
 		"key":  str(item.get_metadata(COL_NAME)),
 		"role": tree_role,
 	}
+	# W5g: include vault_path in drag data for vault document rows so the
+	# drop handler can extract the correct doc without re-walking the tree.
+	if item.has_meta("vault_path"):
+		var vp: String = str(item.get_meta("vault_path", ""))
+		if not vp.is_empty():
+			data["vault_path"] = vp
 	# Lightweight drag preview — just a label with the item's name text.
 	var label := Label.new()
 	label.text = item.get_text(COL_NAME)
