@@ -1243,14 +1243,51 @@ func _on_add_dialog_cancelled() -> void:
 
 
 # ---------------------------------------------------------------------------
-# U5: Process All batch pipeline
+# W10: Process All — full filing-engine pipeline (integration capstone)
 # ---------------------------------------------------------------------------
+#
+# Per-source-document pipeline (replaces U5's extract→dedup→classify→insert):
+#
+#   1. Phase 1 — classify_document → facts + rule_signals envelope.
+#   2. Phase 2 — run_rule_engine (classification + file facts + rules_path)
+#                → outcome.fired (FiredRuleAction list).
+#   3. Dedup (W7) — BEFORE placement: near-dup simhash/dhash check via
+#      _check_near_dup; on a hit, surface the disposition dialog and AWAIT
+#      the user's choice (keep_both / replace / skip). Cancel == skip.
+#      Exact SHA-256 is handled inside place_fanout (skipped-already-present).
+#   4. Fan-out placement (W6) — for each fired action, place_fanout to its
+#      copy_to dest-id list, honouring the disposition.
+#   5. Audit (W9) — when audit_log_enabled, one audit_append row per
+#      PlacementResult. Audit failure is non-fatal.
+#
+# U5's batched-parallel structure is PRESERVED: N source files in flight at
+# once, drained on process_frame, batch size from Settings concurrency. The
+# Stop control and the end-of-run status summary are kept (the summary is
+# extended with the new outcome counters).
+#
+# Deadlock note: the dedup disposition dialog is awaited mid-loop. To avoid a
+# process_frame-drain deadlock (and to keep the UX sane — never two prompts at
+# once) the dialog is SERIALISED behind _dedup_prompt_busy: a worker that
+# needs a prompt awaits process_frame until the prompt seat is free, then
+# holds it for the duration of its await. The rest of the batch keeps running
+# in parallel; only the prompting step is single-file.
+
+## W10: true when a dedup disposition dialog is currently being awaited by some
+## worker coroutine. Serialises the prompt so the batched-parallel loop never
+## shows two prompts at once and never deadlocks the process_frame drain.
+var _dedup_prompt_busy: bool = false
+
+## W10 test seam: when non-empty, _show_dedup_disposition returns this value
+## immediately instead of popping the real dialog. Lets headless smoke tests
+## drive the near-dup path without a visible popup. Production leaves it "".
+var _test_dedup_auto_disposition: String = ""
+
 
 ## Called when the user clicks the "Process All" button in the chrome bar.
-## Iterates every source file: extract → dedup → classify → insert.
+## Drives every source file through the full filing-engine pipeline.
 ## Files already in the vault or in _processed_keys are skipped. One failed
 ## file does NOT abort the whole run.
-## U7: batched-parallel execution via ScansortSettings.load_concurrency().
+## Batched-parallel execution via ScansortSettings.load_concurrency().
 func _on_process_all_pressed() -> void:
 	var conn = _get_connection()
 	if conn == null:
@@ -1273,23 +1310,51 @@ func _on_process_all_pressed() -> void:
 		set_status("Process All: source directory is empty.")
 		return
 
+	# Stable ordering — sort source files by path so runs are deterministic.
+	files.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+		return str(a.get("path", "")) < str(b.get("path", ""))
+	)
+
 	# Enter running state.
 	_process_cancelled = false
+	_dedup_prompt_busy = false
 	if _process_btn != null and is_instance_valid(_process_btn):
 		_process_btn.disabled = true
 	if _stop_btn != null and is_instance_valid(_stop_btn):
 		_stop_btn.disabled = false
 	set_status("Processing…")
 
-	# U7: reset per-run shared counters.
-	_run_counters = {"processed": 0, "skipped": 0, "failed": 0, "low_conf": 0}
+	# Reset per-run shared counters. W10 extends U7's counter set with the new
+	# filing-engine outcomes.
+	_run_counters = {
+		"processed":  0,  # source files that produced at least one placement
+		"skipped":    0,  # session-skipped (already processed / in vault)
+		"failed":     0,  # pipeline error (classify / rule engine / etc.)
+		"low_conf":   0,  # processed but classification confidence < threshold
+		"placed":     0,  # individual PlacementResults with status "placed"
+		"exact_dup":  0,  # PlacementResults skipped-already-present (exact SHA)
+		"user_skip":  0,  # source files the user dispositioned as "skip"
+		"flagged":    0,  # source files that surfaced a near-dup disposition
+		"no_rule":    0,  # source files where no rule fired (nothing to place)
+	}
+	# Per-destination placement tally: dest_id -> count of "placed" results.
+	var per_dest: Dictionary = {}
 
 	var total: int = files.size()
 
-	# U7: read concurrency from settings (default 1 = sequential).
+	# Read concurrency from settings (default 1 = sequential).
 	var concurrency: int = _SettingsDialog.ScansortSettings.load_concurrency()
 
-	# Batched-parallel loop.
+	# Processed-state priming: place_fanout does its own per-destination
+	# processed-state check, so we rely on that rather than priming
+	# scan_directory_hashes here. Priming would be a pure optimisation and is
+	# skipped to keep the loop simple (documented W10 decision).
+
+	# Audit-log settings — read once at run start.
+	var audit_enabled: bool = _SettingsDialog.ScansortSettings.load_audit_log_enabled()
+	var audit_path: String  = _SettingsDialog.ScansortSettings.load_audit_log_path()
+
+	# Batched-parallel loop — structure preserved from U5/U7.
 	var idx: int = 0
 	while idx < total:
 		if _process_cancelled:
@@ -1299,14 +1364,17 @@ func _on_process_all_pressed() -> void:
 			if idx >= total or _process_cancelled:
 				break
 			batch_remaining["n"] += 1
-			_process_one_source_file(files[idx], conn, batch_remaining)  # fire, do NOT await
+			# Fire the worker — do NOT await. Worker decrements batch_remaining.
+			_process_one_source_file(
+				files[idx], conn, batch_remaining,
+				audit_enabled, audit_path, per_dest
+			)
 			idx += 1
 		# Wait for the batch to drain.
 		while int(batch_remaining["n"]) > 0:
 			await get_tree().process_frame
 
 	# Run finished (or cancelled) — refresh trees.
-	# W5: refresh all destination trees then the source pane.
 	await _refresh_all_dest_trees()
 	if _source_tree != null and is_instance_valid(_source_tree):
 		await _source_tree.refresh()
@@ -1317,25 +1385,48 @@ func _on_process_all_pressed() -> void:
 	if _stop_btn != null and is_instance_valid(_stop_btn):
 		_stop_btn.disabled = true
 
-	# Summary status.
+	# Summary status — extended with the new filing-engine outcome counters.
 	var processed_this_run: int = int(_run_counters.get("processed", 0))
-	var skipped: int = int(_run_counters.get("skipped", 0))
-	var failed: int = int(_run_counters.get("failed", 0))
-	var low_conf: int = int(_run_counters.get("low_conf", 0))
-	if _process_cancelled:
-		set_status("Stopped — processed %d, %d low-confidence, %d failed, %d skipped" % [
-			processed_this_run, low_conf, failed, skipped
-		])
-	else:
-		set_status("Processed %d/%d — %d low-confidence, %d failed, %d skipped" % [
-			processed_this_run, total, low_conf, failed, skipped
-		])
+	var skipped: int    = int(_run_counters.get("skipped", 0))
+	var failed: int     = int(_run_counters.get("failed", 0))
+	var placed: int     = int(_run_counters.get("placed", 0))
+	var exact_dup: int  = int(_run_counters.get("exact_dup", 0))
+	var user_skip: int  = int(_run_counters.get("user_skip", 0))
+	var flagged: int    = int(_run_counters.get("flagged", 0))
+
+	# Per-destination tail (only when there were placements worth reporting).
+	var dest_tail: String = ""
+	if not per_dest.is_empty():
+		var parts: PackedStringArray = PackedStringArray()
+		var dest_ids: Array = per_dest.keys()
+		dest_ids.sort()
+		for dest_id: String in dest_ids:
+			parts.append("%s:%d" % [dest_id, int(per_dest[dest_id])])
+		dest_tail = " [" + ", ".join(parts) + "]"
+
+	var head: String = "Stopped" if _process_cancelled else "Processed %d/%d" % [processed_this_run, total]
+	set_status(
+		"%s — %d placed, %d exact-dup, %d flagged, %d user-skip, %d failed, %d skipped%s" % [
+			head, placed, exact_dup, flagged, user_skip, failed, skipped, dest_tail
+		]
+	)
 
 
-## U7: per-file worker coroutine for the batched-parallel Process All loop.
-## Decrements batch_remaining["n"] in every exit path (success or failure) so the
-## outer while-loop can drain without a separate join mechanism.
-func _process_one_source_file(file: Dictionary, conn: Object, batch_remaining: Dictionary) -> void:
+## W10: per-file worker coroutine for the batched-parallel Process All loop.
+## Drives one source file through classify → run_rule_engine → dedup →
+## place_fanout → audit. Decrements batch_remaining["n"] in EVERY exit path
+## (success or failure) so the outer while-loop can drain without a separate
+## join mechanism.
+##
+## conn is passed explicitly so this worker is unit-testable with a mock
+## connection (the smoke test drives it directly).
+func _process_one_source_file(
+		file: Dictionary,
+		conn: Object,
+		batch_remaining: Dictionary,
+		audit_enabled: bool = false,
+		audit_path: String = "",
+		per_dest: Dictionary = {}) -> void:
 	const MAX_CLASSIFY_CHARS := 4000
 	const VISION_THRESHOLD := 50
 
@@ -1348,13 +1439,13 @@ func _process_one_source_file(file: Dictionary, conn: Object, batch_remaining: D
 		batch_remaining["n"] -= 1
 		return
 
-	# -- Step 1: Extract --
+	# -- Step 0: Extract text + fingerprints (needed for classify + dedup) --
 	var extract_res: Dictionary = await conn.call_tool(
 		"minerva_scansort_extract_text",
 		{"file_path": fpath}
 	)
 	if not extract_res.get("success", false):
-		push_warning("[ScansortPanel] batch extract failed for %s: %s" % [
+		push_warning("[ScansortPanel] W10 extract failed for %s: %s" % [
 			fname, str(extract_res.get("error", "unknown"))
 		])
 		_run_counters["failed"] = int(_run_counters.get("failed", 0)) + 1
@@ -1366,20 +1457,10 @@ func _process_one_source_file(file: Dictionary, conn: Object, batch_remaining: D
 	var full_text:  String = str(extract_res.get("full_text", ""))
 	var simhash:    String = str(extract_res.get("simhash",  "0000000000000000"))
 	var dhash:      String = str(extract_res.get("dhash",    "0000000000000000"))
+	var file_size:  int    = int(extract_res.get("size", file.get("size", 0)))
+	var extension:  String = fpath.get_extension()
 
-	# -- Step 2: Dedup --
-	var dup_res: Dictionary = await conn.call_tool(
-		"minerva_scansort_check_sha256",
-		{"vault_path": _active_vault_path, "sha256": sha256}
-	)
-	if dup_res.get("found", false):
-		_processed_keys[fpath] = true
-		_run_counters["skipped"] = int(_run_counters.get("skipped", 0)) + 1
-		_push_session_marks_to_provider()
-		batch_remaining["n"] -= 1
-		return
-
-	# -- Step 3: Classify --
+	# -- Phase 1: classify_document → facts + rule_signals envelope --
 	var model_desc: Dictionary = _resolve_chat_model_for_classify()
 	var model_spec: Dictionary = model_desc.get("model_spec", {}) as Dictionary if model_desc.get("model_spec") is Dictionary else {}
 	var classify_args: Dictionary = {
@@ -1402,7 +1483,7 @@ func _process_one_source_file(file: Dictionary, conn: Object, batch_remaining: D
 			{"file_path": fpath, "max_pages": 2, "dpi": 96}
 		)
 		if not render_res.get("success", false):
-			push_warning("[ScansortPanel] batch render failed for %s: %s" % [
+			push_warning("[ScansortPanel] W10 render failed for %s: %s" % [
 				fname, str(render_res.get("error", "unknown"))
 			])
 			_run_counters["failed"] = int(_run_counters.get("failed", 0)) + 1
@@ -1416,7 +1497,7 @@ func _process_one_source_file(file: Dictionary, conn: Object, batch_remaining: D
 		classify_args
 	)
 	if not classify_res.get("ok", false):
-		push_warning("[ScansortPanel] batch classify failed for %s: %s" % [
+		push_warning("[ScansortPanel] W10 classify failed for %s: %s" % [
 			fname, str(classify_res.get("error", "unknown"))
 		])
 		_run_counters["failed"] = int(_run_counters.get("failed", 0)) + 1
@@ -1424,48 +1505,215 @@ func _process_one_source_file(file: Dictionary, conn: Object, batch_remaining: D
 		return
 
 	var classification: Dictionary = classify_res.get("classification", {})
+	var rule_snapshot: String = str(classify_res.get("rule_snapshot", ""))
 
-	# -- Step 4: Insert --
-	var insert_args: Dictionary = {
-		"vault_path":    _active_vault_path,
-		"file_path":     fpath,
-		"category":      classification.get("category",    ""),
-		"confidence":    float(classification.get("confidence", 0.0)),
-		"sender":        classification.get("sender",      ""),
-		"description":   classification.get("description", ""),
-		"doc_date":      classification.get("doc_date",    ""),
-		"status":        "classified",
-		"sha256":        sha256,
-		"simhash":       simhash,
-		"dhash":         dhash,
-		"source_path":   fpath,
-		"rule_snapshot": str(classify_res.get("rule_snapshot", "")),
-	}
-	if not _vault_password.is_empty():
-		insert_args["password"] = _vault_password
-
-	var insert_res: Dictionary = await conn.call_tool(
-		"minerva_scansort_insert_document",
-		insert_args
+	# -- Phase 2: run_rule_engine → fired actions --
+	var rules_path: String = _vault_rules_path()
+	var rule_engine_res: Dictionary = await conn.call_tool(
+		"minerva_scansort_run_rule_engine",
+		{
+			"classification": classification,
+			"rules_path":     rules_path,
+			"filename":       fname,
+			"extension":      extension,
+			"size":           file_size,
+		}
 	)
-	if not insert_res.get("ok", false):
-		push_warning("[ScansortPanel] batch insert failed for %s: %s" % [
-			fname, str(insert_res.get("error", "unknown"))
+	if not rule_engine_res.get("ok", false):
+		push_warning("[ScansortPanel] W10 rule engine failed for %s: %s" % [
+			fname, str(rule_engine_res.get("error", "unknown"))
 		])
 		_run_counters["failed"] = int(_run_counters.get("failed", 0)) + 1
 		batch_remaining["n"] -= 1
 		return
 
-	# Successful insert — record session state.
+	var outcome: Dictionary = rule_engine_res.get("outcome", {})
+	var fired: Array = outcome.get("fired", [])
+
+	if fired.is_empty():
+		# No rule fired — nothing to place. Record as processed-with-no-rule
+		# (the file is reviewed; it is NOT a failure and NOT lost).
+		_processed_keys[fpath] = true
+		_run_counters["no_rule"] = int(_run_counters.get("no_rule", 0)) + 1
+		_push_session_marks_to_provider()
+		batch_remaining["n"] -= 1
+		return
+
+	# Common DocMeta carried into every place_fanout call.
+	var doc_meta: Dictionary = {
+		"category":      str(classification.get("category", outcome.get("effective_category", ""))),
+		"confidence":    float(classification.get("confidence", 0.0)),
+		"issuer":        str(classification.get("issuer", "")),
+		"description":   str(classification.get("description", "")),
+		"doc_date":      str(classification.get("doc_date", "")),
+		"status":        "classified",
+		"sha256":        sha256,
+		"simhash":       simhash,
+		"dhash":         dhash,
+		"source_path":   fpath,
+		"rule_snapshot": rule_snapshot,
+	}
+
+	var any_placed: bool = false
+
+	# -- Per fired action: dedup → disposition → place_fanout → audit --
+	for action: Dictionary in fired:
+		if _process_cancelled:
+			break
+
+		var copy_to: Array = action.get("copy_to", [])
+		if copy_to.is_empty():
+			continue
+
+		var rule_dict: Dictionary = action.get("rule", {})
+		var rule_label: String = str(rule_dict.get("label", action.get("category", "")))
+		var resolved_subfolder: String = str(action.get("resolved_subfolder", ""))
+		var resolved_rename_pattern: String = str(action.get("resolved_rename_pattern", ""))
+		var encrypt: bool = bool(action.get("encrypt", false))
+
+		# -- W7 dedup: near-dup check BEFORE placement --
+		# Exact SHA-256 dups are auto-skipped inside place_fanout — we do not
+		# re-check them here. Near-dup (simhash/dhash) matches MUST surface a
+		# disposition prompt; logical-identity has no MCP surface so it stays a
+		# place_fanout-internal concern.
+		var disposition: String = "keep_both"  # default when no near-dup match
+		var target_hint: String = "%s/%s" % [resolved_subfolder, fname] if not resolved_subfolder.is_empty() else fname
+		var match_info: Dictionary = await _check_near_dup(
+			conn, fpath, simhash, dhash, rule_label, target_hint
+		)
+		if not match_info.is_empty():
+			# HARD CONSTRAINT: a near-dup match is NEVER auto-dropped. The user's
+			# explicit disposition decides. Serialise the prompt so the
+			# batched-parallel drain never sees two prompts at once.
+			_run_counters["flagged"] = int(_run_counters.get("flagged", 0)) + 1
+			while _dedup_prompt_busy and not _process_cancelled:
+				await get_tree().process_frame
+			if _process_cancelled:
+				break
+			_dedup_prompt_busy = true
+			disposition = await _show_dedup_disposition(match_info)
+			_dedup_prompt_busy = false
+
+		if disposition == "skip":
+			# Explicit user skip — do NOT place this action. No data loss: the
+			# source file stays where it is.
+			_run_counters["user_skip"] = int(_run_counters.get("user_skip", 0)) + 1
+			if audit_enabled and not audit_path.is_empty():
+				await _append_audit_rows(conn, audit_path, [{
+					"event":            "skipped",
+					"source_sha256":    sha256,
+					"source_filename":  fname,
+					"rule_label":       rule_label,
+					"destination_id":   "",
+					"destination_kind": "",
+					"resolved_path":    "",
+					"disposition":      "skip",
+					"detail":           "user dispositioned near-dup as skip",
+				}])
+			continue
+
+		# -- W6 fan-out placement --
+		# disposition is "keep_both" or "replace". place_fanout has no native
+		# replace mode, so for "replace" we place normally (collision-safe
+		# naming) and record the disposition in the audit row as "replace" —
+		# the existing document is left in place; the new one is filed
+		# alongside it and the audit trail records the human's intent.
+		var place_res: Dictionary = await conn.call_tool(
+			"minerva_scansort_place_fanout",
+			{
+				"file_path":               fpath,
+				"copy_to":                 copy_to,
+				"resolved_subfolder":      resolved_subfolder,
+				"resolved_rename_pattern": resolved_rename_pattern,
+				"encrypt":                 encrypt,
+				"registry_path":           _registry_path,
+				"category":                doc_meta["category"],
+				"confidence":              doc_meta["confidence"],
+				"issuer":                  doc_meta["issuer"],
+				"description":             doc_meta["description"],
+				"doc_date":                doc_meta["doc_date"],
+				"status":                  doc_meta["status"],
+				"sha256":                  doc_meta["sha256"],
+				"simhash":                 doc_meta["simhash"],
+				"dhash":                   doc_meta["dhash"],
+				"source_path":             doc_meta["source_path"],
+				"rule_snapshot":           doc_meta["rule_snapshot"],
+			}
+		)
+		if not place_res.get("ok", false):
+			push_warning("[ScansortPanel] W10 place_fanout failed for %s: %s" % [
+				fname, str(place_res.get("error", "unknown"))
+			])
+			_run_counters["failed"] = int(_run_counters.get("failed", 0)) + 1
+			continue
+
+		var placements: Array = place_res.get("placements", [])
+		var audit_rows: Array = []
+		for pr: Dictionary in placements:
+			var pr_status: String = str(pr.get("status", "error"))
+			var dest_id: String   = str(pr.get("destination_id", ""))
+			var dest_kind: String = str(pr.get("kind", ""))
+			var target_path: String = str(pr.get("target_path", ""))
+			var pr_msg: String    = str(pr.get("message", ""))
+
+			if pr_status == "placed":
+				any_placed = true
+				_run_counters["placed"] = int(_run_counters.get("placed", 0)) + 1
+				if not dest_id.is_empty():
+					per_dest[dest_id] = int(per_dest.get(dest_id, 0)) + 1
+			elif pr_status == "skipped-already-present":
+				_run_counters["exact_dup"] = int(_run_counters.get("exact_dup", 0)) + 1
+
+			# W9: one audit row per PlacementResult.
+			audit_rows.append({
+				"event":            pr_status,
+				"source_sha256":    sha256,
+				"source_filename":  fname,
+				"rule_label":       rule_label,
+				"destination_id":   dest_id,
+				"destination_kind": dest_kind,
+				"resolved_path":    target_path,
+				"disposition":      disposition,
+				"detail":           pr_msg,
+			})
+
+		# W9: append audit rows — non-fatal on failure.
+		if audit_enabled and not audit_path.is_empty() and not audit_rows.is_empty():
+			await _append_audit_rows(conn, audit_path, audit_rows)
+
+	# Record session state. A source file is "processed" when it produced at
+	# least one placement; otherwise it was user-skipped / no-rule (already
+	# counted above) but we still mark it so it is not re-attempted this run.
 	_processed_keys[fpath] = true
-	_run_counters["processed"] = int(_run_counters.get("processed", 0)) + 1
-	var confidence: float = float(classification.get("confidence", 0.0))
-	if confidence < LOW_CONFIDENCE_THRESHOLD:
-		_low_confidence_keys[fpath] = true
-		_run_counters["low_conf"] = int(_run_counters.get("low_conf", 0)) + 1
+	if any_placed:
+		_run_counters["processed"] = int(_run_counters.get("processed", 0)) + 1
+		var confidence: float = float(classification.get("confidence", 0.0))
+		if confidence < LOW_CONFIDENCE_THRESHOLD:
+			_low_confidence_keys[fpath] = true
+			_run_counters["low_conf"] = int(_run_counters.get("low_conf", 0)) + 1
 
 	_push_session_marks_to_provider()
 	batch_remaining["n"] -= 1
+
+
+## W10: append one or more audit rows. NON-FATAL — a write failure logs a
+## warning and never aborts the run. Fills in the timestamp per row.
+func _append_audit_rows(conn: Object, audit_path: String, rows: Array) -> void:
+	if conn == null or audit_path.is_empty() or rows.is_empty():
+		return
+	var ts: String = Time.get_datetime_string_from_system(true, true)
+	var stamped: Array = []
+	for row: Dictionary in rows:
+		var r: Dictionary = row.duplicate(true)
+		if not r.has("timestamp") or str(r.get("timestamp", "")).is_empty():
+			r["timestamp"] = ts
+		stamped.append(r)
+	var res: Dictionary = await conn.call_tool(
+		"minerva_scansort_audit_append",
+		{"log_path": audit_path, "rows": stamped}
+	)
+	if not res.get("ok", false):
+		push_warning("[ScansortPanel] W10 audit_append failed (non-fatal): %s" % str(res.get("error", "unknown")))
 
 
 ## Stop button — sets the cancel flag; the batch loop picks it up between
@@ -2219,7 +2467,12 @@ func _on_panel_create_note_request(_ctx: Dictionary) -> Variant:
 ##
 ## HARD CONSTRAINT: the caller must surface non-empty results as a disposition
 ## prompt — NEVER auto-discard.
+## W10: `conn` is now passed explicitly (was resolved internally in W7) so the
+## Process All worker — and the headless smoke test — can supply a mock
+## connection. Callers without a conn handy may pass null; the method then
+## falls back to _get_connection().
 func _check_near_dup(
+	conn: Object,
 	file_path: String,
 	simhash: String,
 	dhash: String,
@@ -2228,7 +2481,8 @@ func _check_near_dup(
 ) -> Dictionary:
 	if not _vault_is_open:
 		return {}
-	var conn = _get_connection()
+	if conn == null:
+		conn = _get_connection()
 	if conn == null:
 		return {}
 
@@ -2302,6 +2556,13 @@ func _check_near_dup(
 func _show_dedup_disposition(match_info: Dictionary) -> String:
 	_pending_dedup_match = match_info
 	_last_dedup_disposition = ""
+
+	# W10 test seam: headless smoke tests set _test_dedup_auto_disposition to
+	# drive the near-dup path without a visible popup. Production leaves it "".
+	if not _test_dedup_auto_disposition.is_empty():
+		_last_dedup_disposition = _test_dedup_auto_disposition
+		_pending_dedup_match = {}
+		return _last_dedup_disposition
 
 	# Create or reuse the dialog.
 	if _dedup_dialog == null or not is_instance_valid(_dedup_dialog):
