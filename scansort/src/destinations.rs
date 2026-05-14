@@ -226,6 +226,11 @@ pub fn list(reg: &DestinationRegistry) -> &[Destination] {
     &reg.destinations
 }
 
+/// Look up a destination by its stable id.  Returns `None` when not found.
+pub fn find_by_id<'a>(reg: &'a DestinationRegistry, id: &str) -> Option<&'a Destination> {
+    reg.destinations.iter().find(|d| d.id == id)
+}
+
 /// Remove a destination by `id`.
 /// Returns `true` if a destination was removed, `false` if no match.
 pub fn remove(reg: &mut DestinationRegistry, id: &str) -> bool {

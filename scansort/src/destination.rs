@@ -270,12 +270,13 @@ fn parse_year(doc_date: &str) -> String {
 
 /// Apply `{year}` / `{date}` / `{issuer}` templates to `s`, then sanitise each
 /// `/`-delimited path component so no component is `..` or contains a literal `/`.
+/// Public for use by the placement engine (W6).
 ///
 /// `{sender}` is accepted as a backward-compat alias for `{issuer}`.
 ///
 /// We split on `/`, resolve templates in each component, reject traversal, and
 /// rejoin with the OS separator.
-fn resolve_and_sanitise(s: &str, year: &str, date: &str, issuer: &str) -> VaultResult<String> {
+pub fn resolve_and_sanitise(s: &str, year: &str, date: &str, issuer: &str) -> VaultResult<String> {
     let replaced = s
         .replace("{year}", year)
         .replace("{date}", date)
@@ -312,7 +313,8 @@ fn resolve_and_sanitise(s: &str, year: &str, date: &str, issuer: &str) -> VaultR
 /// Find a collision-safe path in `dir` for `<stem><ext>`.
 /// If `<stem><ext>` is free, returns it. Otherwise tries
 /// `<stem> (1)<ext>`, `<stem> (2)<ext>`, … until a free slot is found.
-fn collision_safe_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
+/// Public for use by the placement engine (W6).
+pub fn collision_safe_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
     let first = dir.join(format!("{stem}{ext}"));
     if !first.exists() {
         return first;

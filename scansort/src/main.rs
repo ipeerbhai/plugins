@@ -31,6 +31,7 @@ mod destinations;
 mod documents;
 mod extract;
 mod fingerprints;
+mod placement;
 mod registry;
 mod render;
 mod rule_engine;
@@ -1498,6 +1499,179 @@ fn handle_destination_remove(params: &Value, id: Value) -> RpcResponse {
     ok_response(id, tool_ok(json!({"ok": true, "removed": removed})))
 }
 
+// ---------------------------------------------------------------------------
+// W6: fan-out placement handler
+// ---------------------------------------------------------------------------
+
+/// `minerva_scansort_place_fanout` — execute copy_to fan-out for one document.
+///
+/// Takes a source file path, the resolved action fields from the W3 rule
+/// engine, a registry_path, and doc metadata.  Fans the document out to every
+/// destination in `copy_to`.  Returns a per-destination result list.
+///
+/// The `(path,mtime,size)` directory hash cache is NOT shared across tool
+/// calls (the tool is stateless); W10 Process All should drive this in-process
+/// using `placement::fan_out` directly with a long-lived `DirHashCache`.
+fn handle_place_fanout(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+
+    let file_path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+    if file_path.is_empty() {
+        return ok_response(id, tool_err("file_path is required"));
+    }
+
+    let registry_path = args.get("registry_path").and_then(|v| v.as_str()).unwrap_or("");
+    if registry_path.is_empty() {
+        return ok_response(id, tool_err("registry_path is required"));
+    }
+
+    let copy_to_val = args.get("copy_to").and_then(|v| v.as_array());
+    let copy_to: Vec<String> = match copy_to_val {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        None => vec![],
+    };
+
+    let resolved_subfolder =
+        args.get("resolved_subfolder").and_then(|v| v.as_str()).unwrap_or("");
+    let resolved_rename_pattern =
+        args.get("resolved_rename_pattern").and_then(|v| v.as_str()).unwrap_or("");
+    let encrypt = args.get("encrypt").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // Load destination registry.
+    let reg_path = std::path::Path::new(registry_path);
+    let registry = match destinations::load_or_init(reg_path) {
+        Ok(r) => r,
+        Err(e) => return ok_response(id, tool_err(&e.message)),
+    };
+
+    // Build DocMeta from params.
+    let meta = placement::DocMeta {
+        category: args
+            .get("category")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        confidence: args.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        issuer: args
+            .get("issuer")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        description: args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        doc_date: args
+            .get("doc_date")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        status: args
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("classified")
+            .to_string(),
+        simhash: args
+            .get("simhash")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0000000000000000")
+            .to_string(),
+        dhash: args
+            .get("dhash")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0000000000000000")
+            .to_string(),
+        source_path: args
+            .get("source_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        rule_snapshot: args
+            .get("rule_snapshot")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        sha256: args
+            .get("sha256")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    };
+
+    let results = placement::fan_out(
+        file_path,
+        &copy_to,
+        resolved_subfolder,
+        resolved_rename_pattern,
+        encrypt,
+        &registry,
+        &meta,
+        None,
+    );
+
+    // Serialise to JSON-friendly form.
+    let results_json: Vec<Value> = results
+        .iter()
+        .map(|r| {
+            json!({
+                "destination_id": r.destination_id,
+                "kind": r.kind,
+                "target_path": r.target_path,
+                "doc_id": r.doc_id,
+                "status": serde_json::to_value(&r.status).unwrap_or(json!("error")),
+                "message": r.message,
+            })
+        })
+        .collect();
+
+    ok_response(
+        id,
+        tool_ok(json!({
+            "ok": true,
+            "file_path": file_path,
+            "placements": results_json,
+            "count": results_json.len(),
+        })),
+    )
+}
+
+/// `minerva_scansort_scan_directory_hashes` — scan a directory for content
+/// sha256 hashes.
+///
+/// Walks `dir_path` recursively and returns the set of sha256 hex strings for
+/// every regular file found.  Stateless (no cache shared across tool calls).
+/// W10 Process All should use the in-process `DirHashCache` struct directly
+/// for performance within a single run.
+fn handle_scan_directory_hashes(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+
+    let dir_path = args.get("dir_path").and_then(|v| v.as_str()).unwrap_or("");
+    if dir_path.is_empty() {
+        return ok_response(id, tool_err("dir_path is required"));
+    }
+
+    let p = std::path::Path::new(dir_path);
+    match placement::scan_directory_hashes(p) {
+        Ok(set) => {
+            let hashes: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
+            ok_response(
+                id,
+                tool_ok(json!({
+                    "ok": true,
+                    "dir_path": dir_path,
+                    "sha256_hashes": hashes,
+                    "count": hashes.len(),
+                })),
+            )
+        }
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
 fn main() {
     // Logging goes to stderr so it never pollutes the JSON-RPC stdout channel.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -2158,6 +2332,44 @@ fn main() {
                             "required": ["registry_path", "id"],
                         },
                     },
+                    {
+                        "name": "minerva_scansort_place_fanout",
+                        "description": "W6: Execute copy_to fan-out for a single document — copy/insert it into every destination in copy_to. For directory destinations: copies file to <dest.path>/<resolved_subfolder>/<resolved_rename>, sanitised against path traversal, collision-safe. For vault destinations: calls insert_document. Skips (SkippedAlreadyPresent) if content sha256 already present at that destination. Bad/unknown destination ids produce an error row without aborting the rest. Returns {ok, placements: [{destination_id, kind, target_path, doc_id, status, message}]}. Note: directory hash cache is NOT shared across tool calls (stateless); use the in-process DirHashCache for W10 Process All runs.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "file_path": {"type": "string", "description": "Absolute path to the source file. Never moved or deleted."},
+                                "registry_path": {"type": "string", "description": "Absolute path to the destination registry JSON file (W4)."},
+                                "copy_to": {"type": "array", "items": {"type": "string"}, "description": "List of destination ids from the registry (from copy_to in the fired rule action)."},
+                                "resolved_subfolder": {"type": "string", "description": "Token-expanded subfolder from the W3 FiredRuleAction. Will be sanitised against path traversal here."},
+                                "resolved_rename_pattern": {"type": "string", "description": "Token-expanded rename pattern from W3. Will be sanitised. Empty = keep original filename."},
+                                "encrypt": {"type": "boolean", "description": "Encrypt flag from the rule. Stored in vault rule_snapshot for vault destinations."},
+                                "category": {"type": "string", "description": "Document category (from classification/rule)."},
+                                "confidence": {"type": "number", "description": "Classification confidence score."},
+                                "issuer": {"type": "string", "description": "Document issuer/sender."},
+                                "description": {"type": "string", "description": "Document description."},
+                                "doc_date": {"type": "string", "description": "Document date (YYYY-MM-DD)."},
+                                "status": {"type": "string", "description": "Document status (default: classified)."},
+                                "sha256": {"type": "string", "description": "Pre-computed content sha256 hex. When empty the tool computes it from file_path."},
+                                "simhash": {"type": "string", "description": "SimHash for near-dup detection. Default: 0000000000000000."},
+                                "dhash": {"type": "string", "description": "Perceptual dhash. Default: 0000000000000000."},
+                                "source_path": {"type": "string", "description": "Original source directory path for provenance."},
+                                "rule_snapshot": {"type": "string", "description": "JSON snapshot of the rule that fired."},
+                            },
+                            "required": ["file_path", "registry_path", "copy_to"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_scan_directory_hashes",
+                        "description": "W6: Scan a directory recursively and return the set of content sha256 hex strings for every regular file found. Stateless — no cache shared across calls. Use to check processed-state for directory destinations. For W10 Process All, use the in-process DirHashCache for performance. Returns {ok, dir_path, sha256_hashes: [string], count}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "dir_path": {"type": "string", "description": "Absolute path to the directory to scan."},
+                            },
+                            "required": ["dir_path"],
+                        },
+                    },
                 ]
             })),
 
@@ -2301,6 +2513,12 @@ fn main() {
                     }
                     "minerva_scansort_destination_remove" => {
                         handle_destination_remove(&req.params, req.id)
+                    }
+                    "minerva_scansort_place_fanout" => {
+                        handle_place_fanout(&req.params, req.id)
+                    }
+                    "minerva_scansort_scan_directory_hashes" => {
+                        handle_scan_directory_hashes(&req.params, req.id)
                     }
                     other => err_response(req.id, -32601, format!("unknown tool: {other}")),
                 }
