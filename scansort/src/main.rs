@@ -539,11 +539,9 @@ fn handle_render_pages(params: &Value, id: Value) -> RpcResponse {
 
 fn handle_insert_rule(params: &Value, id: Value) -> RpcResponse {
     let args = params.get("arguments").unwrap_or(params);
+    let rules_path = args.get("rules_path").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
-    if path.is_empty() {
-        return ok_response(id, tool_err("path is required"));
-    }
+
     let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
     if label.is_empty() {
         return ok_response(id, tool_err("label is required"));
@@ -555,26 +553,83 @@ fn handle_insert_rule(params: &Value, id: Value) -> RpcResponse {
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
     let subfolder = args.get("subfolder").and_then(|v| v.as_str()).unwrap_or("");
+    let rename_pattern = args.get("rename_pattern").and_then(|v| v.as_str()).unwrap_or("");
     let confidence_threshold = args.get("confidence_threshold").and_then(|v| v.as_f64()).unwrap_or(0.6);
     let encrypt = args.get("encrypt").and_then(|v| v.as_bool()).unwrap_or(false);
     let enabled = args.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    let is_default = args.get("is_default").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    match rules::insert_rule(path, password, label, name, instruction, &signals, subfolder, confidence_threshold, encrypt, enabled) {
-        Ok(rule_id) => ok_response(id, tool_ok(json!({"ok": true, "rule_id": rule_id}))),
-        Err(e) => ok_response(id, tool_err(&e.message)),
+    if let Some(rp) = rules_path {
+        let p = std::path::Path::new(rp);
+        let mut file = match rules_file::load_or_init(p) {
+            Ok(f) => f,
+            Err(e) => return ok_response(id, tool_err(&e.message)),
+        };
+        let rule = rules_file::FileRule {
+            label: label.to_string(),
+            name: name.to_string(),
+            instruction: instruction.to_string(),
+            signals,
+            subfolder: subfolder.to_string(),
+            rename_pattern: rename_pattern.to_string(),
+            confidence_threshold,
+            encrypt,
+            enabled,
+            is_default,
+        };
+        let idx = rules_file::upsert(&mut file, rule);
+        if let Err(e) = rules_file::save(p, &file) {
+            return ok_response(id, tool_err(&e.message));
+        }
+        return ok_response(id, tool_ok(json!({"ok": true, "index": idx, "rules_path": rp})));
     }
+
+    if path.is_empty() {
+        return ok_response(id, tool_err("rules_path (or legacy `path` for read-only) is required"));
+    }
+    // Legacy write path: refuse with deprecation message.
+    ok_response(id, tool_err(
+        "rules table is read-only after migration to 1.1.0 — pass `rules_path` instead of `path`",
+    ))
 }
 
 fn handle_list_rules(params: &Value, id: Value) -> RpcResponse {
     let args = params.get("arguments").unwrap_or(params);
+    let rules_path = args.get("rules_path").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
     let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
-    if path.is_empty() {
-        return ok_response(id, tool_err("path is required"));
+
+    if let Some(rp) = rules_path {
+        let p = std::path::Path::new(rp);
+        let file = match rules_file::load_or_init(p) {
+            Ok(f) => f,
+            Err(e) => return ok_response(id, tool_err(&e.message)),
+        };
+        match serde_json::to_value(&file.rules) {
+            Ok(v) => return ok_response(id, tool_ok(json!({
+                "ok": true,
+                "rules": v,
+                "count": file.rules.len(),
+                "rules_path": rp,
+                "exists": p.exists(),
+            }))),
+            Err(e) => return ok_response(id, tool_err(&e.to_string())),
+        }
     }
+
+    if path.is_empty() {
+        return ok_response(id, tool_err("rules_path (or legacy `path`) is required"));
+    }
+    // Legacy read path — embedded table, marked deprecated.
     match rules::list_rules(path, password) {
         Ok(r) => match serde_json::to_value(&r) {
-            Ok(v) => ok_response(id, tool_ok(json!({"ok": true, "rules": v, "count": r.len()}))),
+            Ok(v) => ok_response(id, tool_ok(json!({
+                "ok": true,
+                "rules": v,
+                "count": r.len(),
+                "deprecated": true,
+                "deprecation_reason": "Reading from the embedded vault rules table (legacy). Pass rules_path to read the external rules file.",
+            }))),
             Err(e) => ok_response(id, tool_err(&e.to_string())),
         },
         Err(e) => ok_response(id, tool_err(&e.message)),
@@ -583,16 +638,38 @@ fn handle_list_rules(params: &Value, id: Value) -> RpcResponse {
 
 fn handle_get_rule(params: &Value, id: Value) -> RpcResponse {
     let args = params.get("arguments").unwrap_or(params);
+    let rules_path = args.get("rules_path").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
     let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
-    if path.is_empty() {
-        return ok_response(id, tool_err("path is required"));
+    let label_opt = args.get("label").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+
+    if let Some(rp) = rules_path {
+        let label = match label_opt {
+            Some(l) => l,
+            None => return ok_response(id, tool_err("label is required when using rules_path (rule_id is vault-embedded only)")),
+        };
+        let p = std::path::Path::new(rp);
+        let file = match rules_file::load_or_init(p) {
+            Ok(f) => f,
+            Err(e) => return ok_response(id, tool_err(&e.message)),
+        };
+        match rules_file::find_by_label(&file.rules, label) {
+            Some(r) => match serde_json::to_value(r) {
+                Ok(v) => return ok_response(id, tool_ok(json!({"ok": true, "rule": v, "rules_path": rp}))),
+                Err(e) => return ok_response(id, tool_err(&e.to_string())),
+            },
+            None => return ok_response(id, tool_err(&format!("Rule not found: {label}"))),
+        }
     }
-    // Accept either label (string) or rule_id (integer)
-    if let Some(label) = args.get("label").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+
+    if path.is_empty() {
+        return ok_response(id, tool_err("rules_path (or legacy `path`) is required"));
+    }
+    // Legacy: accept either label or rule_id, embedded table read.
+    if let Some(label) = label_opt {
         match rules::get_rule_by_label(path, password, label) {
             Ok(Some(r)) => match serde_json::to_value(&r) {
-                Ok(v) => ok_response(id, tool_ok(json!({"ok": true, "rule": v}))),
+                Ok(v) => ok_response(id, tool_ok(json!({"ok": true, "rule": v, "deprecated": true}))),
                 Err(e) => ok_response(id, tool_err(&e.to_string())),
             },
             Ok(None) => ok_response(id, tool_err(&format!("Rule not found: {label}"))),
@@ -601,7 +678,7 @@ fn handle_get_rule(params: &Value, id: Value) -> RpcResponse {
     } else if let Some(rule_id) = args.get("rule_id").and_then(|v| v.as_i64()) {
         match rules::get_rule_by_id(path, password, rule_id) {
             Ok(Some(r)) => match serde_json::to_value(&r) {
-                Ok(v) => ok_response(id, tool_ok(json!({"ok": true, "rule": v}))),
+                Ok(v) => ok_response(id, tool_ok(json!({"ok": true, "rule": v, "deprecated": true}))),
                 Err(e) => ok_response(id, tool_err(&e.to_string())),
             },
             Ok(None) => ok_response(id, tool_err(&format!("Rule not found: {rule_id}"))),
@@ -614,11 +691,8 @@ fn handle_get_rule(params: &Value, id: Value) -> RpcResponse {
 
 fn handle_update_rule(params: &Value, id: Value) -> RpcResponse {
     let args = params.get("arguments").unwrap_or(params);
+    let rules_path = args.get("rules_path").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
-    if path.is_empty() {
-        return ok_response(id, tool_err("path is required"));
-    }
     let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
     if label.is_empty() {
         return ok_response(id, tool_err("label is required"));
@@ -628,44 +702,178 @@ fn handle_update_rule(params: &Value, id: Value) -> RpcResponse {
         Value::Object(map) => map.into_iter().collect(),
         _ => return ok_response(id, tool_err("updates must be an object")),
     };
-    match rules::update_rule(path, password, label, &updates) {
-        Ok(()) => ok_response(id, tool_ok(json!({"ok": true}))),
-        Err(e) => ok_response(id, tool_err(&e.message)),
+    if updates.is_empty() {
+        return ok_response(id, tool_err("No valid fields to update"));
     }
+
+    if let Some(rp) = rules_path {
+        let p = std::path::Path::new(rp);
+        let mut file = match rules_file::load_or_init(p) {
+            Ok(f) => f,
+            Err(e) => return ok_response(id, tool_err(&e.message)),
+        };
+        let idx = match rules_file::index_of(&file, label) {
+            Some(i) => i,
+            None => return ok_response(id, tool_err(&format!("Rule not found: {label}"))),
+        };
+        let rule = &mut file.rules[idx];
+
+        if let Some(v) = updates.get("name").and_then(|x| x.as_str()) { rule.name = v.to_string(); }
+        if let Some(v) = updates.get("instruction").and_then(|x| x.as_str()) { rule.instruction = v.to_string(); }
+        if let Some(v) = updates.get("subfolder").and_then(|x| x.as_str()) { rule.subfolder = v.to_string(); }
+        if let Some(v) = updates.get("rename_pattern").and_then(|x| x.as_str()) { rule.rename_pattern = v.to_string(); }
+        if let Some(v) = updates.get("confidence_threshold").and_then(|x| x.as_f64()) { rule.confidence_threshold = v; }
+        if let Some(v) = updates.get("encrypt").and_then(|x| x.as_bool()) { rule.encrypt = v; }
+        if let Some(v) = updates.get("enabled").and_then(|x| x.as_bool()) { rule.enabled = v; }
+        if let Some(v) = updates.get("is_default").and_then(|x| x.as_bool()) { rule.is_default = v; }
+        if let Some(v) = updates.get("signals").and_then(|x| x.as_array()) {
+            rule.signals = v.iter().filter_map(|s| s.as_str().map(String::from)).collect();
+        }
+        // Label renames are supported but must not collide.
+        if let Some(new_label) = updates.get("label").and_then(|x| x.as_str()) {
+            if !new_label.is_empty() && new_label != label {
+                if rules_file::index_of(&file, new_label).is_some() {
+                    return ok_response(id, tool_err(&format!("Cannot rename to '{new_label}': label already in use")));
+                }
+                file.rules[idx].label = new_label.to_string();
+            }
+        }
+
+        if let Err(e) = rules_file::save(p, &file) {
+            return ok_response(id, tool_err(&e.message));
+        }
+        return ok_response(id, tool_ok(json!({"ok": true, "rules_path": rp})));
+    }
+
+    if path.is_empty() {
+        return ok_response(id, tool_err("rules_path (or legacy `path` for read-only) is required"));
+    }
+    ok_response(id, tool_err(
+        "rules table is read-only after migration to 1.1.0 — pass `rules_path` instead of `path`",
+    ))
 }
 
 fn handle_delete_rule(params: &Value, id: Value) -> RpcResponse {
     let args = params.get("arguments").unwrap_or(params);
+    let rules_path = args.get("rules_path").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
-    if path.is_empty() {
-        return ok_response(id, tool_err("path is required"));
-    }
     let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
     if label.is_empty() {
         return ok_response(id, tool_err("label is required"));
     }
-    match rules::delete_rule(path, password, label) {
-        Ok(()) => ok_response(id, tool_ok(json!({"ok": true}))),
-        Err(e) => ok_response(id, tool_err(&e.message)),
+
+    if let Some(rp) = rules_path {
+        let p = std::path::Path::new(rp);
+        let mut file = match rules_file::load_or_init(p) {
+            Ok(f) => f,
+            Err(e) => return ok_response(id, tool_err(&e.message)),
+        };
+        if let Some(idx) = rules_file::index_of(&file, label) {
+            if file.rules[idx].is_default {
+                return ok_response(id, tool_err(&format!("Cannot delete default rule '{label}'")));
+            }
+        }
+        let removed = rules_file::remove(&mut file, label);
+        if !removed {
+            return ok_response(id, tool_err(&format!("Rule not found: {label}")));
+        }
+        if let Err(e) = rules_file::save(p, &file) {
+            return ok_response(id, tool_err(&e.message));
+        }
+        return ok_response(id, tool_ok(json!({"ok": true, "rules_path": rp})));
     }
+
+    if path.is_empty() {
+        return ok_response(id, tool_err("rules_path (or legacy `path` for read-only) is required"));
+    }
+    ok_response(id, tool_err(
+        "rules table is read-only after migration to 1.1.0 — pass `rules_path` instead of `path`",
+    ))
 }
 
 fn handle_import_rules_from_json(params: &Value, id: Value) -> RpcResponse {
     let args = params.get("arguments").unwrap_or(params);
+    let rules_path = args.get("rules_path").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
     let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
-    if path.is_empty() {
-        return ok_response(id, tool_err("path is required"));
-    }
     let json_text = args.get("json_text").and_then(|v| v.as_str()).unwrap_or("");
     if json_text.is_empty() {
         return ok_response(id, tool_err("json_text is required"));
     }
-    match rules::import_rules_from_json(path, password, json_text) {
-        Ok(count) => ok_response(id, tool_ok(json!({"ok": true, "count": count}))),
-        Err(e) => ok_response(id, tool_err(&e.message)),
+
+    if let Some(rp) = rules_path {
+        let p = std::path::Path::new(rp);
+        // Accept three input shapes:
+        //   1. A full RulesFile object {schema_version, rules: [...]}
+        //   2. A bare array of rule entries
+        //   3. An object with a "rules" or "categories" array key
+        // For shapes 2 and 3 the top-level RulesFile metadata is preserved
+        // from any existing file (or defaults), and rules are UPSERTED by label.
+        let parsed: Value = match serde_json::from_str(json_text) {
+            Ok(v) => v,
+            Err(e) => return ok_response(id, tool_err(&format!("JSON parse error: {e}"))),
+        };
+
+        // Try to parse as a full RulesFile first.
+        if let Ok(file) = serde_json::from_value::<rules_file::RulesFile>(parsed.clone()) {
+            if file.schema_version > rules_file::CURRENT_SCHEMA_VERSION {
+                return ok_response(id, tool_err(&format!(
+                    "Imported rules file has schema_version {} (supported: {})",
+                    file.schema_version, rules_file::CURRENT_SCHEMA_VERSION,
+                )));
+            }
+            let count = file.rules.len();
+            if let Err(e) = rules_file::save(p, &file) {
+                return ok_response(id, tool_err(&e.message));
+            }
+            return ok_response(id, tool_ok(json!({"ok": true, "count": count, "mode": "replace", "rules_path": rp})));
+        }
+
+        // Otherwise treat as a list of rule entries (shape 2 or 3).
+        let entries: Vec<Value> = if let Some(arr) = parsed.as_array() {
+            arr.to_owned()
+        } else if let Some(obj) = parsed.as_object() {
+            obj.get("rules")
+                .or_else(|| obj.get("categories"))
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if entries.is_empty() {
+            return ok_response(id, tool_err("Expected a RulesFile object, a bare array, or an object with a 'rules'/'categories' array"));
+        }
+
+        let mut file = match rules_file::load_or_init(p) {
+            Ok(f) => f,
+            Err(e) => return ok_response(id, tool_err(&e.message)),
+        };
+        let mut count: i64 = 0;
+        for entry in entries {
+            let rule: rules_file::FileRule = match serde_json::from_value(entry.clone()) {
+                Ok(r) => r,
+                Err(e) => return ok_response(id, tool_err(&format!("Invalid rule entry: {e} ({entry})"))),
+            };
+            if rule.label.is_empty() {
+                continue;
+            }
+            rules_file::upsert(&mut file, rule);
+            count += 1;
+        }
+        if let Err(e) = rules_file::save(p, &file) {
+            return ok_response(id, tool_err(&e.message));
+        }
+        return ok_response(id, tool_ok(json!({"ok": true, "count": count, "mode": "upsert", "rules_path": rp})));
     }
+
+    if path.is_empty() {
+        return ok_response(id, tool_err("rules_path (or legacy `path` for read-only) is required"));
+    }
+    let _ = password;
+    ok_response(id, tool_err(
+        "rules table is read-only after migration to 1.1.0 — pass `rules_path` instead of `path`",
+    ))
 }
 
 fn handle_classify_document(
@@ -1239,88 +1447,94 @@ fn main() {
                     },
                     {
                         "name": "minerva_scansort_insert_rule",
-                        "description": "Insert a classification rule into a vault. Returns {ok, rule_id}.",
+                        "description": "Insert or replace a classification rule in the rules file. Pass `rules_path` (preferred) — the new external rules JSON. Legacy `path`/`password` args are accepted for back-compat but write operations against the embedded vault rules table are no longer supported (returns an error pointing at rules_path).",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "path": {"type": "string", "description": "Absolute path to the vault file."},
-                                "password": {"type": "string", "description": "Vault password (optional, for API consistency)."},
-                                "label": {"type": "string", "description": "Unique label for the rule (used as category key)."},
+                                "rules_path": {"type": "string", "description": "Absolute path to the rules JSON file (e.g. <vault-stem>.rules.json sibling or a user-level library file). Created if absent."},
+                                "path": {"type": "string", "description": "Deprecated: legacy vault path. Write ops return an error; use rules_path instead."},
+                                "password": {"type": "string", "description": "Deprecated: unused for rule operations."},
+                                "label": {"type": "string", "description": "Unique label for the rule (used as category key). Upserts if a rule with this label already exists."},
                                 "name": {"type": "string", "description": "Human-readable rule name."},
                                 "instruction": {"type": "string", "description": "LLM instruction for classifying documents into this category."},
                                 "signals": {"type": "array", "items": {"type": "string"}, "description": "Keywords/signals that hint at this category."},
                                 "subfolder": {"type": "string", "description": "Subfolder to place classified documents."},
+                                "rename_pattern": {"type": "string", "description": "Per-rule rename pattern override (defaults to the file-level pattern)."},
                                 "confidence_threshold": {"type": "number", "description": "Minimum confidence for auto-classification (default: 0.6)."},
                                 "encrypt": {"type": "boolean", "description": "Whether documents in this category should be encrypted."},
                                 "enabled": {"type": "boolean", "description": "Whether this rule is active (default: true)."},
+                                "is_default": {"type": "boolean", "description": "Mark this rule as the default fallback. At most one rule should have this set."},
                             },
-                            "required": ["path", "label"],
+                            "required": ["label"],
                         },
                     },
                     {
                         "name": "minerva_scansort_list_rules",
-                        "description": "List all classification rules in a vault. Returns {ok, rules, count}.",
+                        "description": "List classification rules from a rules file (preferred) or the legacy embedded vault rules table (read-only, deprecated). Returns {ok, rules, count, rules_path?, deprecated?}.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "path": {"type": "string", "description": "Absolute path to the vault file."},
-                                "password": {"type": "string", "description": "Vault password (optional)."},
+                                "rules_path": {"type": "string", "description": "Absolute path to the rules JSON file. Returns an empty rules array if the file does not yet exist."},
+                                "path": {"type": "string", "description": "Deprecated: legacy vault path. Reads the embedded rules table read-only with a deprecated:true flag."},
+                                "password": {"type": "string", "description": "Deprecated: unused."},
                             },
-                            "required": ["path"],
                         },
                     },
                     {
                         "name": "minerva_scansort_get_rule",
-                        "description": "Get a single classification rule by label or rule_id. Returns {ok, rule}.",
+                        "description": "Get a single classification rule. Use rules_path + label (preferred) or the legacy embedded-table read path. Returns {ok, rule}.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "path": {"type": "string", "description": "Absolute path to the vault file."},
-                                "password": {"type": "string", "description": "Vault password (optional)."},
-                                "label": {"type": "string", "description": "Rule label to look up (mutually exclusive with rule_id)."},
-                                "rule_id": {"type": "integer", "description": "Rule ID to look up (mutually exclusive with label)."},
+                                "rules_path": {"type": "string", "description": "Absolute path to the rules JSON file."},
+                                "path": {"type": "string", "description": "Deprecated: legacy vault path."},
+                                "password": {"type": "string", "description": "Deprecated: unused."},
+                                "label": {"type": "string", "description": "Rule label to look up. Required when using rules_path."},
+                                "rule_id": {"type": "integer", "description": "Legacy: rule_id lookup only works against the embedded vault rules table (no rule_ids in the rules file)."},
                             },
-                            "required": ["path"],
                         },
                     },
                     {
                         "name": "minerva_scansort_update_rule",
-                        "description": "Update fields of an existing classification rule by label. Returns {ok}.",
+                        "description": "Update fields of an existing classification rule by label. Pass rules_path (preferred). Legacy path returns deprecation error.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "path": {"type": "string", "description": "Absolute path to the vault file."},
-                                "password": {"type": "string", "description": "Vault password (optional)."},
+                                "rules_path": {"type": "string", "description": "Absolute path to the rules JSON file."},
+                                "path": {"type": "string", "description": "Deprecated: legacy vault path. Write ops return an error."},
+                                "password": {"type": "string", "description": "Deprecated: unused."},
                                 "label": {"type": "string", "description": "Label of the rule to update."},
                                 "updates": {"type": "object", "description": "Map of field names to new values. Allowed: name, instruction, signals, subfolder, rename_pattern, confidence_threshold, encrypt, enabled, is_default, label."},
                             },
-                            "required": ["path", "label", "updates"],
+                            "required": ["label", "updates"],
                         },
                     },
                     {
                         "name": "minerva_scansort_delete_rule",
-                        "description": "Delete a classification rule by label. Refuses to delete default rules. Returns {ok}.",
+                        "description": "Delete a classification rule by label. Refuses to delete rules marked is_default. Pass rules_path (preferred).",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "path": {"type": "string", "description": "Absolute path to the vault file."},
-                                "password": {"type": "string", "description": "Vault password (optional)."},
+                                "rules_path": {"type": "string", "description": "Absolute path to the rules JSON file."},
+                                "path": {"type": "string", "description": "Deprecated: legacy vault path. Write ops return an error."},
+                                "password": {"type": "string", "description": "Deprecated: unused."},
                                 "label": {"type": "string", "description": "Label of the rule to delete."},
                             },
-                            "required": ["path", "label"],
+                            "required": ["label"],
                         },
                     },
                     {
                         "name": "minerva_scansort_import_rules_from_json",
-                        "description": "Bulk-import classification rules from a JSON array string (or object with 'rules' key). Uses INSERT OR REPLACE. Returns {ok, count}.",
+                        "description": "Bulk import classification rules into a rules file. json_text accepts a full RulesFile object (replaces file content), a bare array, or an object with a 'rules'/'categories' key (upserts entries into the existing or new file). Returns {ok, count, mode, rules_path}.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "path": {"type": "string", "description": "Absolute path to the vault file."},
-                                "password": {"type": "string", "description": "Vault password (optional)."},
-                                "json_text": {"type": "string", "description": "JSON string containing a rules array or object with 'rules' key."},
+                                "rules_path": {"type": "string", "description": "Absolute path to the rules JSON file. Created if absent."},
+                                "path": {"type": "string", "description": "Deprecated: legacy vault path. Write ops return an error."},
+                                "password": {"type": "string", "description": "Deprecated: unused."},
+                                "json_text": {"type": "string", "description": "JSON string: RulesFile object, bare rule array, or {rules: [...]}/{categories: [...]}."},
                             },
-                            "required": ["path", "json_text"],
+                            "required": ["json_text"],
                         },
                     },
                     {

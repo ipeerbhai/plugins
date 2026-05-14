@@ -217,6 +217,56 @@ pub fn load_for_vault(
 }
 
 // ---------------------------------------------------------------------------
+// CRUD helpers — used by the MCP tool handlers
+// ---------------------------------------------------------------------------
+
+/// Load a rules file from disk, or return a default empty file if the path
+/// doesn't exist. Used by MCP handlers when the user is starting a new
+/// rules set — the first `insert_rule` should just-work without a prior
+/// explicit `create` step.
+///
+/// Existing files still validate normally (schema_version check, JSON parse).
+pub fn load_or_init(path: &Path) -> VaultResult<RulesFile> {
+    if path.exists() {
+        load(path)
+    } else {
+        Ok(RulesFile::default())
+    }
+}
+
+/// Find the index of a rule by label. Returns None if no match.
+pub fn index_of(file: &RulesFile, label: &str) -> Option<usize> {
+    file.rules.iter().position(|r| r.label == label)
+}
+
+/// Insert a rule (or replace existing rule with the same label).
+/// Returns the resulting index.
+pub fn upsert(file: &mut RulesFile, rule: FileRule) -> usize {
+    match index_of(file, &rule.label) {
+        Some(i) => {
+            file.rules[i] = rule;
+            i
+        }
+        None => {
+            file.rules.push(rule);
+            file.rules.len() - 1
+        }
+    }
+}
+
+/// Remove a rule by label. Returns true if a rule was removed, false if
+/// no rule with that label existed.
+pub fn remove(file: &mut RulesFile, label: &str) -> bool {
+    match index_of(file, label) {
+        Some(i) => {
+            file.rules.remove(i);
+            true
+        }
+        None => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot construction
 // ---------------------------------------------------------------------------
 
@@ -558,6 +608,96 @@ mod tests {
         let s1: serde_json::Value = serde_json::from_str(&build_snapshot(&r1)).unwrap();
         let s2: serde_json::Value = serde_json::from_str(&build_snapshot(&r2)).unwrap();
         assert_ne!(s1["snapshot_hash"], s2["snapshot_hash"]);
+    }
+
+    #[test]
+    fn load_or_init_returns_default_for_missing_path() {
+        let path = unique_tmp("loadinit_missing").join("rules.json");
+        let f = load_or_init(&path).expect("default");
+        assert_eq!(f.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(f.rules.is_empty());
+    }
+
+    #[test]
+    fn load_or_init_returns_existing_for_existing_path() {
+        let dir = unique_tmp("loadinit_existing");
+        let path = dir.join("rules.json");
+        save(&path, &sample_file()).expect("save");
+        let f = load_or_init(&path).expect("load");
+        assert_eq!(f.rules.len(), 2);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn upsert_appends_new_rule_when_label_absent() {
+        let mut f = RulesFile::default();
+        let idx = upsert(&mut f, sample_rule("new_rule"));
+        assert_eq!(idx, 0);
+        assert_eq!(f.rules.len(), 1);
+        assert_eq!(f.rules[0].label, "new_rule");
+    }
+
+    #[test]
+    fn upsert_replaces_existing_rule_with_same_label() {
+        let mut f = sample_file();
+        let original_count = f.rules.len();
+        let mut updated = sample_rule("tax_w2");
+        updated.instruction = "REPLACED INSTRUCTION".to_string();
+        upsert(&mut f, updated);
+        assert_eq!(f.rules.len(), original_count, "count must not grow on replace");
+        let r = find_by_label(&f.rules, "tax_w2").expect("found");
+        assert_eq!(r.instruction, "REPLACED INSTRUCTION");
+    }
+
+    #[test]
+    fn remove_returns_true_and_drops_rule_when_label_present() {
+        let mut f = sample_file();
+        assert!(remove(&mut f, "tax_w2"));
+        assert!(find_by_label(&f.rules, "tax_w2").is_none());
+    }
+
+    #[test]
+    fn remove_returns_false_when_label_absent() {
+        let mut f = sample_file();
+        assert!(!remove(&mut f, "no_such_label"));
+        assert_eq!(f.rules.len(), 2);
+    }
+
+    /// R3+R4 vertical slice: simulate what the insert_rule MCP handler does
+    /// (write a rule via load_or_init+upsert+save), then run the resolution
+    /// path that classify_document uses (load_for_vault) and confirm the
+    /// rule round-trips with content intact. Catches any breakage in the
+    /// file-format ↔ resolution-path contract.
+    #[test]
+    fn integration_r3_plus_r4_write_then_classify_resolves() {
+        let dir = unique_tmp("integration_r3r4");
+        fs::create_dir_all(&dir).unwrap();
+        let vault_path = dir.join("v.ssort");
+        // (vault file doesn't need to exist — resolve_for_vault only checks paths)
+        let sibling = sibling_path(&vault_path);
+
+        // Step 1: insert_rule MCP handler behavior
+        let mut file = load_or_init(&sibling).expect("init");
+        upsert(&mut file, sample_rule("school"));
+        upsert(&mut file, sample_rule("receipt"));
+        upsert(&mut file, sample_rule("memories")); // is_default
+        save(&sibling, &file).expect("save");
+
+        // Step 2: classify_document path — resolve + load + lookup by label
+        let (resolved_path, loaded) =
+            load_for_vault(&vault_path, None).expect("load_for_vault");
+        assert_eq!(resolved_path, sibling, "resolution must hit the sibling we just wrote");
+        assert_eq!(loaded.rules.len(), 3);
+
+        // Step 3: build_snapshot for a hypothetical LLM-returned label
+        let resolved_rule = find_by_label(&loaded.rules, "school").expect("school rule");
+        let snapshot = build_snapshot(resolved_rule);
+        let parsed: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(parsed["label"], "school");
+        assert_eq!(parsed["confidence_threshold"], 0.7);
+        assert!(parsed["snapshot_hash"].as_str().unwrap().len() == 64);
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
