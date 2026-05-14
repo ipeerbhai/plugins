@@ -226,15 +226,20 @@ func _build_category_nodes(docs: Array) -> Array:
 			var display: String = str(doc.get("display_name", doc.get("original_filename", "unknown")))
 			var sender: String = str(doc.get("sender", ""))
 			var desc: String = str(doc.get("description", ""))
+			var is_encrypted: bool = bool(doc.get("encrypted", false))
 			children.append({
 				"kind":       "file",
 				"name":       display,
 				"key":        "doc:%d" % doc_id,
 				"date":       str(doc.get("doc_date", "")),
-				"tooltip":    "%s\nSender: %s\n%s" % [display, sender, desc],
+				"tooltip":    "%s\nSender: %s\n%s%s" % [
+					display, sender, desc,
+					"\n[encrypted]" if is_encrypted else "",
+				],
 				"children":   [],
 				"node_role":  "document",
 				"vault_path": _building_vault_path,
+				"encrypted":  is_encrypted,
 			})
 		nodes.append({
 			"kind":     "folder",

@@ -501,6 +501,30 @@ fn handle_extract_document(params: &Value, id: Value) -> RpcResponse {
     }
 }
 
+fn handle_set_document_encrypted(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let vault_path = args.get("vault_path").and_then(|v| v.as_str()).unwrap_or("");
+    if vault_path.is_empty() {
+        return ok_response(id, tool_err("vault_path is required"));
+    }
+    let doc_id = match args.get("doc_id").and_then(|v| v.as_i64()) {
+        Some(d) => d,
+        None => return ok_response(id, tool_err("doc_id is required")),
+    };
+    let encrypt = match args.get("encrypt").and_then(|v| v.as_bool()) {
+        Some(b) => b,
+        None => return ok_response(id, tool_err("encrypt (boolean) is required")),
+    };
+    let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
+    match documents::set_document_encrypted(vault_path, doc_id, encrypt, password) {
+        Ok(()) => ok_response(
+            id,
+            tool_ok(json!({"ok": true, "doc_id": doc_id, "encrypted": encrypt})),
+        ),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
 fn handle_update_document(params: &Value, id: Value) -> RpcResponse {
     let args = params.get("arguments").unwrap_or(params);
     let vault_path = args.get("vault_path").and_then(|v| v.as_str()).unwrap_or("");
@@ -2178,6 +2202,20 @@ fn main() {
                         },
                     },
                     {
+                        "name": "minerva_scansort_set_document_encrypted",
+                        "description": "Toggle a document's at-rest encryption in place. encrypt=true encrypts a plaintext document; encrypt=false decrypts an encrypted one. A state change requires the vault password; already-in-state is a no-op.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "vault_path": {"type": "string", "description": "Absolute path to the vault file."},
+                                "doc_id": {"type": "integer", "description": "Document ID to encrypt or decrypt."},
+                                "encrypt": {"type": "boolean", "description": "true = encrypt the document at rest; false = decrypt it."},
+                                "password": {"type": "string", "description": "Vault password. Required to change encryption state; ignored when the document is already in the requested state."},
+                            },
+                            "required": ["vault_path", "doc_id", "encrypt"],
+                        },
+                    },
+                    {
                         "name": "minerva_scansort_update_document",
                         "description": "Update document metadata fields (status, category, display_name, description, tags) by doc_id.",
                         "inputSchema": {
@@ -2752,6 +2790,9 @@ fn main() {
                     }
                     "minerva_scansort_extract_document" => {
                         handle_extract_document(&req.params, req.id)
+                    }
+                    "minerva_scansort_set_document_encrypted" => {
+                        handle_set_document_encrypted(&req.params, req.id)
                     }
                     "minerva_scansort_update_document" => {
                         handle_update_document(&req.params, req.id)

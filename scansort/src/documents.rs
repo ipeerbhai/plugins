@@ -426,6 +426,104 @@ pub fn extract_document(path: &str, doc_id: i64, dest: &str, password: &str) -> 
 }
 
 // ---------------------------------------------------------------------------
+// set_document_encrypted — toggle a document's at-rest encryption in place
+// ---------------------------------------------------------------------------
+
+/// Toggle whether a document's stored blob is encrypted, in place.
+///
+/// The stored blob is always `compress(raw)`; an *encrypted* document
+/// additionally has that compressed blob AES-256-GCM encrypted
+/// (`encrypt(compress(raw))`) with `encryption_iv` / `encryption_tag` set.
+/// Encryption state is identified by iv/tag presence — the same convention
+/// `extract_document` and `query_documents` use.
+///
+/// * `encrypt == true` on a plaintext doc  → `encrypt(compress(raw))`, sets iv/tag.
+/// * `encrypt == false` on an encrypted doc → decrypts back to `compress(raw)`,
+///   clears iv/tag.
+/// * Already in the requested state → no-op (`Ok`).
+/// * A state change requires a non-empty `password`; a wrong password on
+///   decrypt returns a clear error and never panics (GCM tag mismatch).
+pub fn set_document_encrypted(
+    path: &str,
+    doc_id: i64,
+    encrypt: bool,
+    password: &str,
+) -> VaultResult<()> {
+    let conn = db::connect(path)?;
+
+    let (file_data, enc_iv, enc_tag): (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>) = conn
+        .prepare(
+            "SELECT file_data, encryption_iv, encryption_tag FROM documents WHERE doc_id = ?",
+        )?
+        .query_row(params![doc_id], |row| {
+            Ok((
+                db::get_blob(row, "file_data"),
+                db::get_blob(row, "encryption_iv"),
+                db::get_blob(row, "encryption_tag"),
+            ))
+        })
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                VaultError::new(format!("Document not found: id={doc_id}"))
+            }
+            other => VaultError::from(other),
+        })?;
+
+    let blob = file_data.ok_or_else(|| VaultError::new("Document has no file data"))?;
+    let currently_encrypted = enc_iv.is_some() && enc_tag.is_some();
+
+    // Already in the requested state — nothing to do.
+    if currently_encrypted == encrypt {
+        return Ok(());
+    }
+
+    if password.is_empty() {
+        return Err(VaultError::new(
+            "A vault password is required to change a document's encryption.",
+        ));
+    }
+    let key = crypto::vault_key(path, password).map_err(|e| {
+        VaultError::new(format!("Failed to derive vault key: {}", e.message))
+    })?;
+
+    let (new_blob, new_iv, new_tag): (Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>) = if encrypt {
+        // Plaintext → encrypted: encrypt the (already compressed) blob.
+        let (ct, iv, tag) = crypto::encrypt_bytes(&key, &blob)?;
+        (ct, Some(iv), Some(tag))
+    } else {
+        // Encrypted → plaintext: decrypt back to the compressed blob.
+        let iv = enc_iv.unwrap();
+        let tag = enc_tag.unwrap();
+        let compressed = crypto::decrypt_bytes(&key, &blob, &iv, &tag).map_err(|_| {
+            VaultError::new("Incorrect vault password — could not decrypt the document.")
+        })?;
+        (compressed, None, None)
+    };
+
+    conn.execute(
+        "UPDATE documents SET file_data = ?1, encryption_iv = ?2, encryption_tag = ?3 \
+         WHERE doc_id = ?4",
+        params![new_blob, new_iv, new_tag, doc_id],
+    )?;
+
+    conn.execute(
+        "INSERT INTO log (timestamp, level, component, message, doc_id) \
+         VALUES (?1, 'info', 'vault', ?2, ?3)",
+        params![
+            now_iso(),
+            if encrypt {
+                "Document encrypted at rest"
+            } else {
+                "Document decrypted at rest"
+            },
+            doc_id,
+        ],
+    )?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // update_document
 // ---------------------------------------------------------------------------
 
@@ -565,7 +663,7 @@ pub fn vault_inventory(path: &str) -> VaultResult<Vec<Document>> {
 #[cfg(test)]
 mod tests {
     use crate::crypto;
-    use crate::documents::{extract_document, insert_document};
+    use crate::documents::{extract_document, insert_document, set_document_encrypted};
     use crate::vault_lifecycle;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -746,6 +844,79 @@ mod tests {
             std::fs::read(&out_path2).unwrap().as_slice(),
             body,
             "plaintext extract must match original even when a password is supplied"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. W5h: set_document_encrypted toggles encryption in place, round-trips.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn set_document_encrypted_round_trips_plaintext_to_encrypted_and_back() {
+        let body = b"a document that starts plaintext and gets encrypted in place";
+        let (dir, vault_path, src_file) = setup("setenc-rt", body);
+        let pw = "vault password for in-place encryption";
+        crypto::set_password(vault_path.to_str().unwrap(), pw).expect("set_password");
+
+        // Insert as PLAINTEXT (no password to insert).
+        let doc_id = insert(&vault_path, &src_file, "");
+
+        // Encrypt in place.
+        set_document_encrypted(vault_path.to_str().unwrap(), doc_id, true, pw)
+            .expect("encrypt in place");
+        // Now it must require the password to extract...
+        let no_pw = extract_document(
+            vault_path.to_str().unwrap(),
+            doc_id,
+            dir.join("x1.txt").to_str().unwrap(),
+            "",
+        );
+        assert!(no_pw.is_err(), "encrypted doc must need a password");
+        // ...and decrypt correctly with it.
+        let out = dir.join("enc-extract.txt");
+        extract_document(vault_path.to_str().unwrap(), doc_id, out.to_str().unwrap(), pw)
+            .expect("extract after in-place encrypt");
+        assert_eq!(std::fs::read(&out).unwrap().as_slice(), body);
+
+        // Decrypt in place — now it extracts with an empty password again.
+        set_document_encrypted(vault_path.to_str().unwrap(), doc_id, false, pw)
+            .expect("decrypt in place");
+        let out2 = dir.join("dec-extract.txt");
+        extract_document(vault_path.to_str().unwrap(), doc_id, out2.to_str().unwrap(), "")
+            .expect("extract after in-place decrypt");
+        assert_eq!(std::fs::read(&out2).unwrap().as_slice(), body);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_document_encrypted_is_idempotent_and_guards_password() {
+        let body = b"idempotency + password-guard checks";
+        let (dir, vault_path, src_file) = setup("setenc-guard", body);
+        let pw = "the vault password";
+        crypto::set_password(vault_path.to_str().unwrap(), pw).expect("set_password");
+        let doc_id = insert(&vault_path, &src_file, "");
+
+        // Already plaintext → encrypt:false is a no-op, even with empty password.
+        set_document_encrypted(vault_path.to_str().unwrap(), doc_id, false, "")
+            .expect("no-op when already in the requested state");
+
+        // Plaintext → encrypt:true with EMPTY password → clear error.
+        let err = set_document_encrypted(vault_path.to_str().unwrap(), doc_id, true, "")
+            .expect_err("a state change needs a password");
+        assert!(err.message.to_lowercase().contains("password"));
+
+        // Encrypt for real, then decrypt with the WRONG password → clear error, no panic.
+        set_document_encrypted(vault_path.to_str().unwrap(), doc_id, true, pw)
+            .expect("encrypt");
+        let werr = set_document_encrypted(vault_path.to_str().unwrap(), doc_id, false, "wrong pw")
+            .expect_err("wrong password must error");
+        assert!(
+            werr.message.to_lowercase().contains("password")
+                || werr.message.to_lowercase().contains("decrypt"),
+            "got: {}",
+            werr.message
         );
 
         let _ = std::fs::remove_dir_all(&dir);

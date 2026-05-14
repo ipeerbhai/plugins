@@ -327,6 +327,13 @@ func _build_ui() -> void:
 	vault_hdr_lbl.text = "Vaults"
 	vault_hdr_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	vault_hdr.add_child(vault_hdr_lbl)
+	# W5h: a discoverable control to extract checked documents to a directory
+	# (previously only reachable via the buried File-menu item).
+	var vault_extract_btn := Button.new()
+	vault_extract_btn.text = "Extract Marked…"
+	vault_extract_btn.tooltip_text = "Extract checked documents to a directory…"
+	vault_extract_btn.pressed.connect(_on_export_marked_pressed)
+	vault_hdr.add_child(vault_extract_btn)
 	var vault_add_btn := Button.new()
 	vault_add_btn.text = "+"
 	vault_add_btn.tooltip_text = "Add a vault destination…"
@@ -951,6 +958,50 @@ func _on_area_dest_button_pressed(dest_id: String, action: String) -> void:
 		"settings":
 			# W5d: vault-level settings popup — "Set/Change Password…" and other vault ops.
 			_on_vault_dest_settings_pressed(dest_id, dest_dict)
+		"encrypt":
+			# W5h: dest_id is a "doc:<id>" key here, not a destination id.
+			_on_doc_encrypt_toggle(dest_id, true)
+		"decrypt":
+			_on_doc_encrypt_toggle(dest_id, false)
+
+
+## W5h: encrypt or decrypt a single vault document at rest. `doc_key` is a
+## "doc:<id>" tree key; `want_encrypted` is the desired new state. Fire-and-
+## forget (called from a button handler); awaits the MCP call internally.
+func _on_doc_encrypt_toggle(doc_key: String, want_encrypted: bool) -> void:
+	if not doc_key.begins_with("doc:"):
+		return
+	var doc_id: int = int(doc_key.substr(4))
+	var vault_path: String = _find_vault_path_for_doc_key(doc_key)
+	if vault_path.is_empty():
+		vault_path = _active_vault_path
+	if vault_path.is_empty():
+		set_status("Cannot change encryption: vault path unknown.")
+		return
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+	if _vault_password.is_empty():
+		set_status("Set a vault password first to encrypt/decrypt documents.")
+		return
+	set_status("%s document…" % ("Encrypting" if want_encrypted else "Decrypting"))
+	var result: Dictionary = await conn.call_tool(
+		"minerva_scansort_set_document_encrypted",
+		{
+			"vault_path": vault_path,
+			"doc_id": doc_id,
+			"encrypt": want_encrypted,
+			"password": _vault_password,
+		}
+	)
+	if not result.get("ok", false):
+		set_status("ERROR: %s" % result.get("error", "unknown"))
+		return
+	set_status("Document %s." % ("encrypted" if want_encrypted else "decrypted"))
+	# Refresh the vault area tree so the lock icon reflects the new state.
+	if _vault_area_tree != null and is_instance_valid(_vault_area_tree):
+		await _vault_area_tree.refresh()
 
 
 ## W5b: find a destination dict from the area providers' last_destinations cache.
@@ -2741,7 +2792,7 @@ func get_editor_actions() -> Array:
 	popup.add_separator()
 	popup.add_item("Settings...", 11)
 	popup.add_separator()
-	popup.add_item("Export Marked to Disk...", 12)
+	popup.add_item("Extract Marked...", 12)
 	popup.add_item("Recovery Sheet...", 13)
 	popup.add_separator()
 	popup.add_item("Close Vault", 2)

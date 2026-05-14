@@ -49,6 +49,8 @@ const BTN_ID_LOCK       := 2
 ## W5d: additional button IDs.
 const BTN_ID_OPEN       := 3
 const BTN_ID_SETTINGS   := 4
+# W5h: encrypt/decrypt toggle on document rows.
+const BTN_ID_ENCRYPT    := 5
 
 var _provider: Object = null
 
@@ -183,6 +185,12 @@ func _add_node(parent: TreeItem, node: Dictionary) -> void:
 		var file_node_role: String = str(node.get("node_role", ""))
 		if file_node_role == "document":
 			item.add_button(COL_DATE, _make_icon_open(), BTN_ID_OPEN, false, "Open document")
+			# W5h: a lock toggle to encrypt/decrypt the document at rest; the
+			# icon reflects the document's current encryption state.
+			var is_encrypted: bool = bool(node.get("encrypted", false))
+			item.add_button(COL_DATE, _make_icon_lock(is_encrypted), BTN_ID_ENCRYPT, false,
+				"Decrypt document" if is_encrypted else "Encrypt document")
+			item.set_meta("encrypted", is_encrypted)
 			# vault_path needed by the panel to call extract_document.
 			item.set_meta("vault_path", str(node.get("vault_path", "")))
 
@@ -364,6 +372,16 @@ func _on_button_clicked(item: TreeItem, _column: int, btn_id: int, _mouse_button
 		var file_key: String = str(item.get_metadata(COL_NAME))
 		if not file_key.is_empty():
 			file_activated.emit(file_key)
+		return
+
+	# W5h: [Encrypt/Decrypt] toggle on document rows. Emit with the doc key as
+	# the id and an action reflecting the DESIRED new state so the panel can
+	# dispatch without re-querying.
+	if btn_id == BTN_ID_ENCRYPT:
+		var doc_key: String = str(item.get_metadata(COL_NAME))
+		if not doc_key.is_empty():
+			var currently_enc: bool = bool(item.get_meta("encrypted", false))
+			dest_button_pressed.emit(doc_key, "decrypt" if currently_enc else "encrypt")
 		return
 
 	var dest_id: String = str(item.get_meta("dest_id", ""))
