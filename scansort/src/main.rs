@@ -34,6 +34,7 @@ mod render;
 mod rules;
 mod rules_file;
 mod schema;
+mod source;
 mod types;
 mod vault_lifecycle;
 
@@ -1148,6 +1149,53 @@ fn handle_run_checklist_check(params: &Value, id: Value) -> RpcResponse {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Source-directory handlers (U2)
+// ---------------------------------------------------------------------------
+
+fn handle_set_source_dir(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    if path.is_empty() {
+        return ok_response(id, tool_err("path is required"));
+    }
+    let recursive = args.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
+    match source::set_source_dir(path, recursive) {
+        Ok(()) => ok_response(id, tool_ok(json!({"ok": true, "path": path, "recursive": recursive}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_get_source_dir(params: &Value, id: Value) -> RpcResponse {
+    let _args = params.get("arguments").unwrap_or(params);
+    let (dir, recursive) = source::get_source_dir();
+    ok_response(id, tool_ok(json!({"ok": true, "path": dir, "recursive": recursive})))
+}
+
+fn handle_list_source_files(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let vault_path = args.get("vault_path").and_then(|v| v.as_str());
+    let vp: Option<&str> = vault_path.filter(|s| !s.is_empty());
+    match source::list_source_files(vp) {
+        Ok(files) => {
+            let file_values: Vec<Value> = files
+                .iter()
+                .map(|f| {
+                    json!({
+                        "path": f.path,
+                        "name": f.name,
+                        "size": f.size,
+                        "sha256": f.sha256,
+                        "in_vault": f.in_vault,
+                    })
+                })
+                .collect();
+            ok_response(id, tool_ok(json!({"ok": true, "files": file_values})))
+        }
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
 fn main() {
     // Logging goes to stderr so it never pollutes the JSON-RPC stdout channel.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -1657,6 +1705,38 @@ fn main() {
                             "required": ["path", "tax_year"],
                         },
                     },
+                    {
+                        "name": "minerva_scansort_set_source_dir",
+                        "description": "Set the transitory source directory the plugin watches for incoming documents. State is process-memory only — not persisted. Returns {ok, path, recursive}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "Absolute filesystem path to the source/incoming directory."},
+                                "recursive": {"type": "boolean", "description": "If true, walk subdirectories when listing files. Defaults to false."},
+                            },
+                            "required": ["path"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_get_source_dir",
+                        "description": "Return the current transitory source directory. Returns {ok, path, recursive}. path is empty when no directory has been set.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "required": [],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_list_source_files",
+                        "description": "List supported document files (.pdf, .docx, .xlsx, .xls) under the stored source directory. For each file returns {path, name, size, sha256, in_vault}. Pass vault_path to enable dedup check.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "vault_path": {"type": "string", "description": "Optional absolute path to a vault file. When provided, in_vault is set via SHA-256 fingerprint lookup."},
+                            },
+                            "required": [],
+                        },
+                    },
                 ]
             })),
 
@@ -1764,6 +1844,15 @@ fn main() {
                     }
                     "minerva_scansort_run_checklist_check" => {
                         handle_run_checklist_check(&req.params, req.id)
+                    }
+                    "minerva_scansort_set_source_dir" => {
+                        handle_set_source_dir(&req.params, req.id)
+                    }
+                    "minerva_scansort_get_source_dir" => {
+                        handle_get_source_dir(&req.params, req.id)
+                    }
+                    "minerva_scansort_list_source_files" => {
+                        handle_list_source_files(&req.params, req.id)
                     }
                     other => err_response(req.id, -32601, format!("unknown tool: {other}")),
                 }
