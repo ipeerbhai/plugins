@@ -52,14 +52,16 @@ func _build_ui() -> void:
 	var sep2 := VSeparator.new()
 	add_child(sep2)
 
-	# Spacer.
-	var spacer := Control.new()
-	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	add_child(spacer)
-
-	# Status message (right-aligned).
+	# Status message — fills the remaining width, right-aligned, and CLIPS
+	# (ellipsis) so a long message can never grow the HBox's minimum width
+	# and, through it, the whole panel. The expanding label replaces what
+	# used to be a separate spacer Control.
 	_status_label = Label.new()
 	_status_label.text = "Idle"
+	_status_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_status_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	_status_label.clip_text = true
+	_status_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
 	_status_label.add_theme_color_override("font_color", Color(0.6, 0.6, 0.6))
 	add_child(_status_label)
 
