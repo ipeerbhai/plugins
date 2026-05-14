@@ -32,6 +32,7 @@ mod fingerprints;
 mod registry;
 mod render;
 mod rules;
+mod rules_file;
 mod schema;
 mod types;
 mod vault_lifecycle;
