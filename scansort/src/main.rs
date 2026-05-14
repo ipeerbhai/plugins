@@ -1271,6 +1271,31 @@ fn handle_place_on_disk(params: &Value, id: Value) -> RpcResponse {
     }
 }
 
+fn handle_list_disk_files(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let vault_path = args.get("vault_path").and_then(|v| v.as_str()).unwrap_or("");
+    if vault_path.is_empty() {
+        return ok_response(id, tool_err("vault_path is required"));
+    }
+    match destination::list_disk_files(vault_path) {
+        Ok(files) => {
+            let file_values: Vec<Value> = files
+                .iter()
+                .map(|(path, name, rel_path, size)| {
+                    json!({
+                        "path": path,
+                        "name": name,
+                        "rel_path": rel_path,
+                        "size": size,
+                    })
+                })
+                .collect();
+            ok_response(id, tool_ok(json!({"ok": true, "files": file_values})))
+        }
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
 fn main() {
     // Logging goes to stderr so it never pollutes the JSON-RPC stdout channel.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -1837,6 +1862,17 @@ fn main() {
                         },
                     },
                     {
+                        "name": "minerva_scansort_list_disk_files",
+                        "description": "List every regular file under the vault's configured disk_root, recursively. Returns {ok, files: [{path, name, rel_path, size}]}, sorted by rel_path. Returns ok:true with empty files array when disk_root is unset/empty or does not exist (vault_only vaults have no disk tree).",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "vault_path": {"type": "string", "description": "Absolute path to the .ssort vault file."},
+                            },
+                            "required": ["vault_path"],
+                        },
+                    },
+                    {
                         "name": "minerva_scansort_place_on_disk",
                         "description": "Copy a file to its resolved on-disk location under the vault's configured disk_root. Resolves {year} and {date} templates in subfolder and rename_pattern. Creates missing directories. Collision-safe (appends (1), (2), … before extension). Returns {ok, placed_path}.",
                         "inputSchema": {
@@ -1976,6 +2012,9 @@ fn main() {
                     }
                     "minerva_scansort_place_on_disk" => {
                         handle_place_on_disk(&req.params, req.id)
+                    }
+                    "minerva_scansort_list_disk_files" => {
+                        handle_list_disk_files(&req.params, req.id)
                     }
                     other => err_response(req.id, -32601, format!("unknown tool: {other}")),
                 }

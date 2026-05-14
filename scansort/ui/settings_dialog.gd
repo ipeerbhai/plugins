@@ -1,24 +1,23 @@
 extends AcceptDialog
 ## Scansort Settings dialog.
 ##
-## Single per-plugin preference: classification model override. The default
-## is "Inherit from chat panel" — whatever model is currently selected in
-## the chat panel's ProviderOptionButton is used for classify. When the user
-## picks a specific model here, that override travels across vaults.
-##
-## Scansort always operates in multimodal mode (text and vision share one
-## model), so this dialog exposes a single model picker rather than separate
-## text/vision options.
+## Per-plugin user preference: classification model override.
+## Per-vault settings (when a vault is open): destination mode + disk_root.
+## Per-user setting: Process All concurrency (1–4).
 ##
 ## Storage: OS.get_user_data_dir() + "/scansort_settings.json"
-##   { "model_override": {kind: ..., ...} | null }
+##   { "model_override": {kind: ..., ...} | null,
+##     "process_concurrency": int }
+##
+## Destination mode is stored in the vault's project table via MCP tools
+## (minerva_scansort_get_destination / set_destination).
 ##
 ## Usage:
 ##   var dlg = preload("settings_dialog.gd").new()
-##   dlg.init(conn)
+##   dlg.init(conn, vault_path)   # vault_path may be empty
 ##   add_child(dlg)
 ##   dlg.settings_changed.connect(_on_settings_changed)
-##   dlg.popup_centered(Vector2(520, 240))
+##   dlg.popup_centered(Vector2(580, 420))
 ##
 ## No class_name — off-tree plugin script; use preload().
 
@@ -33,13 +32,20 @@ signal closed
 # ---------------------------------------------------------------------------
 
 var _conn: Object = null
+var _vault_path: String = ""
 
 # ---------------------------------------------------------------------------
 # Widgets
 # ---------------------------------------------------------------------------
 
-var _model_picker: OptionButton = null
-var _help_label:   Label        = null
+var _model_picker:   OptionButton = null
+var _help_label:     Label        = null
+var _dest_picker:    OptionButton = null
+var _disk_root_edit: LineEdit     = null
+var _disk_root_btn:  Button       = null
+var _dest_section:   Control      = null   # container to enable/disable
+var _concurrency_spin: SpinBox    = null
+var _dest_error_lbl: Label        = null   # visible error for missing disk_root
 
 
 const _UiScale := preload("ui_scale.gd")
@@ -48,18 +54,19 @@ const _UiScale := preload("ui_scale.gd")
 func _ready() -> void:
 	_UiScale.apply_to(self)
 	title = "Scansort Settings"
-	min_size = Vector2(520, 240)
+	min_size = Vector2(580, 420)
 	ok_button_text = "Save"
 	confirmed.connect(_on_save_pressed)
 	canceled.connect(_on_close_pressed)
 	_build_ui()
 
 
-## Inject the plugin connection. Settings file is loaded on demand from
-## OS.get_user_data_dir(); the panel doesn't need to pass a path.
-func init(conn: Object) -> void:
+## Inject the plugin connection and optional vault path.
+## Settings file is loaded on demand; vault destination loaded if vault_path non-empty.
+func init(conn: Object, vault_path: String = "") -> void:
 	_conn = conn
-	# Defer until added to scene so _model_picker is populated.
+	_vault_path = vault_path
+	# Defer until added to scene so widgets are populated.
 	call_deferred("_load_current_settings")
 
 
@@ -69,7 +76,7 @@ func init(conn: Object) -> void:
 
 func _build_ui() -> void:
 	var root := VBoxContainer.new()
-	root.add_theme_constant_override("separation", 8)
+	root.add_theme_constant_override("separation", 10)
 
 	# --- Model row ---------------------------------------------------------
 	var model_row := HBoxContainer.new()
@@ -88,18 +95,101 @@ func _build_ui() -> void:
 
 	# --- Help text ---------------------------------------------------------
 	_help_label = Label.new()
-	_help_label.text = "Scansort always uses a single multimodal model for both text and vision classification. Pick one that supports images for the best results, or leave inherited to follow the chat panel."
+	_help_label.text = "Scansort uses a single multimodal model for text and vision classification. Pick one that supports images, or leave inherited to follow the chat panel."
 	_help_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	_help_label.add_theme_color_override("font_color", Color(0.7, 0.7, 0.7))
 	root.add_child(_help_label)
 
+	# --- Separator ---------------------------------------------------------
+	root.add_child(HSeparator.new())
+
+	# --- Destination section (per-vault; disabled if no vault open) --------
+	_dest_section = VBoxContainer.new()
+	_dest_section.add_theme_constant_override("separation", 6)
+
+	var dest_title := Label.new()
+	dest_title.text = "Destination" + ("" if not _vault_path.is_empty() else " (open a vault to configure)")
+	dest_title.add_theme_color_override("font_color", Color(0.9, 0.9, 0.9))
+	_dest_section.add_child(dest_title)
+
+	var dest_row := HBoxContainer.new()
+	dest_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var dest_lbl := Label.new()
+	dest_lbl.text = "Mode"
+	dest_lbl.custom_minimum_size.x = 80
+	dest_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	dest_row.add_child(dest_lbl)
+
+	_dest_picker = OptionButton.new()
+	_dest_picker.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_dest_picker.add_item("Vault only", 0)
+	_dest_picker.set_item_metadata(0, "vault_only")
+	_dest_picker.add_item("Disk only", 1)
+	_dest_picker.set_item_metadata(1, "disk_only")
+	_dest_picker.add_item("Vault and disk", 2)
+	_dest_picker.set_item_metadata(2, "vault_and_disk")
+	dest_row.add_child(_dest_picker)
+	_dest_section.add_child(dest_row)
+
+	var disk_row := HBoxContainer.new()
+	disk_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var disk_lbl := Label.new()
+	disk_lbl.text = "Disk root"
+	disk_lbl.custom_minimum_size.x = 80
+	disk_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	disk_row.add_child(disk_lbl)
+
+	_disk_root_edit = LineEdit.new()
+	_disk_root_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_disk_root_edit.placeholder_text = "/path/to/disk/root"
+	disk_row.add_child(_disk_root_edit)
+
+	_disk_root_btn = Button.new()
+	_disk_root_btn.text = "Browse…"
+	_disk_root_btn.pressed.connect(_on_browse_disk_root_pressed)
+	disk_row.add_child(_disk_root_btn)
+	_dest_section.add_child(disk_row)
+
+	# Error label for missing disk_root.
+	_dest_error_lbl = Label.new()
+	_dest_error_lbl.add_theme_color_override("font_color", Color(1.0, 0.4, 0.4))
+	_dest_error_lbl.text = ""
+	_dest_error_lbl.visible = false
+	_dest_section.add_child(_dest_error_lbl)
+
+	# Disable the entire destination section if no vault is open.
+	if _vault_path.is_empty():
+		_dest_picker.disabled = true
+		_disk_root_edit.editable = false
+		_disk_root_btn.disabled = true
+
+	root.add_child(_dest_section)
+
+	# --- Separator ---------------------------------------------------------
+	root.add_child(HSeparator.new())
+
+	# --- Concurrency row ---------------------------------------------------
+	var conc_row := HBoxContainer.new()
+	conc_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var conc_lbl := Label.new()
+	conc_lbl.text = "Process All concurrency"
+	conc_lbl.custom_minimum_size.x = 180
+	conc_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	conc_row.add_child(conc_lbl)
+
+	_concurrency_spin = SpinBox.new()
+	_concurrency_spin.min_value = 1
+	_concurrency_spin.max_value = 4
+	_concurrency_spin.step = 1
+	_concurrency_spin.value = ScansortSettings.load_concurrency()
+	_concurrency_spin.tooltip_text = "Number of files processed in parallel during Process All (1 = sequential)."
+	conc_row.add_child(_concurrency_spin)
+	root.add_child(conc_row)
+
 	add_child(root)
 
 
-## Populate the model picker:
-##   index 0: "Inherit from chat panel" (metadata = empty Dict)
-##   index 1+: items from ChatPane.get_available_models()
-## Selection set from the current saved override if any.
+## Populate the model picker and (if vault open) load destination settings.
 func _load_current_settings() -> void:
 	if _model_picker == null:
 		return
@@ -123,7 +213,7 @@ func _load_current_settings() -> void:
 		_model_picker.add_item(display, item_id)
 		_model_picker.set_item_metadata(item_id, spec)
 
-	# Restore previously-saved selection.
+	# Restore previously-saved model selection.
 	var override: Dictionary = ScansortSettings.load_model_override()
 	var target_idx: int = 0  # default to "Inherit"
 	if not override.is_empty():
@@ -134,6 +224,23 @@ func _load_current_settings() -> void:
 					target_idx = i
 					break
 	_model_picker.select(target_idx)
+
+	# Load destination settings from vault (async — safe here since called deferred).
+	if not _vault_path.is_empty() and _conn != null and _dest_picker != null:
+		var dest_result: Dictionary = await _conn.call_tool(
+			"minerva_scansort_get_destination",
+			{"vault_path": _vault_path}
+		)
+		if dest_result.get("ok", false):
+			var mode: String = str(dest_result.get("mode", "vault_only"))
+			var disk_root: String = str(dest_result.get("disk_root", ""))
+			# Find the matching OptionButton item by metadata.
+			for i in range(_dest_picker.get_item_count()):
+				if str(_dest_picker.get_item_metadata(i)) == mode:
+					_dest_picker.select(i)
+					break
+			if _disk_root_edit != null:
+				_disk_root_edit.text = disk_root
 
 
 ## Shallow equality on the two fields that uniquely identify a spec:
@@ -168,8 +275,52 @@ func _on_save_pressed() -> void:
 	var spec: Dictionary = meta as Dictionary if meta is Dictionary else {}
 	# Empty spec → inherit (clears the override).
 	ScansortSettings.save_model_override(spec)
+
+	# Save concurrency.
+	if _concurrency_spin != null:
+		ScansortSettings.save_concurrency(int(_concurrency_spin.value))
+
+	# Save destination (vault-level, async) — only when vault is open.
+	if not _vault_path.is_empty() and _conn != null and _dest_picker != null:
+		var dest_idx: int = _dest_picker.get_selected()
+		var mode: String = str(_dest_picker.get_item_metadata(dest_idx)) if dest_idx >= 0 else "vault_only"
+		var disk_root: String = _disk_root_edit.text.strip_edges() if _disk_root_edit != null else ""
+
+		# Require disk_root for non-vault_only modes.
+		if mode != "vault_only" and disk_root.is_empty():
+			if _dest_error_lbl != null:
+				_dest_error_lbl.text = "disk_root is required for %s mode." % mode
+				_dest_error_lbl.visible = true
+			# Do NOT close — let user fix the error.
+			return
+
+		if _dest_error_lbl != null:
+			_dest_error_lbl.visible = false
+
+		var set_args: Dictionary = {"vault_path": _vault_path, "mode": mode}
+		if not disk_root.is_empty():
+			set_args["disk_root"] = disk_root
+		await _conn.call_tool("minerva_scansort_set_destination", set_args)
+
 	settings_changed.emit()
 	closed.emit()
+
+
+func _on_browse_disk_root_pressed() -> void:
+	var fd := FileDialog.new()
+	fd.access = FileDialog.ACCESS_FILESYSTEM
+	fd.file_mode = FileDialog.FILE_MODE_OPEN_DIR
+	fd.title = "Choose disk root directory"
+	fd.dir_selected.connect(func(dir: String) -> void:
+		if _disk_root_edit != null:
+			_disk_root_edit.text = dir
+		fd.queue_free()
+	)
+	fd.canceled.connect(func() -> void:
+		fd.queue_free()
+	)
+	add_child(fd)
+	fd.popup_centered(Vector2i(700, 500))
 
 
 func _on_close_pressed() -> void:
@@ -188,9 +339,8 @@ class ScansortSettings:
 	static func settings_path() -> String:
 		return OS.get_user_data_dir() + "/" + SETTINGS_FILENAME
 
-	## Read the saved model override spec. Returns an empty Dict when no
-	## override is set (i.e. inherit-from-chat is in effect).
-	static func load_model_override() -> Dictionary:
+	## Read the full settings blob, or {} on missing/corrupt file.
+	static func _load_blob() -> Dictionary:
 		var path := settings_path()
 		if not FileAccess.file_exists(path):
 			return {}
@@ -202,15 +352,10 @@ class ScansortSettings:
 		var parsed: Variant = JSON.parse_string(text)
 		if not (parsed is Dictionary):
 			return {}
-		var p_dict: Dictionary = parsed as Dictionary
-		var raw = p_dict.get("model_override", null)
-		if raw is Dictionary:
-			return raw as Dictionary
-		return {}
+		return parsed as Dictionary
 
-	## Save the model override spec. Empty Dict → write null (inherit mode).
-	## Creates the parent directory if missing. Returns true on success.
-	static func save_model_override(spec: Dictionary) -> bool:
+	## Write the blob to disk. Creates parent dir if missing. Returns true on success.
+	static func _save_blob(blob: Dictionary) -> bool:
 		var path := settings_path()
 		var dir := path.get_base_dir()
 		if not DirAccess.dir_exists_absolute(dir):
@@ -218,11 +363,6 @@ class ScansortSettings:
 			if err != OK:
 				push_error("[ScansortSettings] could not create %s (error %d)" % [dir, err])
 				return false
-		var blob: Dictionary
-		if spec.is_empty():
-			blob = {"model_override": null}
-		else:
-			blob = {"model_override": spec}
 		var f := FileAccess.open(path, FileAccess.WRITE)
 		if f == null:
 			push_error("[ScansortSettings] could not write %s" % path)
@@ -230,3 +370,36 @@ class ScansortSettings:
 		f.store_string(JSON.stringify(blob, "  "))
 		f.close()
 		return true
+
+	## Read the saved model override spec. Returns an empty Dict when no
+	## override is set (i.e. inherit-from-chat is in effect).
+	static func load_model_override() -> Dictionary:
+		var blob := _load_blob()
+		var raw = blob.get("model_override", null)
+		if raw is Dictionary:
+			return raw as Dictionary
+		return {}
+
+	## Save the model override spec. Empty Dict → write null (inherit mode).
+	## Read-modify-write so other keys (concurrency) are preserved.
+	static func save_model_override(spec: Dictionary) -> bool:
+		var blob := _load_blob()
+		if spec.is_empty():
+			blob["model_override"] = null
+		else:
+			blob["model_override"] = spec
+		return _save_blob(blob)
+
+	## Read the saved process concurrency. Returns 1 (sequential) as default.
+	## Clamped to [1, 4].
+	static func load_concurrency() -> int:
+		var blob := _load_blob()
+		var raw = blob.get("process_concurrency", 1)
+		var n: int = int(raw)
+		return clampi(n, 1, 4)
+
+	## Save the process concurrency. Read-modify-write to preserve other keys.
+	static func save_concurrency(n: int) -> void:
+		var blob := _load_blob()
+		blob["process_concurrency"] = clampi(n, 1, 4)
+		_save_blob(blob)

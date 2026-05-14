@@ -175,6 +175,67 @@ pub fn place_on_disk(
     })
 }
 
+/// List every regular file under the vault's configured disk_root, recursively.
+/// Returns Vec of (absolute_path, file_name, rel_path_from_disk_root, size_bytes).
+/// Returns an empty Vec (Ok) when disk_root is unset/empty or does not exist —
+/// this is not an error (vault_only vaults have no disk tree).
+pub fn list_disk_files(vault_path: &str) -> VaultResult<Vec<(String, String, String, u64)>> {
+    let (_, disk_root) = get_destination(vault_path)?;
+    if disk_root.is_empty() {
+        return Ok(vec![]);
+    }
+    let root_path = Path::new(&disk_root);
+    if !root_path.exists() {
+        return Ok(vec![]);
+    }
+
+    let mut results: Vec<(String, String, String, u64)> = Vec::new();
+    collect_disk_files(root_path, root_path, &mut results)?;
+    results.sort_by(|a, b| a.2.cmp(&b.2));
+    Ok(results)
+}
+
+/// Recursive helper for list_disk_files.
+fn collect_disk_files(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<(String, String, String, u64)>,
+) -> VaultResult<()> {
+    let entries = std::fs::read_dir(dir).map_err(|e| {
+        VaultError::new(format!("cannot read directory {}: {}", dir.display(), e))
+    })?;
+    for entry_result in entries {
+        let entry = match entry_result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if path.is_dir() {
+            collect_disk_files(root, &path, out)?;
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let abs_path = path
+            .canonicalize()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let rel_path = path
+            .strip_prefix(root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| file_name.clone());
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        out.push((abs_path, file_name, rel_path, size));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -565,6 +626,79 @@ mod tests {
             err.message
         );
 
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // (i) list_disk_files returns empty on a vault_only vault (no disk_root configured).
+    #[test]
+    fn list_disk_files_empty_on_vault_only() {
+        let base = unique_tmp("ldf-vo");
+        std::fs::create_dir_all(&base).unwrap();
+        let vault = base.join("v.ssort");
+        make_vault(&vault);
+        let vp = vault.to_str().unwrap();
+        // Default mode is vault_only — no disk_root.
+        let files = list_disk_files(vp).expect("list_disk_files");
+        assert!(files.is_empty(), "vault_only should yield empty list");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // (j) list_disk_files returns correct entries after placing files in nested subdirs.
+    #[test]
+    fn list_disk_files_after_placing_files() {
+        let base = unique_tmp("ldf-files");
+        std::fs::create_dir_all(&base).unwrap();
+        let vault = base.join("v.ssort");
+        make_vault(&vault);
+        let vp = vault.to_str().unwrap();
+        let disk = base.join("disk");
+        std::fs::create_dir_all(&disk).unwrap();
+
+        set_destination(vp, "disk_only", Some(disk.to_str().unwrap())).unwrap();
+
+        // Place two files in different nested subdirs.
+        let sub1 = disk.join("invoices").join("2024");
+        let sub2 = disk.join("receipts");
+        std::fs::create_dir_all(&sub1).unwrap();
+        std::fs::create_dir_all(&sub2).unwrap();
+        std::fs::write(sub1.join("invoice_a.pdf"), b"invoice a").unwrap();
+        std::fs::write(sub2.join("receipt_b.pdf"), b"receipt b").unwrap();
+
+        let files = list_disk_files(vp).expect("list_disk_files");
+        assert_eq!(files.len(), 2, "expected 2 files, got {}", files.len());
+
+        // Check rel_paths sort correctly (invoices/2024/invoice_a.pdf < receipts/receipt_b.pdf).
+        let rel_paths: Vec<&str> = files.iter().map(|f| f.2.as_str()).collect();
+        assert!(
+            rel_paths.iter().any(|r| r.contains("invoice_a.pdf")),
+            "invoice_a.pdf rel_path missing: {rel_paths:?}"
+        );
+        assert!(
+            rel_paths.iter().any(|r| r.contains("receipt_b.pdf")),
+            "receipt_b.pdf rel_path missing: {rel_paths:?}"
+        );
+        // Verify sizes.
+        for (_, name, _, size) in &files {
+            assert!(*size > 0, "size should be > 0 for {name}");
+        }
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // (k) list_disk_files returns empty when disk_root points to a non-existent dir.
+    #[test]
+    fn list_disk_files_empty_when_disk_root_missing() {
+        let base = unique_tmp("ldf-nodir");
+        std::fs::create_dir_all(&base).unwrap();
+        let vault = base.join("v.ssort");
+        make_vault(&vault);
+        let vp = vault.to_str().unwrap();
+        // Point disk_root at a directory that does not exist.
+        let nonexistent = base.join("does_not_exist");
+        set_destination(vp, "disk_only", Some(nonexistent.to_str().unwrap())).unwrap();
+
+        let files = list_disk_files(vp).expect("list_disk_files should return Ok([])");
+        assert!(files.is_empty(), "non-existent disk_root should yield empty list");
         std::fs::remove_dir_all(&base).ok();
     }
 

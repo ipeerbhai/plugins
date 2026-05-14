@@ -64,6 +64,9 @@ const _ChecklistDialog: Script = preload("checklist_dialog.gd")
 const _SettingsDialog: Script  = preload("settings_dialog.gd")
 const _UiScale: Script         = preload("ui_scale.gd")
 
+## U7: disk tree provider (off-tree: no class_name).
+const _DiskProvider: Script = preload("scan_tree_disk_provider.gd")
+
 # ---------------------------------------------------------------------------
 # Signals
 # ---------------------------------------------------------------------------
@@ -113,10 +116,13 @@ var _chrome_popup: PopupMenu = null
 ## scan_tree bound to a provider, with the status panel as a bottom bar.
 ## Process All / Stop live in the editor chrome bar (get_editor_actions),
 ## not in the panel.
+## U7: DestPane is stacked: Vault tree (top) + Disk tree (bottom).
 var _source_tree: Tree = null
 var _dest_tree:   Tree = null
+var _disk_tree:   Tree = null
 var _source_provider: Object = null
 var _dest_provider:   Object = null
+var _disk_provider:   Object = null
 ## Chrome-bar buttons — created in get_editor_actions(); the editor owns and
 ## frees them on teardown, so guard with is_instance_valid before use.
 var _process_btn: Button = null
@@ -142,6 +148,10 @@ var _process_cancelled: bool = false
 ## low-confidence.
 const LOW_CONFIDENCE_THRESHOLD := 0.5
 var _status_panel: HBoxContainer = null
+
+## U7: per-run counters shared across concurrent coroutines (Dictionary reference
+## so coroutines can mutate them without capture-by-value issues).
+var _run_counters: Dictionary = {}  # keys: processed, skipped, failed, low_conf
 
 ## File dialog (reused for open and create).
 var _file_dialog: FileDialog = null
@@ -225,17 +235,30 @@ func _build_ui() -> void:
 	source_col.add_child(_source_tree)
 	columns.add_child(source_col)
 
-	# --- Right column: destination (vault) pane ---
+	# --- Right column: destination pane (stacked: Vault + Disk) ---
 	var dest_col := VBoxContainer.new()
 	dest_col.name = "DestPane"
 	dest_col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	dest_col.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	dest_col.custom_minimum_size.x = 200
+
+	# Vault section.
 	var dest_header := Label.new()
 	dest_header.text = "Vault"
 	dest_col.add_child(dest_header)
 	_dest_tree = _ScanTree.new()
+	_dest_tree.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	dest_col.add_child(_dest_tree)
+
+	# Disk section (U7).
+	var disk_header := Label.new()
+	disk_header.text = "Disk"
+	dest_col.add_child(disk_header)
+	_disk_tree = _ScanTree.new()
+	_disk_tree.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_disk_tree.tree_role = "disk"
+	dest_col.add_child(_disk_tree)
+
 	columns.add_child(dest_col)
 
 	# --- Status bar along the bottom ---
@@ -537,6 +560,13 @@ func _on_vault_opened_r2(path: String, open_result: Dictionary) -> void:
 		_dest_tree.set_provider(_dest_provider)
 		await _dest_tree.refresh()
 
+	# U7: bind disk provider and refresh the disk tree.
+	_disk_provider = _DiskProvider.new()
+	_disk_provider.init(conn, path)
+	if _disk_tree != null and is_instance_valid(_disk_tree):
+		_disk_tree.set_provider(_disk_provider)
+		await _disk_tree.refresh()
+
 	if _status_panel != null and is_instance_valid(_status_panel):
 		_status_panel.init(conn)
 		_status_panel.set_vault(vault_name, 0)
@@ -550,8 +580,12 @@ func _on_vault_closed_r2() -> void:
 	if _dest_tree != null and is_instance_valid(_dest_tree):
 		_dest_tree.set_provider(null)
 		_dest_tree.populate([])
+	if _disk_tree != null and is_instance_valid(_disk_tree):
+		_disk_tree.set_provider(null)
+		_disk_tree.populate([])
 	_source_provider = null
 	_dest_provider = null
+	_disk_provider = null
 	if _status_panel != null and is_instance_valid(_status_panel):
 		_status_panel.clear()
 
@@ -771,6 +805,8 @@ func _on_add_dialog_accepted(
 	# the source pane so the just-ingested file shows its in-vault mark.
 	if _dest_tree != null and is_instance_valid(_dest_tree):
 		await _dest_tree.refresh()
+	if _disk_tree != null and is_instance_valid(_disk_tree):
+		await _disk_tree.refresh()
 	if _source_tree != null and is_instance_valid(_source_tree):
 		await _source_tree.refresh()
 
@@ -789,6 +825,7 @@ func _on_add_dialog_cancelled() -> void:
 ## Iterates every source file: extract → dedup → classify → insert.
 ## Files already in the vault or in _processed_keys are skipped. One failed
 ## file does NOT abort the whole run.
+## U7: batched-parallel execution via ScansortSettings.load_concurrency().
 func _on_process_all_pressed() -> void:
 	var conn = _get_connection()
 	if conn == null:
@@ -819,147 +856,35 @@ func _on_process_all_pressed() -> void:
 		_stop_btn.disabled = false
 	set_status("Processing…")
 
+	# U7: reset per-run shared counters.
+	_run_counters = {"processed": 0, "skipped": 0, "failed": 0, "low_conf": 0}
+
 	var total: int = files.size()
-	var processed_this_run: int = 0
-	var skipped: int = 0
-	var failed: int = 0
-	var low_conf: int = 0
 
-	const MAX_CLASSIFY_CHARS := 4000
+	# U7: read concurrency from settings (default 1 = sequential).
+	var concurrency: int = _SettingsDialog.ScansortSettings.load_concurrency()
 
-	for i: int in range(total):
+	# Batched-parallel loop.
+	var idx: int = 0
+	while idx < total:
 		if _process_cancelled:
 			break
+		var batch_remaining: Dictionary = {"n": 0}
+		for _j: int in range(concurrency):
+			if idx >= total or _process_cancelled:
+				break
+			batch_remaining["n"] += 1
+			_process_one_source_file(files[idx], conn, batch_remaining)  # fire, do NOT await
+			idx += 1
+		# Wait for the batch to drain.
+		while int(batch_remaining["n"]) > 0:
+			await get_tree().process_frame
 
-		var file: Dictionary = files[i]
-		var fpath: String = str(file.get("path", ""))
-		var fname: String = str(file.get("name", fpath.get_file()))
-
-		# Skip already-done files.
-		if bool(file.get("in_vault", false)) or _processed_keys.has(fpath):
-			skipped += 1
-			continue
-
-		set_status("Processing %d/%d: %s…" % [i + 1, total, fname])
-
-		# -- Step 1: Extract --
-		var extract_res: Dictionary = await conn.call_tool(
-			"minerva_scansort_extract_text",
-			{"file_path": fpath}
-		)
-		if not extract_res.get("success", false):
-			push_warning("[ScansortPanel] batch extract failed for %s: %s" % [
-				fname, str(extract_res.get("error", "unknown"))
-			])
-			failed += 1
-			continue
-
-		var sha256:     String = str(extract_res.get("sha256",   ""))
-		var char_count: int    = int(extract_res.get("char_count", 0))
-		var full_text:  String = str(extract_res.get("full_text", ""))
-		var simhash:    String = str(extract_res.get("simhash",  "0000000000000000"))
-		var dhash:      String = str(extract_res.get("dhash",    "0000000000000000"))
-
-		# -- Step 2: Dedup --
-		var dup_res: Dictionary = await conn.call_tool(
-			"minerva_scansort_check_sha256",
-			{"vault_path": _active_vault_path, "sha256": sha256}
-		)
-		if dup_res.get("found", false):
-			# Already in vault (list may have been stale) — mark and skip.
-			_processed_keys[fpath] = true
-			skipped += 1
-			_push_session_marks_to_provider()
-			continue
-
-		# -- Step 3: Classify --
-		var model_desc: Dictionary = _resolve_chat_model_for_classify()
-		var model_spec: Dictionary = model_desc.get("model_spec", {}) as Dictionary if model_desc.get("model_spec") is Dictionary else {}
-		var classify_args: Dictionary = {
-			"vault_path": _active_vault_path,
-			"model":      "default",
-		}
-		if not model_spec.is_empty():
-			classify_args["model_spec"] = model_spec
-		if not _vault_password.is_empty():
-			classify_args["password"] = _vault_password
-
-		const VISION_THRESHOLD := 50
-		if char_count >= VISION_THRESHOLD:
-			classify_args["mode"]          = "text"
-			classify_args["document_text"] = full_text
-			if MAX_CLASSIFY_CHARS > 0:
-				classify_args["max_text_chars"] = MAX_CLASSIFY_CHARS
-		else:
-			var render_res: Dictionary = await conn.call_tool(
-				"minerva_scansort_render_pages",
-				{"file_path": fpath, "max_pages": 2, "dpi": 96}
-			)
-			if not render_res.get("success", false):
-				push_warning("[ScansortPanel] batch render failed for %s: %s" % [
-					fname, str(render_res.get("error", "unknown"))
-				])
-				failed += 1
-				continue
-			classify_args["mode"]        = "vision"
-			classify_args["page_images"] = render_res.get("pages", [])
-
-		var classify_res: Dictionary = await conn.call_tool(
-			"minerva_scansort_classify_document",
-			classify_args
-		)
-		if not classify_res.get("ok", false):
-			push_warning("[ScansortPanel] batch classify failed for %s: %s" % [
-				fname, str(classify_res.get("error", "unknown"))
-			])
-			failed += 1
-			continue
-
-		var classification: Dictionary = classify_res.get("classification", {})
-
-		# -- Step 4: Insert --
-		var insert_args: Dictionary = {
-			"vault_path":    _active_vault_path,
-			"file_path":     fpath,
-			"category":      classification.get("category",    ""),
-			"confidence":    float(classification.get("confidence", 0.0)),
-			"sender":        classification.get("sender",      ""),
-			"description":   classification.get("description", ""),
-			"doc_date":      classification.get("doc_date",    ""),
-			"status":        "classified",
-			"sha256":        sha256,
-			"simhash":       simhash,
-			"dhash":         dhash,
-			"source_path":   fpath,
-			"rule_snapshot": str(classify_res.get("rule_snapshot", "")),
-		}
-		if not _vault_password.is_empty():
-			insert_args["password"] = _vault_password
-
-		var insert_res: Dictionary = await conn.call_tool(
-			"minerva_scansort_insert_document",
-			insert_args
-		)
-		if not insert_res.get("ok", false):
-			push_warning("[ScansortPanel] batch insert failed for %s: %s" % [
-				fname, str(insert_res.get("error", "unknown"))
-			])
-			failed += 1
-			continue
-
-		# Successful insert — record session state.
-		_processed_keys[fpath] = true
-		processed_this_run += 1
-		var confidence: float = float(classification.get("confidence", 0.0))
-		if confidence < LOW_CONFIDENCE_THRESHOLD:
-			_low_confidence_keys[fpath] = true
-			low_conf += 1
-
-		_push_session_marks_to_provider()
-
-	# Run finished (or cancelled) — refresh both trees.
+	# Run finished (or cancelled) — refresh trees.
 	if _dest_tree != null and is_instance_valid(_dest_tree):
 		await _dest_tree.refresh()
+	if _disk_tree != null and is_instance_valid(_disk_tree):
+		await _disk_tree.refresh()
 	if _source_tree != null and is_instance_valid(_source_tree):
 		await _source_tree.refresh()
 
@@ -970,6 +895,10 @@ func _on_process_all_pressed() -> void:
 		_stop_btn.disabled = true
 
 	# Summary status.
+	var processed_this_run: int = int(_run_counters.get("processed", 0))
+	var skipped: int = int(_run_counters.get("skipped", 0))
+	var failed: int = int(_run_counters.get("failed", 0))
+	var low_conf: int = int(_run_counters.get("low_conf", 0))
 	if _process_cancelled:
 		set_status("Stopped — processed %d, %d low-confidence, %d failed, %d skipped" % [
 			processed_this_run, low_conf, failed, skipped
@@ -978,6 +907,142 @@ func _on_process_all_pressed() -> void:
 		set_status("Processed %d/%d — %d low-confidence, %d failed, %d skipped" % [
 			processed_this_run, total, low_conf, failed, skipped
 		])
+
+
+## U7: per-file worker coroutine for the batched-parallel Process All loop.
+## Decrements batch_remaining["n"] in every exit path (success or failure) so the
+## outer while-loop can drain without a separate join mechanism.
+func _process_one_source_file(file: Dictionary, conn: Object, batch_remaining: Dictionary) -> void:
+	const MAX_CLASSIFY_CHARS := 4000
+	const VISION_THRESHOLD := 50
+
+	var fpath: String = str(file.get("path", ""))
+	var fname: String = str(file.get("name", fpath.get_file()))
+
+	# Skip already-done files.
+	if bool(file.get("in_vault", false)) or _processed_keys.has(fpath):
+		_run_counters["skipped"] = int(_run_counters.get("skipped", 0)) + 1
+		batch_remaining["n"] -= 1
+		return
+
+	# -- Step 1: Extract --
+	var extract_res: Dictionary = await conn.call_tool(
+		"minerva_scansort_extract_text",
+		{"file_path": fpath}
+	)
+	if not extract_res.get("success", false):
+		push_warning("[ScansortPanel] batch extract failed for %s: %s" % [
+			fname, str(extract_res.get("error", "unknown"))
+		])
+		_run_counters["failed"] = int(_run_counters.get("failed", 0)) + 1
+		batch_remaining["n"] -= 1
+		return
+
+	var sha256:     String = str(extract_res.get("sha256",   ""))
+	var char_count: int    = int(extract_res.get("char_count", 0))
+	var full_text:  String = str(extract_res.get("full_text", ""))
+	var simhash:    String = str(extract_res.get("simhash",  "0000000000000000"))
+	var dhash:      String = str(extract_res.get("dhash",    "0000000000000000"))
+
+	# -- Step 2: Dedup --
+	var dup_res: Dictionary = await conn.call_tool(
+		"minerva_scansort_check_sha256",
+		{"vault_path": _active_vault_path, "sha256": sha256}
+	)
+	if dup_res.get("found", false):
+		_processed_keys[fpath] = true
+		_run_counters["skipped"] = int(_run_counters.get("skipped", 0)) + 1
+		_push_session_marks_to_provider()
+		batch_remaining["n"] -= 1
+		return
+
+	# -- Step 3: Classify --
+	var model_desc: Dictionary = _resolve_chat_model_for_classify()
+	var model_spec: Dictionary = model_desc.get("model_spec", {}) as Dictionary if model_desc.get("model_spec") is Dictionary else {}
+	var classify_args: Dictionary = {
+		"vault_path": _active_vault_path,
+		"model":      "default",
+	}
+	if not model_spec.is_empty():
+		classify_args["model_spec"] = model_spec
+	if not _vault_password.is_empty():
+		classify_args["password"] = _vault_password
+
+	if char_count >= VISION_THRESHOLD:
+		classify_args["mode"]          = "text"
+		classify_args["document_text"] = full_text
+		if MAX_CLASSIFY_CHARS > 0:
+			classify_args["max_text_chars"] = MAX_CLASSIFY_CHARS
+	else:
+		var render_res: Dictionary = await conn.call_tool(
+			"minerva_scansort_render_pages",
+			{"file_path": fpath, "max_pages": 2, "dpi": 96}
+		)
+		if not render_res.get("success", false):
+			push_warning("[ScansortPanel] batch render failed for %s: %s" % [
+				fname, str(render_res.get("error", "unknown"))
+			])
+			_run_counters["failed"] = int(_run_counters.get("failed", 0)) + 1
+			batch_remaining["n"] -= 1
+			return
+		classify_args["mode"]        = "vision"
+		classify_args["page_images"] = render_res.get("pages", [])
+
+	var classify_res: Dictionary = await conn.call_tool(
+		"minerva_scansort_classify_document",
+		classify_args
+	)
+	if not classify_res.get("ok", false):
+		push_warning("[ScansortPanel] batch classify failed for %s: %s" % [
+			fname, str(classify_res.get("error", "unknown"))
+		])
+		_run_counters["failed"] = int(_run_counters.get("failed", 0)) + 1
+		batch_remaining["n"] -= 1
+		return
+
+	var classification: Dictionary = classify_res.get("classification", {})
+
+	# -- Step 4: Insert --
+	var insert_args: Dictionary = {
+		"vault_path":    _active_vault_path,
+		"file_path":     fpath,
+		"category":      classification.get("category",    ""),
+		"confidence":    float(classification.get("confidence", 0.0)),
+		"sender":        classification.get("sender",      ""),
+		"description":   classification.get("description", ""),
+		"doc_date":      classification.get("doc_date",    ""),
+		"status":        "classified",
+		"sha256":        sha256,
+		"simhash":       simhash,
+		"dhash":         dhash,
+		"source_path":   fpath,
+		"rule_snapshot": str(classify_res.get("rule_snapshot", "")),
+	}
+	if not _vault_password.is_empty():
+		insert_args["password"] = _vault_password
+
+	var insert_res: Dictionary = await conn.call_tool(
+		"minerva_scansort_insert_document",
+		insert_args
+	)
+	if not insert_res.get("ok", false):
+		push_warning("[ScansortPanel] batch insert failed for %s: %s" % [
+			fname, str(insert_res.get("error", "unknown"))
+		])
+		_run_counters["failed"] = int(_run_counters.get("failed", 0)) + 1
+		batch_remaining["n"] -= 1
+		return
+
+	# Successful insert — record session state.
+	_processed_keys[fpath] = true
+	_run_counters["processed"] = int(_run_counters.get("processed", 0)) + 1
+	var confidence: float = float(classification.get("confidence", 0.0))
+	if confidence < LOW_CONFIDENCE_THRESHOLD:
+		_low_confidence_keys[fpath] = true
+		_run_counters["low_conf"] = int(_run_counters.get("low_conf", 0)) + 1
+
+	_push_session_marks_to_provider()
+	batch_remaining["n"] -= 1
 
 
 ## Stop button — sets the cancel flag; the batch loop picks it up between
@@ -1298,7 +1363,7 @@ func _on_settings_pressed() -> void:
 		return
 	var dlg = _SettingsDialog.new()
 	add_child(dlg)
-	dlg.init(conn)
+	dlg.init(conn, _active_vault_path)
 	dlg.settings_changed.connect(
 		func() -> void:
 			set_status("Scansort settings saved.")
@@ -1307,7 +1372,7 @@ func _on_settings_pressed() -> void:
 		func() -> void:
 			dlg.queue_free()
 	)
-	dlg.popup_centered(Vector2i(520, 240))
+	dlg.popup_centered(Vector2i(580, 420))
 
 
 # ---------------------------------------------------------------------------
@@ -1514,6 +1579,8 @@ func _on_tree_file_dropped(drag_data: Dictionary, target_key: String, _target_ki
 		set_status("Filed %s → %s" % [fname, category])
 		if _dest_tree != null and is_instance_valid(_dest_tree):
 			await _dest_tree.refresh()
+		if _disk_tree != null and is_instance_valid(_disk_tree):
+			await _disk_tree.refresh()
 		if _source_tree != null and is_instance_valid(_source_tree):
 			await _source_tree.refresh()
 
@@ -1539,6 +1606,8 @@ func _on_tree_file_dropped(drag_data: Dictionary, target_key: String, _target_ki
 		set_status("Reclassified → %s" % category)
 		if _dest_tree != null and is_instance_valid(_dest_tree):
 			await _dest_tree.refresh()
+		if _disk_tree != null and is_instance_valid(_disk_tree):
+			await _disk_tree.refresh()
 
 
 # ---------------------------------------------------------------------------
@@ -1614,6 +1683,8 @@ func _on_export_marked_pressed() -> void:
 		exported += 1
 
 	set_status("Exported %d, %d failed, %d skipped" % [exported, failed, skipped])
+	if _disk_tree != null and is_instance_valid(_disk_tree):
+		await _disk_tree.refresh()
 
 
 # ---------------------------------------------------------------------------
