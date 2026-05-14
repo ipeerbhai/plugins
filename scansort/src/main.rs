@@ -26,6 +26,7 @@ mod checklists;
 mod classifier;
 mod crypto;
 mod db;
+mod dedup;
 mod destination;
 mod destinations;
 mod documents;
@@ -1500,6 +1501,107 @@ fn handle_destination_remove(params: &Value, id: Value) -> RpcResponse {
 }
 
 // ---------------------------------------------------------------------------
+// W7: near-dup detection handlers
+// ---------------------------------------------------------------------------
+
+/// `minerva_scansort_check_simhash` — query a vault for near-duplicate text
+/// documents using SimHash Hamming distance.
+///
+/// Returns all matching `(doc_id, distance, existing_hash)` entries within
+/// the given threshold.  A zero hash always returns an empty matches array.
+///
+/// **HARD CONSTRAINT**: the caller MUST surface non-empty results as an
+/// explicit disposition prompt (keep-both / replace / skip).  Near-duplicate
+/// matches MUST NEVER be auto-discarded.
+fn handle_check_simhash(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+
+    let vault_path = args.get("vault_path").and_then(|v| v.as_str()).unwrap_or("");
+    if vault_path.is_empty() {
+        return ok_response(id, tool_err("vault_path is required"));
+    }
+    let simhash = args.get("simhash").and_then(|v| v.as_str()).unwrap_or("");
+    if simhash.is_empty() {
+        return ok_response(id, tool_err("simhash is required"));
+    }
+    let threshold = args
+        .get("threshold")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .unwrap_or(dedup::DEFAULT_SIMHASH_THRESHOLD);
+
+    match dedup::check_simhash(vault_path, simhash, threshold) {
+        Ok(matches) => {
+            let matches_json: Vec<Value> = matches
+                .iter()
+                .map(|m| json!({
+                    "doc_id": m.doc_id,
+                    "distance": m.distance,
+                    "existing_hash": m.existing_hash,
+                    "hash_kind": m.hash_kind,
+                }))
+                .collect();
+            ok_response(id, tool_ok(json!({
+                "ok": true,
+                "found": !matches_json.is_empty(),
+                "matches": matches_json,
+                "count": matches_json.len(),
+                "threshold": threshold,
+            })))
+        }
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+/// `minerva_scansort_check_dhash` — query a vault for near-duplicate image
+/// documents using perceptual dHash Hamming distance.
+///
+/// Same shape as `check_simhash` but operates on the `dhash` column.
+/// The default threshold is 0 (disabled); set > 0 to enable image near-dup.
+///
+/// **HARD CONSTRAINT**: non-empty results MUST surface a disposition prompt —
+/// never auto-skipped.
+fn handle_check_dhash(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+
+    let vault_path = args.get("vault_path").and_then(|v| v.as_str()).unwrap_or("");
+    if vault_path.is_empty() {
+        return ok_response(id, tool_err("vault_path is required"));
+    }
+    let dhash = args.get("dhash").and_then(|v| v.as_str()).unwrap_or("");
+    if dhash.is_empty() {
+        return ok_response(id, tool_err("dhash is required"));
+    }
+    let threshold = args
+        .get("threshold")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .unwrap_or(dedup::DEFAULT_DHASH_THRESHOLD);
+
+    match dedup::check_dhash(vault_path, dhash, threshold) {
+        Ok(matches) => {
+            let matches_json: Vec<Value> = matches
+                .iter()
+                .map(|m| json!({
+                    "doc_id": m.doc_id,
+                    "distance": m.distance,
+                    "existing_hash": m.existing_hash,
+                    "hash_kind": m.hash_kind,
+                }))
+                .collect();
+            ok_response(id, tool_ok(json!({
+                "ok": true,
+                "found": !matches_json.is_empty(),
+                "matches": matches_json,
+                "count": matches_json.len(),
+                "threshold": threshold,
+            })))
+        }
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // W6: fan-out placement handler
 // ---------------------------------------------------------------------------
 
@@ -2333,6 +2435,32 @@ fn main() {
                         },
                     },
                     {
+                        "name": "minerva_scansort_check_simhash",
+                        "description": "W7: Query a vault for near-duplicate text documents using SimHash Hamming distance. Returns all stored documents whose simhash is within `threshold` bits of the candidate. A zero hash ('0000000000000000') always returns empty matches. Non-empty results MUST surface a disposition prompt (keep-both/replace/skip) — never auto-discard. Returns {ok, found, matches: [{doc_id, distance, existing_hash, hash_kind}], count, threshold}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "vault_path": {"type": "string", "description": "Absolute path to the vault file."},
+                                "simhash": {"type": "string", "description": "16-hex-char SimHash of the candidate document."},
+                                "threshold": {"type": "integer", "description": "Maximum Hamming distance to flag as near-duplicate (default: 3). Set 0 to find only exact-hash duplicates."},
+                            },
+                            "required": ["vault_path", "simhash"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_check_dhash",
+                        "description": "W7: Query a vault for near-duplicate image documents using perceptual dHash Hamming distance. Same shape as check_simhash but operates on the dhash column. Default threshold is 0 (disabled by default — set > 0 to enable image near-dup detection). Non-empty results MUST surface a disposition prompt — never auto-discard. Returns {ok, found, matches: [{doc_id, distance, existing_hash, hash_kind}], count, threshold}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "vault_path": {"type": "string", "description": "Absolute path to the vault file."},
+                                "dhash": {"type": "string", "description": "16-hex-char perceptual dHash of the candidate document."},
+                                "threshold": {"type": "integer", "description": "Maximum Hamming distance to flag as near-duplicate (default: 0 = disabled). Set > 0 to enable image near-dup."},
+                            },
+                            "required": ["vault_path", "dhash"],
+                        },
+                    },
+                    {
                         "name": "minerva_scansort_place_fanout",
                         "description": "W6: Execute copy_to fan-out for a single document — copy/insert it into every destination in copy_to. For directory destinations: copies file to <dest.path>/<resolved_subfolder>/<resolved_rename>, sanitised against path traversal, collision-safe. For vault destinations: calls insert_document. Skips (SkippedAlreadyPresent) if content sha256 already present at that destination. Bad/unknown destination ids produce an error row without aborting the rest. Returns {ok, placements: [{destination_id, kind, target_path, doc_id, status, message}]}. Note: directory hash cache is NOT shared across tool calls (stateless); use the in-process DirHashCache for W10 Process All runs.",
                         "inputSchema": {
@@ -2513,6 +2641,12 @@ fn main() {
                     }
                     "minerva_scansort_destination_remove" => {
                         handle_destination_remove(&req.params, req.id)
+                    }
+                    "minerva_scansort_check_simhash" => {
+                        handle_check_simhash(&req.params, req.id)
+                    }
+                    "minerva_scansort_check_dhash" => {
+                        handle_check_dhash(&req.params, req.id)
                     }
                     "minerva_scansort_place_fanout" => {
                         handle_place_fanout(&req.params, req.id)

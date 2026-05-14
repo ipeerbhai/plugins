@@ -46,6 +46,9 @@ var _disk_root_btn:  Button       = null
 var _dest_section:   Control      = null   # container to enable/disable
 var _concurrency_spin: SpinBox    = null
 var _dest_error_lbl: Label        = null   # visible error for missing disk_root
+## W7: near-dup threshold controls.
+var _simhash_spin: SpinBox = null
+var _dhash_spin:   SpinBox = null
 
 
 const _UiScale := preload("ui_scale.gd")
@@ -186,6 +189,57 @@ func _build_ui() -> void:
 	conc_row.add_child(_concurrency_spin)
 	root.add_child(conc_row)
 
+	# --- Separator ---------------------------------------------------------
+	root.add_child(HSeparator.new())
+
+	# --- W7: Near-dup thresholds section -----------------------------------
+	var dedup_title := Label.new()
+	dedup_title.text = "Near-Duplicate Detection"
+	dedup_title.add_theme_color_override("font_color", Color(0.9, 0.9, 0.9))
+	root.add_child(dedup_title)
+
+	var dedup_help := Label.new()
+	dedup_help.text = "SimHash compares text fingerprints; dHash compares image fingerprints. Threshold = max Hamming-distance bits to flag as near-duplicate. Set to 0 to disable that layer."
+	dedup_help.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	dedup_help.add_theme_color_override("font_color", Color(0.7, 0.7, 0.7))
+	root.add_child(dedup_help)
+
+	# SimHash threshold row.
+	var simhash_row := HBoxContainer.new()
+	simhash_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var simhash_lbl := Label.new()
+	simhash_lbl.text = "SimHash threshold"
+	simhash_lbl.custom_minimum_size.x = 180
+	simhash_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	simhash_row.add_child(simhash_lbl)
+
+	_simhash_spin = SpinBox.new()
+	_simhash_spin.min_value = 0
+	_simhash_spin.max_value = 64
+	_simhash_spin.step = 1
+	_simhash_spin.value = ScansortSettings.load_simhash_threshold()
+	_simhash_spin.tooltip_text = "SimHash Hamming-distance threshold for near-dup text detection (0–64). Default: 3. Set 0 to disable."
+	simhash_row.add_child(_simhash_spin)
+	root.add_child(simhash_row)
+
+	# dHash threshold row.
+	var dhash_row := HBoxContainer.new()
+	dhash_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var dhash_lbl := Label.new()
+	dhash_lbl.text = "Image hash threshold"
+	dhash_lbl.custom_minimum_size.x = 180
+	dhash_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	dhash_row.add_child(dhash_lbl)
+
+	_dhash_spin = SpinBox.new()
+	_dhash_spin.min_value = 0
+	_dhash_spin.max_value = 64
+	_dhash_spin.step = 1
+	_dhash_spin.value = ScansortSettings.load_dhash_threshold()
+	_dhash_spin.tooltip_text = "Image perceptual dHash Hamming-distance threshold (0–64). Default: 0 (disabled). Set > 0 to enable image near-dup detection."
+	dhash_row.add_child(_dhash_spin)
+	root.add_child(dhash_row)
+
 	add_child(root)
 
 
@@ -279,6 +333,12 @@ func _on_save_pressed() -> void:
 	# Save concurrency.
 	if _concurrency_spin != null:
 		ScansortSettings.save_concurrency(int(_concurrency_spin.value))
+
+	# W7: Save near-dup thresholds.
+	if _simhash_spin != null:
+		ScansortSettings.save_simhash_threshold(int(_simhash_spin.value))
+	if _dhash_spin != null:
+		ScansortSettings.save_dhash_threshold(int(_dhash_spin.value))
 
 	# Save destination (vault-level, async) — only when vault is open.
 	if not _vault_path.is_empty() and _conn != null and _dest_picker != null:
@@ -402,4 +462,30 @@ class ScansortSettings:
 	static func save_concurrency(n: int) -> void:
 		var blob := _load_blob()
 		blob["process_concurrency"] = clampi(n, 1, 4)
+		_save_blob(blob)
+
+	## Read the saved SimHash near-dup threshold. Default is 3 (experiment default).
+	## Clamped to [0, 64].
+	static func load_simhash_threshold() -> int:
+		var blob := _load_blob()
+		var raw = blob.get("simhash_threshold", 3)
+		return clampi(int(raw), 0, 64)
+
+	## Save the SimHash near-dup threshold. Read-modify-write to preserve other keys.
+	static func save_simhash_threshold(n: int) -> void:
+		var blob := _load_blob()
+		blob["simhash_threshold"] = clampi(n, 0, 64)
+		_save_blob(blob)
+
+	## Read the saved dHash near-dup threshold. Default is 0 (disabled by default).
+	## Clamped to [0, 64].
+	static func load_dhash_threshold() -> int:
+		var blob := _load_blob()
+		var raw = blob.get("dhash_threshold", 0)
+		return clampi(int(raw), 0, 64)
+
+	## Save the dHash near-dup threshold. Read-modify-write to preserve other keys.
+	static func save_dhash_threshold(n: int) -> void:
+		var blob := _load_blob()
+		blob["dhash_threshold"] = clampi(n, 0, 64)
 		_save_blob(blob)

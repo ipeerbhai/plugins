@@ -71,6 +71,9 @@ const _DiskProvider: Script = preload("scan_tree_disk_provider.gd")
 ## W5: destination registry provider — vault or directory destination.
 const _DestinationProvider: Script = preload("scan_tree_destination_provider.gd")
 
+## W7: dedup disposition dialog (off-tree: no class_name).
+const _DedupDispositionDialog: Script = preload("dedup_disposition_dialog.gd")
+
 # ---------------------------------------------------------------------------
 # Signals
 # ---------------------------------------------------------------------------
@@ -213,6 +216,22 @@ var _inject_payload_cache: String = ""
 
 ## True when the user has toggled the inject-to-chat switch on.
 var _inject_enabled: bool = false
+
+# ---------------------------------------------------------------------------
+# W7: near-dup dedup state
+# ---------------------------------------------------------------------------
+
+## Reusable dedup disposition dialog instance (created once, reused).
+var _dedup_dialog: AcceptDialog = null
+
+## When a dedup disposition is pending, this holds the match_info dict that was
+## passed to the dialog.  Cleared once the user makes a choice or cancels.
+var _pending_dedup_match: Dictionary = {}
+
+## Last disposition chosen by the user for the current near-dup prompt.
+## One of "keep_both", "replace", "skip", or "" (pending / not yet chosen).
+## W9 (audit log) and W10 (Process All) read this after the dialog closes.
+var _last_dedup_disposition: String = ""
 
 # ---------------------------------------------------------------------------
 # Platform hooks
@@ -2068,6 +2087,141 @@ func _on_panel_create_note_request(_ctx: Dictionary) -> Variant:
 		"title":   "Scansort source files",
 		"content": _inject_payload_cache,
 	}
+
+
+# ---------------------------------------------------------------------------
+# W7: near-dup dedup detection + disposition prompt
+# ---------------------------------------------------------------------------
+
+## Check a candidate document for near-duplicates in the active vault.
+##
+## Calls `minerva_scansort_check_simhash` and `minerva_scansort_check_dhash`
+## using the thresholds from Settings.  Returns a match_info dict if any match
+## is found, or an empty dict if no match (caller proceeds normally).
+##
+## The match_info dict shape:
+##   { "file_name", "match_kind", "match_count", "distance",
+##     "existing_doc_id", "rule_label", "target_path" }
+##
+## HARD CONSTRAINT: the caller must surface non-empty results as a disposition
+## prompt — NEVER auto-discard.
+func _check_near_dup(
+	file_path: String,
+	simhash: String,
+	dhash: String,
+	rule_label: String = "",
+	target_path: String = "",
+) -> Dictionary:
+	if not _vault_is_open:
+		return {}
+	var conn = _get_connection()
+	if conn == null:
+		return {}
+
+	# Load thresholds from settings.
+	var SettingsClass = _SettingsDialog.ScansortSettings
+	var simhash_threshold: int = SettingsClass.load_simhash_threshold()
+	var dhash_threshold: int = SettingsClass.load_dhash_threshold()
+
+	# Layer 2a: SimHash near-dup check.
+	if simhash_threshold > 0 and simhash != "0000000000000000" and not simhash.is_empty():
+		var sim_res: Dictionary = await conn.call_tool(
+			"minerva_scansort_check_simhash",
+			{
+				"vault_path": _active_vault_path,
+				"simhash": simhash,
+				"threshold": simhash_threshold,
+			}
+		)
+		if sim_res.get("ok", false) and sim_res.get("found", false):
+			var matches: Array = sim_res.get("matches", [])
+			var best_match: Dictionary = matches[0] if matches.size() > 0 else {}
+			return {
+				"file_name":       file_path.get_file(),
+				"match_kind":      "simhash",
+				"match_count":     int(sim_res.get("count", 1)),
+				"distance":        int(best_match.get("distance", 0)),
+				"existing_doc_id": int(best_match.get("doc_id", 0)),
+				"rule_label":      rule_label,
+				"target_path":     target_path,
+			}
+
+	# Layer 2b: dHash near-dup check (image).
+	if dhash_threshold > 0 and dhash != "0000000000000000" and not dhash.is_empty():
+		var dhash_res: Dictionary = await conn.call_tool(
+			"minerva_scansort_check_dhash",
+			{
+				"vault_path": _active_vault_path,
+				"dhash": dhash,
+				"threshold": dhash_threshold,
+			}
+		)
+		if dhash_res.get("ok", false) and dhash_res.get("found", false):
+			var matches: Array = dhash_res.get("matches", [])
+			var best_match: Dictionary = matches[0] if matches.size() > 0 else {}
+			return {
+				"file_name":       file_path.get_file(),
+				"match_kind":      "dhash",
+				"match_count":     int(dhash_res.get("count", 1)),
+				"distance":        int(best_match.get("distance", 0)),
+				"existing_doc_id": int(best_match.get("doc_id", 0)),
+				"rule_label":      rule_label,
+				"target_path":     target_path,
+			}
+
+	return {}
+
+
+## Show the dedup disposition dialog for a near-dup or logical-identity match.
+##
+## Awaitable — suspends until the user makes a choice (or cancels).
+## Returns the chosen disposition string: "keep_both", "replace", "skip".
+## A cancelled dialog (X button) returns "skip" — the safest fallback that
+## doesn't lose data silently.
+##
+## The chosen disposition is also written to `_last_dedup_disposition` so that
+## W9 (audit log) and W10 (Process All) can read it after this coroutine returns.
+##
+## HARD CONSTRAINT: callers MUST await this and check the result before
+## deciding whether to place the document.  Never call place_fanout without
+## first honouring the disposition.
+func _show_dedup_disposition(match_info: Dictionary) -> String:
+	_pending_dedup_match = match_info
+	_last_dedup_disposition = ""
+
+	# Create or reuse the dialog.
+	if _dedup_dialog == null or not is_instance_valid(_dedup_dialog):
+		_dedup_dialog = _DedupDispositionDialog.new()
+		add_child(_dedup_dialog)
+
+	# Wire signals (disconnect first to avoid double-connections on reuse).
+	if _dedup_dialog.disposition_chosen.is_connected(_on_dedup_disposition_chosen):
+		_dedup_dialog.disposition_chosen.disconnect(_on_dedup_disposition_chosen)
+	if _dedup_dialog.cancelled.is_connected(_on_dedup_disposition_cancelled):
+		_dedup_dialog.cancelled.disconnect(_on_dedup_disposition_cancelled)
+
+	_dedup_dialog.disposition_chosen.connect(_on_dedup_disposition_chosen)
+	_dedup_dialog.cancelled.connect(_on_dedup_disposition_cancelled)
+
+	_dedup_dialog.init(match_info)
+	_dedup_dialog.popup_centered(Vector2i(520, 340))
+
+	# Suspend until the user picks a disposition.
+	await _dedup_dialog.hide
+
+	_pending_dedup_match = {}
+	return _last_dedup_disposition if not _last_dedup_disposition.is_empty() else "skip"
+
+
+## Handler: user picked a disposition in the dedup dialog.
+func _on_dedup_disposition_chosen(disposition: String) -> void:
+	_last_dedup_disposition = disposition
+
+
+## Handler: user dismissed the dedup dialog without choosing (X button / Escape).
+## Treat as "skip" — do not auto-place to avoid data loss.
+func _on_dedup_disposition_cancelled() -> void:
+	_last_dedup_disposition = "skip"
 
 
 func set_status(text: String) -> void:
