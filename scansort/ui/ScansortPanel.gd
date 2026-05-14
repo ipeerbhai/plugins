@@ -109,13 +109,16 @@ var _chrome_popup: PopupMenu = null
 ## R7: No internal toolbar. The File menu is returned via get_editor_actions()
 ## and lives in the editor chrome bar.
 ##
-## U4: 3-column layout — SourcePane | Action column | DestPane. Each side
-## pane hosts a unified scan_tree bound to a provider; the centre action
-## column carries the Process/Stop buttons and the status panel.
+## U4: 2-column layout — SourcePane | DestPane — each hosting a unified
+## scan_tree bound to a provider, with the status panel as a bottom bar.
+## Process All / Stop live in the editor chrome bar (get_editor_actions),
+## not in the panel.
 var _source_tree: Tree = null
 var _dest_tree:   Tree = null
 var _source_provider: Object = null
 var _dest_provider:   Object = null
+## Chrome-bar buttons — created in get_editor_actions(); the editor owns and
+## frees them on teardown, so guard with is_instance_valid before use.
 var _process_btn: Button = null
 var _stop_btn:    Button = null
 var _status_panel: HBoxContainer = null
@@ -165,13 +168,18 @@ func _build_ui() -> void:
 	anchor_right = 1.0
 	anchor_bottom = 1.0
 
-	# U4: 3-column layout — SourcePane | Action column | DestPane.
-	# R7: no internal toolbar; the File menu lives in the editor chrome bar
-	# via get_editor_actions().
+	# U4: 2-column layout — SourcePane | DestPane — with the status panel as a
+	# bottom bar. Process All / Stop live in the editor chrome bar, contributed
+	# via get_editor_actions(); R7: no internal toolbar.
+	var layout := VBoxContainer.new()
+	layout.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	add_child(layout)
+
 	var columns := HBoxContainer.new()
-	columns.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	columns.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	columns.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	columns.add_theme_constant_override("separation", 4)
-	add_child(columns)
+	layout.add_child(columns)
 
 	# --- Left column: source pane ---
 	var source_col := VBoxContainer.new()
@@ -186,29 +194,6 @@ func _build_ui() -> void:
 	source_col.add_child(_source_tree)
 	columns.add_child(source_col)
 
-	# --- Centre column: action column (Process/Stop + status) ---
-	var action_col := VBoxContainer.new()
-	action_col.name = "ActionColumn"
-	action_col.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	action_col.custom_minimum_size.x = 150
-	_process_btn = Button.new()
-	_process_btn.text = "Process All"
-	_process_btn.tooltip_text = "Extract, classify and file every source document (wired in U5)."
-	_process_btn.disabled = true  # U5 wires the batch pipeline; placeholder for now.
-	action_col.add_child(_process_btn)
-	_stop_btn = Button.new()
-	_stop_btn.text = "Stop"
-	_stop_btn.tooltip_text = "Stop the running batch (wired in U5)."
-	_stop_btn.disabled = true
-	action_col.add_child(_stop_btn)
-	var action_spacer := Control.new()
-	action_spacer.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	action_col.add_child(action_spacer)
-	_status_panel = _StatusPanel.new()
-	_status_panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	action_col.add_child(_status_panel)
-	columns.add_child(action_col)
-
 	# --- Right column: destination (vault) pane ---
 	var dest_col := VBoxContainer.new()
 	dest_col.name = "DestPane"
@@ -221,6 +206,11 @@ func _build_ui() -> void:
 	_dest_tree = _ScanTree.new()
 	dest_col.add_child(_dest_tree)
 	columns.add_child(dest_col)
+
+	# --- Status bar along the bottom ---
+	_status_panel = _StatusPanel.new()
+	_status_panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	layout.add_child(_status_panel)
 
 # ---------------------------------------------------------------------------
 # Menu handling
@@ -1108,6 +1098,21 @@ func _get_connection() -> Object:
 ## Called by Editor._apply_plugin_chrome_actions() after the panel is mounted.
 ## Returns a fresh MenuButton each call; the editor owns and frees it on teardown.
 func get_editor_actions() -> Array:
+	# Process All / Stop — contributed to the chrome bar, left of the File menu.
+	# Disabled placeholders until U5 wires the batch pipeline. Icons match the
+	# chat panel's submit / stop buttons; style matches the File MenuButton
+	# (flat = false, icon-only + tooltip).
+	_process_btn = Button.new()
+	_process_btn.flat = false
+	_process_btn.icon = load("res://assets/icons/send_icons/send_icon_24_no_bg.png")
+	_process_btn.tooltip_text = "Process All — extract, classify and file every source document (wired in U5)."
+	_process_btn.disabled = true
+	_stop_btn = Button.new()
+	_stop_btn.flat = false
+	_stop_btn.icon = load("res://assets/icons/stop_icons/stop-sign-24.png")
+	_stop_btn.tooltip_text = "Stop the running batch (wired in U5)."
+	_stop_btn.disabled = true
+
 	var menu := MenuButton.new()
 	# Reuse Minerva's drawer icon for the File menu; tooltip explains it.
 	var icon: Texture2D = load("res://assets/icons/drawer.png")
@@ -1141,8 +1146,9 @@ func get_editor_actions() -> Array:
 
 	# Scansort inherits the chat panel's model selection at classify time via
 	# _resolve_chat_model_for_classify() → ChatPane.get_active_model_spec().
-	# No per-panel model picker — keep the chrome single-purpose (File menu).
-	return [menu]
+	# No per-panel model picker.
+	# Process | Stop | File — buttons land left of the File menu in the chrome.
+	return [_process_btn, _stop_btn, menu]
 
 
 ## Disable File-menu items that require an open vault when no vault is open.
