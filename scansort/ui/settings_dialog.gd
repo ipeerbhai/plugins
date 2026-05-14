@@ -49,6 +49,10 @@ var _dest_error_lbl: Label        = null   # visible error for missing disk_root
 ## W7: near-dup threshold controls.
 var _simhash_spin: SpinBox = null
 var _dhash_spin:   SpinBox = null
+## W9: audit-log controls.
+var _audit_enabled_check: CheckBox = null
+var _audit_path_edit:     LineEdit = null
+var _audit_path_btn:      Button   = null
 
 
 const _UiScale := preload("ui_scale.gd")
@@ -240,6 +244,57 @@ func _build_ui() -> void:
 	dhash_row.add_child(_dhash_spin)
 	root.add_child(dhash_row)
 
+	# --- Separator ---------------------------------------------------------
+	root.add_child(HSeparator.new())
+
+	# --- W9: Audit Log section ---------------------------------------------
+	var audit_title := Label.new()
+	audit_title.text = "Audit Log (CPA export)"
+	audit_title.add_theme_color_override("font_color", Color(0.9, 0.9, 0.9))
+	root.add_child(audit_title)
+
+	var audit_help := Label.new()
+	audit_help.text = "When enabled, every placement is appended as a CSV row to the audit log path (outside any vault). The log is write-only — it is never read back for processing decisions."
+	audit_help.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	audit_help.add_theme_color_override("font_color", Color(0.7, 0.7, 0.7))
+	root.add_child(audit_help)
+
+	# Enabled toggle row.
+	var audit_toggle_row := HBoxContainer.new()
+	audit_toggle_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var audit_toggle_lbl := Label.new()
+	audit_toggle_lbl.text = "Enable audit log"
+	audit_toggle_lbl.custom_minimum_size.x = 180
+	audit_toggle_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	audit_toggle_row.add_child(audit_toggle_lbl)
+
+	_audit_enabled_check = CheckBox.new()
+	_audit_enabled_check.button_pressed = ScansortSettings.load_audit_log_enabled()
+	_audit_enabled_check.tooltip_text = "When checked, each placement writes a row to the audit CSV log at the path below. Defaults to OFF."
+	audit_toggle_row.add_child(_audit_enabled_check)
+	root.add_child(audit_toggle_row)
+
+	# Path row.
+	var audit_path_row := HBoxContainer.new()
+	audit_path_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var audit_path_lbl := Label.new()
+	audit_path_lbl.text = "Audit log path"
+	audit_path_lbl.custom_minimum_size.x = 180
+	audit_path_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	audit_path_row.add_child(audit_path_lbl)
+
+	_audit_path_edit = LineEdit.new()
+	_audit_path_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_audit_path_edit.placeholder_text = "/path/to/audit_log.csv  (outside any vault)"
+	audit_path_row.add_child(_audit_path_edit)
+	_audit_path_edit.text = ScansortSettings.load_audit_log_path()
+
+	_audit_path_btn = Button.new()
+	_audit_path_btn.text = "Browse…"
+	_audit_path_btn.pressed.connect(_on_browse_audit_path_pressed)
+	audit_path_row.add_child(_audit_path_btn)
+	root.add_child(audit_path_row)
+
 	add_child(root)
 
 
@@ -340,6 +395,12 @@ func _on_save_pressed() -> void:
 	if _dhash_spin != null:
 		ScansortSettings.save_dhash_threshold(int(_dhash_spin.value))
 
+	# W9: Save audit-log toggle + path.
+	if _audit_enabled_check != null:
+		ScansortSettings.save_audit_log_enabled(bool(_audit_enabled_check.button_pressed))
+	if _audit_path_edit != null:
+		ScansortSettings.save_audit_log_path(_audit_path_edit.text.strip_edges())
+
 	# Save destination (vault-level, async) — only when vault is open.
 	if not _vault_path.is_empty() and _conn != null and _dest_picker != null:
 		var dest_idx: int = _dest_picker.get_selected()
@@ -374,6 +435,24 @@ func _on_browse_disk_root_pressed() -> void:
 	fd.dir_selected.connect(func(dir: String) -> void:
 		if _disk_root_edit != null:
 			_disk_root_edit.text = dir
+		fd.queue_free()
+	)
+	fd.canceled.connect(func() -> void:
+		fd.queue_free()
+	)
+	add_child(fd)
+	fd.popup_centered(Vector2i(700, 500))
+
+
+func _on_browse_audit_path_pressed() -> void:
+	var fd := FileDialog.new()
+	fd.access = FileDialog.ACCESS_FILESYSTEM
+	fd.file_mode = FileDialog.FILE_MODE_SAVE_FILE
+	fd.title = "Choose audit log file"
+	fd.filters = PackedStringArray(["*.csv ; CSV files"])
+	fd.file_selected.connect(func(path: String) -> void:
+		if _audit_path_edit != null:
+			_audit_path_edit.text = path
 		fd.queue_free()
 	)
 	fd.canceled.connect(func() -> void:
@@ -488,4 +567,31 @@ class ScansortSettings:
 	static func save_dhash_threshold(n: int) -> void:
 		var blob := _load_blob()
 		blob["dhash_threshold"] = clampi(n, 0, 64)
+		_save_blob(blob)
+
+	## W9: Read the audit-log enabled toggle. Defaults to false (opt-in).
+	static func load_audit_log_enabled() -> bool:
+		var blob := _load_blob()
+		var raw = blob.get("audit_log_enabled", false)
+		if raw is bool:
+			return raw as bool
+		# JSON.parse returns booleans as bool in Godot 4 but guard anyway.
+		return bool(raw)
+
+	## W9: Save the audit-log enabled toggle. Read-modify-write to preserve other keys.
+	static func save_audit_log_enabled(enabled: bool) -> void:
+		var blob := _load_blob()
+		blob["audit_log_enabled"] = enabled
+		_save_blob(blob)
+
+	## W9: Read the audit-log path. Returns "" when not set.
+	static func load_audit_log_path() -> String:
+		var blob := _load_blob()
+		var raw = blob.get("audit_log_path", "")
+		return str(raw)
+
+	## W9: Save the audit-log path. Read-modify-write to preserve other keys.
+	static func save_audit_log_path(path: String) -> void:
+		var blob := _load_blob()
+		blob["audit_log_path"] = path
 		_save_blob(blob)

@@ -22,6 +22,7 @@
 //
 // The synchronous read pattern below is safe under that guarantee.
 
+mod audit;
 mod checklists;
 mod classifier;
 mod crypto;
@@ -1838,6 +1839,79 @@ fn handle_scan_directory_hashes(params: &Value, id: Value) -> RpcResponse {
     }
 }
 
+// ---------------------------------------------------------------------------
+// W9: audit log append handler
+// ---------------------------------------------------------------------------
+
+/// `minerva_scansort_audit_append` — W9.
+///
+/// Append one or more rows to the append-only CSV audit log at `log_path`.
+///
+/// ## Toggle split
+///
+/// This tool does NOT check whether the audit-log toggle is enabled — that
+/// check lives in the GDScript panel (Settings → `audit_log_enabled`).
+/// Call this tool only when the toggle is ON; it will write unconditionally.
+///
+/// ## Non-fatal contract
+///
+/// If `log_path` is unwritable the tool returns `{ok: false, error: "..."}`.
+/// It does NOT panic. W10 MUST treat audit failures as non-fatal.
+///
+/// ## Parameters
+///
+/// - `log_path`  — absolute path to the CSV log file (outside any vault).
+/// - `rows`      — array of row objects; each has the 10 CSV column fields.
+///   Each row object: `{timestamp, event, source_sha256, source_filename,
+///   rule_label, destination_id, destination_kind, resolved_path,
+///   disposition, detail}`.
+fn handle_audit_append(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let log_path_str = args.get("log_path").and_then(|v| v.as_str()).unwrap_or("");
+    if log_path_str.is_empty() {
+        return ok_response(id, tool_err("log_path is required"));
+    }
+
+    let rows_val = match args.get("rows").and_then(|v| v.as_array()) {
+        Some(arr) => arr.clone(),
+        None => return ok_response(id, tool_err("rows is required and must be an array")),
+    };
+
+    let mut audit_rows: Vec<audit::AuditRow> = Vec::with_capacity(rows_val.len());
+    for (i, rv) in rows_val.iter().enumerate() {
+        let get = |key: &str| rv.get(key).and_then(|v| v.as_str()).unwrap_or("");
+        audit_rows.push(audit::AuditRow {
+            timestamp:        get("timestamp").to_string(),
+            event:            get("event").to_string(),
+            source_sha256:    get("source_sha256").to_string(),
+            source_filename:  get("source_filename").to_string(),
+            rule_label:       get("rule_label").to_string(),
+            destination_id:   get("destination_id").to_string(),
+            destination_kind: get("destination_kind").to_string(),
+            resolved_path:    get("resolved_path").to_string(),
+            disposition:      get("disposition").to_string(),
+            detail:           get("detail").to_string(),
+        });
+        // Validate required fields per row.
+        if audit_rows.last().map_or(true, |r| r.event.is_empty()) {
+            return ok_response(id, tool_err(&format!("rows[{}].event is required", i)));
+        }
+    }
+
+    let log_path = std::path::Path::new(log_path_str);
+    match audit::append_rows(log_path, &audit_rows) {
+        Ok(()) => ok_response(id, tool_ok(json!({
+            "ok": true,
+            "log_path": log_path_str,
+            "rows_written": audit_rows.len(),
+        }))),
+        Err(e) => ok_response(id, tool_ok(json!({
+            "ok": false,
+            "error": e.message,
+        }))),
+    }
+}
+
 fn main() {
     // Logging goes to stderr so it never pollutes the JSON-RPC stdout channel.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -2587,6 +2661,37 @@ fn main() {
                             "required": ["registry_path", "destination_id", "locked"],
                         },
                     },
+                    {
+                        "name": "minerva_scansort_audit_append",
+                        "description": "W9: Append one or more rows to the append-only CSV audit log. Creates the file with a header row on first write; never truncates. The toggle (audit_log_enabled) is checked by the panel — call this tool only when the toggle is ON. Non-fatal: if log_path is unwritable, returns {ok:false, error:...} without panicking. W10 MUST treat audit failure as non-fatal. CSV columns: timestamp, event, source_sha256, source_filename, rule_label, destination_id, destination_kind, resolved_path, disposition, detail. Returns {ok, log_path, rows_written}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "log_path": {"type": "string", "description": "Absolute path to the CSV audit log file. Must be OUTSIDE any vault. Created on first call; appended on subsequent calls."},
+                                "rows": {
+                                    "type": "array",
+                                    "description": "Array of audit row objects. Each row has 10 fields: timestamp (ISO-8601), event (placement|skipped|superseded), source_sha256, source_filename, rule_label, destination_id, destination_kind, resolved_path, disposition (placed|skipped-already-present|kept-both|replaced|superseded|error), detail.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "timestamp":        {"type": "string", "description": "ISO-8601 UTC timestamp."},
+                                            "event":            {"type": "string", "description": "placement, skipped, or superseded."},
+                                            "source_sha256":    {"type": "string", "description": "Hex SHA-256 of the source file."},
+                                            "source_filename":  {"type": "string", "description": "Original source filename (basename)."},
+                                            "rule_label":       {"type": "string", "description": "Classification rule label that fired."},
+                                            "destination_id":   {"type": "string", "description": "Destination registry id."},
+                                            "destination_kind": {"type": "string", "description": "vault or directory."},
+                                            "resolved_path":    {"type": "string", "description": "For directory: absolute target path; for vault: vault path."},
+                                            "disposition":      {"type": "string", "description": "placed, skipped-already-present, kept-both, replaced, superseded, or error."},
+                                            "detail":           {"type": "string", "description": "Human-readable detail (error message, doc_id, cleared count, etc.)."},
+                                        },
+                                        "required": ["timestamp", "event", "source_sha256", "source_filename", "destination_id", "destination_kind", "disposition"],
+                                    },
+                                },
+                            },
+                            "required": ["log_path", "rows"],
+                        },
+                    },
                 ]
             })),
 
@@ -2748,6 +2853,9 @@ fn main() {
                     }
                     "minerva_scansort_set_destination_locked" => {
                         handle_set_destination_locked(&req.params, req.id)
+                    }
+                    "minerva_scansort_audit_append" => {
+                        handle_audit_append(&req.params, req.id)
                     }
                     other => err_response(req.id, -32601, format!("unknown tool: {other}")),
                 }
