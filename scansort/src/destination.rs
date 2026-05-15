@@ -194,12 +194,24 @@ pub fn place_on_disk_with_issuer(
 /// this is not an error (vault_only vaults have no disk tree).
 pub fn list_disk_files(vault_path: &str) -> VaultResult<Vec<(String, String, String, u64)>> {
     let (_, disk_root) = get_destination(vault_path)?;
-    if disk_root.is_empty() {
+    list_disk_files_under(&disk_root)
+}
+
+/// List every regular file under a concrete directory root, recursively.
+/// Returns an empty Vec (Ok) when the root is unset/empty or does not exist.
+pub fn list_disk_files_under(disk_root: &str) -> VaultResult<Vec<(String, String, String, u64)>> {
+    if disk_root.trim().is_empty() {
         return Ok(vec![]);
     }
-    let root_path = Path::new(&disk_root);
+    let root_path = Path::new(disk_root);
     if !root_path.exists() {
         return Ok(vec![]);
+    }
+    if !root_path.is_dir() {
+        return Err(VaultError::new(format!(
+            "disk_root is not a directory: {}",
+            root_path.display()
+        )));
     }
 
     let mut results: Vec<(String, String, String, u64)> = Vec::new();
@@ -720,6 +732,27 @@ mod tests {
 
         let files = list_disk_files(vp).expect("list_disk_files should return Ok([])");
         assert!(files.is_empty(), "non-existent disk_root should yield empty list");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn list_disk_files_under_direct_directory_root() {
+        let base = unique_tmp("ldf-direct");
+        let root = base.join("direct");
+        let nested = root.join("tax").join("2026");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join("top.pdf"), b"top").unwrap();
+        std::fs::write(nested.join("nested.pdf"), b"nested").unwrap();
+
+        let files = list_disk_files_under(root.to_str().unwrap()).expect("direct list");
+        let rel_paths: Vec<&str> = files.iter().map(|f| f.2.as_str()).collect();
+        assert_eq!(files.len(), 2, "expected direct root files, got {rel_paths:?}");
+        assert!(rel_paths.contains(&"top.pdf"), "top-level file missing: {rel_paths:?}");
+        assert!(
+            rel_paths.iter().any(|r| r.ends_with("tax/2026/nested.pdf")),
+            "nested file missing: {rel_paths:?}"
+        );
+
         std::fs::remove_dir_all(&base).ok();
     }
 

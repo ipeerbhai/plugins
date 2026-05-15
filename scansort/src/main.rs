@@ -1367,10 +1367,50 @@ fn handle_place_on_disk(params: &Value, id: Value) -> RpcResponse {
 fn handle_list_disk_files(params: &Value, id: Value) -> RpcResponse {
     let args = params.get("arguments").unwrap_or(params);
     let vault_path = args.get("vault_path").and_then(|v| v.as_str()).unwrap_or("");
-    if vault_path.is_empty() {
-        return ok_response(id, tool_err("vault_path is required"));
-    }
-    match destination::list_disk_files(vault_path) {
+    let disk_root_arg = args.get("disk_root").and_then(|v| v.as_str()).unwrap_or("");
+    let registry_path = args.get("registry_path").and_then(|v| v.as_str()).unwrap_or("");
+    let destination_id = args.get("destination_id").and_then(|v| v.as_str()).unwrap_or("");
+
+    let resolved_root: Option<String> = if !disk_root_arg.trim().is_empty() {
+        Some(disk_root_arg.to_string())
+    } else if !registry_path.is_empty() && !destination_id.is_empty() {
+        match destinations::load_or_init(std::path::Path::new(registry_path)) {
+            Ok(reg) => match destinations::find_by_id(&reg, destination_id) {
+                Some(dest) if dest.kind == "directory" => Some(dest.path.clone()),
+                Some(dest) => {
+                    return ok_response(
+                        id,
+                        tool_err(&format!(
+                            "destination '{}' is kind '{}', not directory",
+                            destination_id, dest.kind
+                        )),
+                    );
+                }
+                None => {
+                    return ok_response(
+                        id,
+                        tool_err(&format!("Destination not found: '{}'", destination_id)),
+                    );
+                }
+            },
+            Err(e) => return ok_response(id, tool_err(&e.message)),
+        }
+    } else {
+        None
+    };
+
+    let list_result = if let Some(root) = resolved_root {
+        destination::list_disk_files_under(&root)
+    } else if !vault_path.is_empty() {
+        destination::list_disk_files(vault_path)
+    } else {
+        return ok_response(
+            id,
+            tool_err("vault_path, disk_root, or registry_path + destination_id is required"),
+        );
+    };
+
+    match list_result {
         Ok(files) => {
             let file_values: Vec<Value> = files
                 .iter()
@@ -2533,13 +2573,16 @@ fn main() {
                     },
                     {
                         "name": "minerva_scansort_list_disk_files",
-                        "description": "List every regular file under the vault's configured disk_root, recursively. Returns {ok, files: [{path, name, rel_path, size}]}, sorted by rel_path. Returns ok:true with empty files array when disk_root is unset/empty or does not exist (vault_only vaults have no disk tree).",
+                        "description": "List every regular file under a directory destination, recursively. Pass vault_path for the vault's configured disk_root, disk_root for a direct directory, or registry_path + destination_id for a registered directory destination. Returns {ok, files: [{path, name, rel_path, size}]}, sorted by rel_path. Returns ok:true with empty files array when the root is unset/empty or does not exist.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "vault_path": {"type": "string", "description": "Absolute path to the .ssort vault file."},
+                                "disk_root": {"type": "string", "description": "Absolute directory path to list directly."},
+                                "registry_path": {"type": "string", "description": "Destination registry path. Use with destination_id."},
+                                "destination_id": {"type": "string", "description": "Registered directory destination id. Use with registry_path."},
                             },
-                            "required": ["vault_path"],
+                            "required": [],
                         },
                     },
                     {
