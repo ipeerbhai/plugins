@@ -144,6 +144,74 @@
     {
       "name": "minerva_scansort_run_checklist_check",
       "description": "Run all enabled checklist items for a tax year against vault documents. Returns {ok, expected, auto_uploaded}."
+    },
+    {
+      "name": "minerva_scansort_session_open_vault",
+      "description": "Register an open vault in the plugin's session under a stable label. Panel-side call; LLM agents read state via session_state."
+    },
+    {
+      "name": "minerva_scansort_session_close_vault",
+      "description": "Remove a vault from the plugin's session by label."
+    },
+    {
+      "name": "minerva_scansort_session_open_directory",
+      "description": "Register an open directory destination in the plugin's session under a stable label."
+    },
+    {
+      "name": "minerva_scansort_session_close_directory",
+      "description": "Remove a directory destination from the plugin's session by label."
+    },
+    {
+      "name": "minerva_scansort_session_open_source",
+      "description": "Register an incoming source directory in the plugin's session under a stable label."
+    },
+    {
+      "name": "minerva_scansort_session_close_source",
+      "description": "Remove a source directory from the plugin's session by label."
+    },
+    {
+      "name": "minerva_scansort_session_state",
+      "description": "Return the current session — open vaults, directories, and sources as label-only lists. Paths are never included. Returns {ok, vaults: [{label}], dirs: [{label}], sources: [{label}]}."
+    },
+    {
+      "name": "minerva_scansort_library_insert_rule",
+      "description": "Upsert a rule into the global library (OS app-data path, no vault required). If a rule with the same label exists it is replaced. Returns {ok, rule}."
+    },
+    {
+      "name": "minerva_scansort_library_list_rules",
+      "description": "List all rules in the global library in stable insertion order. Returns {ok, rules: [FileRule], count}."
+    },
+    {
+      "name": "minerva_scansort_library_get_rule",
+      "description": "Get a single rule from the global library by label. Returns {ok, rule} if found or {ok:false, error} if not found."
+    },
+    {
+      "name": "minerva_scansort_library_update_rule",
+      "description": "Apply partial field updates to a rule in the global library by label. Only provided fields are changed. Returns {ok, rule} if found or {ok:false, error} if not found."
+    },
+    {
+      "name": "minerva_scansort_library_delete_rule",
+      "description": "Remove a rule from the global library by label. Returns {ok, deleted:true} if removed, {ok, deleted:false} if the label was not found."
+    },
+    {
+      "name": "minerva_scansort_library_enable_rule",
+      "description": "Set enabled=true on a rule in the global library by label. Returns {ok, enabled:true} if found, {ok:false, error} if not found."
+    },
+    {
+      "name": "minerva_scansort_library_disable_rule",
+      "description": "Set enabled=false on a rule in the global library by label. Returns {ok, enabled:false} if found, {ok:false, error} if not found."
+    },
+    {
+      "name": "minerva_scansort_library_export_to_sidecar",
+      "description": "Write the current library to the resolved vault's sibling <stem>.rules.json (portable export). Resolves vault_label against the session. Returns {ok, sidecar_path, count}."
+    },
+    {
+      "name": "minerva_scansort_library_import_from_sidecar",
+      "description": "Read a vault's sibling <stem>.rules.json and upsert each rule into the library by label (last-write-wins). Resolves vault_label against the session. Returns {ok, sidecar_path, imported, conflicts, total_after}."
+    },
+    {
+      "name": "minerva_scansort_process",
+      "description": "Run the path-free pipeline against the current session + enabled library rules. Zero arguments. Iterates every file in every open source, classifies via host.providers.chat, runs the deterministic rule engine, fans out to destinations whose labels match in session, marks unprocessable files in the source manifest. Returns {ok, summary, by_rule, by_destination, items}."
     }
   ],
   "ui": {
