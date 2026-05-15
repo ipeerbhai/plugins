@@ -145,6 +145,70 @@ pub fn state() -> SessionState {
 }
 
 // ---------------------------------------------------------------------------
+// B3 helpers — label resolution for the process() pipeline
+// ---------------------------------------------------------------------------
+
+/// The kind of a resolved destination entry.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EntryKind {
+    Vault,
+    Directory,
+    Source,
+}
+
+/// Resolve a destination label to its `(label, path, kind)` triple.
+///
+/// Searches open_vaults first, then open_dirs.  Source directories are NOT
+/// valid placement destinations, so they are excluded from the search.
+///
+/// Returns `None` when the label is not open as a vault or directory.
+pub fn resolve_label(label: &str) -> Option<(String, PathBuf, EntryKind)> {
+    with_session(|s| {
+        // Check vaults first.
+        if let Some(e) = s.open_vaults.iter().find(|e| e.label == label) {
+            return Some((e.label.clone(), e.path.clone(), EntryKind::Vault));
+        }
+        // Then check directories.
+        if let Some(e) = s.open_dirs.iter().find(|e| e.label == label) {
+            return Some((e.label.clone(), e.path.clone(), EntryKind::Directory));
+        }
+        None
+    })
+}
+
+/// Return all open sources as `(label, path)` pairs, sorted by label.
+///
+/// Used by process() to iterate source directories in deterministic order.
+pub fn open_sources_sorted() -> Vec<(String, PathBuf)> {
+    with_session(|s| {
+        let mut pairs: Vec<(String, PathBuf)> = s
+            .open_sources
+            .iter()
+            .map(|e| (e.label.clone(), e.path.clone()))
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        pairs
+    })
+}
+
+/// Return the set of all currently-open destination labels (vaults + dirs).
+///
+/// Used by should_skip to test whether all previously-recorded target labels
+/// are still open.
+pub fn open_destination_labels() -> std::collections::HashSet<String> {
+    with_session(|s| {
+        let mut set = std::collections::HashSet::new();
+        for e in &s.open_vaults {
+            set.insert(e.label.clone());
+        }
+        for e in &s.open_dirs {
+            set.insert(e.label.clone());
+        }
+        set
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

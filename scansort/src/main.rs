@@ -42,8 +42,10 @@ mod rules;
 mod rules_file;
 mod schema;
 mod library;
+mod process;
 mod session;
 mod source;
+mod source_state;
 mod types;
 mod vault_lifecycle;
 
@@ -2255,6 +2257,51 @@ fn handle_library_disable_rule(params: &Value, id: Value) -> RpcResponse {
     }
 }
 
+// ---------------------------------------------------------------------------
+// B3: process() pipeline handler
+// ---------------------------------------------------------------------------
+
+fn handle_process(
+    id: Value,
+    out: &mut impl Write,
+    lines: &mut impl Iterator<Item = Result<String, io::Error>>,
+    next_id: &mut u64,
+) -> RpcResponse {
+    match process::run(out, lines, next_id, "default") {
+        Err(e) => ok_response(id, tool_err(&e.message)),
+        Ok(result) => {
+            let items_json: Vec<Value> = result.items.iter().map(|item| {
+                let mut obj = json!({
+                    "source_label": item.source_label,
+                    "source_path_relative": item.source_path_relative,
+                    "status": item.status,
+                    "target_labels": item.target_labels,
+                });
+                if let Some(ref rl) = item.rule_label {
+                    obj["rule_label"] = json!(rl);
+                }
+                if let Some(ref r) = item.reason {
+                    obj["reason"] = json!(r);
+                }
+                obj
+            }).collect();
+
+            ok_response(id, tool_ok(json!({
+                "ok": true,
+                "summary": {
+                    "moved": result.moved,
+                    "conflicts": result.conflicts,
+                    "unprocessable": result.unprocessable,
+                    "skipped_already_processed": result.skipped_already_processed,
+                },
+                "by_rule": result.by_rule,
+                "by_destination": result.by_destination,
+                "items": items_json,
+            })))
+        }
+    }
+}
+
 fn main() {
     // Logging goes to stderr so it never pollutes the JSON-RPC stdout channel.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -3205,6 +3252,15 @@ fn main() {
                         },
                     },
                     {
+                        "name": "minerva_scansort_process",
+                        "description": "B3: Path-free process() pipeline. Zero arguments. Reads all state from the in-process session (open sources + open destinations) and the global library (enabled rules). For every file under every open source: (1) skips files already processed (B4 manifest), (2) extracts text, (3) classifies via host.providers.chat, (4) runs the deterministic rule engine, (5) fans out to matching open destinations resolved by label, (6) records per-file outcome in the B4 source state manifest. Returns {ok, summary:{moved,conflicts,unprocessable,skipped_already_processed}, by_rule:{<rule_label>:count}, by_destination:{<dest_label>:count}, items:[{source_label,source_path_relative,status,rule_label?,target_labels,reason?}]}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "required": [],
+                        },
+                    },
+                    {
                         "name": "minerva_scansort_audit_append",
                         "description": "W9: Append one or more rows to the append-only CSV audit log. Creates the file with a header row on first write; never truncates. The toggle (audit_log_enabled) is checked by the panel — call this tool only when the toggle is ON. Non-fatal: if log_path is unwritable, returns {ok:false, error:...} without panicking. W10 MUST treat audit failure as non-fatal. CSV columns: timestamp, event, source_sha256, source_filename, rule_label, destination_id, destination_kind, resolved_path, disposition, detail. Returns {ok, log_path, rows_written}.",
                         "inputSchema": {
@@ -3444,6 +3500,9 @@ fn main() {
                     }
                     "minerva_scansort_library_disable_rule" => {
                         handle_library_disable_rule(&req.params, req.id)
+                    }
+                    "minerva_scansort_process" => {
+                        handle_process(req.id, &mut out, &mut lines, &mut next_id)
                     }
                     other => err_response(req.id, -32601, format!("unknown tool: {other}")),
                 }
