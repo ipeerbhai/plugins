@@ -106,6 +106,19 @@ var _active_vault_path: String = ""
 ## True if a vault is open.
 var _vault_is_open: bool = false
 
+# ---------------------------------------------------------------------------
+# B1: session tracking — labels the panel has registered in the plugin session
+# ---------------------------------------------------------------------------
+
+## Label under which the active vault was registered (empty = none registered).
+var _session_vault_label: String = ""
+
+## Label under which the active source dir was registered (empty = none).
+var _session_source_label: String = ""
+
+## Labels of directory destinations registered this session.
+var _session_dir_labels: Array[String] = []
+
 ## R3: password for the currently open vault (empty if no password set).
 ## Never logged.
 var _vault_password: String = ""
@@ -272,6 +285,28 @@ func _on_panel_loaded(ctx: Dictionary) -> void:
 
 
 func _on_panel_unload() -> void:
+	# B1: close all session entries this panel registered.
+	var conn := _get_connection()
+	if conn != null:
+		if not _session_vault_label.is_empty():
+			await conn.call_tool(
+				"minerva_scansort_session_close_vault",
+				{"label": _session_vault_label},
+			)
+			_session_vault_label = ""
+		if not _session_source_label.is_empty():
+			await conn.call_tool(
+				"minerva_scansort_session_close_source",
+				{"label": _session_source_label},
+			)
+			_session_source_label = ""
+		for dir_label in _session_dir_labels:
+			await conn.call_tool(
+				"minerva_scansort_session_close_directory",
+				{"label": dir_label},
+			)
+		_session_dir_labels.clear()
+
 	if _file_dialog != null and is_instance_valid(_file_dialog):
 		_file_dialog.queue_free()
 	if _password_dialog != null and is_instance_valid(_password_dialog):
@@ -760,8 +795,27 @@ func _on_vault_opened_r2(path: String, open_result: Dictionary) -> void:
 		_status_panel.set_vault(vault_name, 0)
 		_status_panel.set_status("Idle")
 
+	# B1: register this vault in the session.
+	if conn != null:
+		var vault_label: String = path.get_file().get_basename()
+		_session_vault_label = vault_label
+		await conn.call_tool(
+			"minerva_scansort_session_open_vault",
+			{"label": vault_label, "path": path},
+		)
+
 
 func _on_vault_closed_r2() -> void:
+	# B1: deregister vault from session before clearing local state.
+	if not _session_vault_label.is_empty():
+		var conn := _get_connection()
+		if conn != null:
+			await conn.call_tool(
+				"minerva_scansort_session_close_vault",
+				{"label": _session_vault_label},
+			)
+		_session_vault_label = ""
+
 	if _source_tree != null and is_instance_valid(_source_tree):
 		_source_tree.set_provider(null)
 		_source_tree.populate([])
@@ -1459,6 +1513,22 @@ func _do_set_source_dir(conn: Object, path: String) -> void:
 	if _source_tree != null and is_instance_valid(_source_tree) and _source_provider != null:
 		await _source_tree.refresh()
 
+	# B1: register this source directory in the session (close old one first if present).
+	# Label must NOT be a path — use the basename, or a literal fallback for root-like paths.
+	var src_label: String = path.get_file()
+	if src_label.is_empty():
+		src_label = "source"
+	if not _session_source_label.is_empty():
+		await conn.call_tool(
+			"minerva_scansort_session_close_source",
+			{"label": _session_source_label},
+		)
+	_session_source_label = src_label
+	await conn.call_tool(
+		"minerva_scansort_session_open_source",
+		{"label": src_label, "path": path},
+	)
+
 
 ## W5b: per-kind Add button handler — opens the add-destination dialog
 ## pre-set to the given kind ("vault" or "directory").
@@ -1673,6 +1743,16 @@ func _do_add_destination(conn: Object, kind: String, path: String, label: String
 		set_status("ERROR: destination_add failed — %s" % result.get("error", "unknown"))
 		return
 	set_status("Destination added.")
+
+	# B1: register directory destinations in the session.
+	if kind == "directory":
+		var dir_label: String = label if not label.is_empty() else path.get_file()
+		_session_dir_labels.append(dir_label)
+		await conn.call_tool(
+			"minerva_scansort_session_open_directory",
+			{"label": dir_label, "path": path},
+		)
+
 	await _refresh_dest_pane(conn)
 	await _refresh_area_trees(conn)
 

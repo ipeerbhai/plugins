@@ -41,6 +41,7 @@ mod rule_engine;
 mod rules;
 mod rules_file;
 mod schema;
+mod session;
 mod source;
 mod types;
 mod vault_lifecycle;
@@ -1978,6 +1979,107 @@ fn handle_audit_append(params: &Value, id: Value) -> RpcResponse {
     }
 }
 
+// ---------------------------------------------------------------------------
+// B1: Session handlers
+// ---------------------------------------------------------------------------
+
+fn handle_session_open_vault(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    if label.is_empty() {
+        return ok_response(id, tool_err("label is required"));
+    }
+    if path.is_empty() {
+        return ok_response(id, tool_err("path is required"));
+    }
+    match session::add_vault(label, std::path::PathBuf::from(path)) {
+        Ok(()) => ok_response(id, tool_ok(json!({"ok": true, "label": label}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_session_close_vault(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
+    if label.is_empty() {
+        return ok_response(id, tool_err("label is required"));
+    }
+    match session::remove_vault(label) {
+        Ok(()) => ok_response(id, tool_ok(json!({"ok": true}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_session_open_directory(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    if label.is_empty() {
+        return ok_response(id, tool_err("label is required"));
+    }
+    if path.is_empty() {
+        return ok_response(id, tool_err("path is required"));
+    }
+    match session::add_dir(label, std::path::PathBuf::from(path)) {
+        Ok(()) => ok_response(id, tool_ok(json!({"ok": true, "label": label}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_session_close_directory(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
+    if label.is_empty() {
+        return ok_response(id, tool_err("label is required"));
+    }
+    match session::remove_dir(label) {
+        Ok(()) => ok_response(id, tool_ok(json!({"ok": true}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_session_open_source(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    if label.is_empty() {
+        return ok_response(id, tool_err("label is required"));
+    }
+    if path.is_empty() {
+        return ok_response(id, tool_err("path is required"));
+    }
+    match session::add_source(label, std::path::PathBuf::from(path)) {
+        Ok(()) => ok_response(id, tool_ok(json!({"ok": true, "label": label}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_session_close_source(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
+    if label.is_empty() {
+        return ok_response(id, tool_err("label is required"));
+    }
+    match session::remove_source(label) {
+        Ok(()) => ok_response(id, tool_ok(json!({"ok": true}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_session_state(_params: &Value, id: Value) -> RpcResponse {
+    let st = session::state();
+    let vaults: Vec<Value> = st.vaults.iter().map(|l| json!({"label": l})).collect();
+    let dirs: Vec<Value> = st.dirs.iter().map(|l| json!({"label": l})).collect();
+    let sources: Vec<Value> = st.sources.iter().map(|l| json!({"label": l})).collect();
+    ok_response(id, tool_ok(json!({
+        "ok": true,
+        "vaults":  vaults,
+        "dirs":    dirs,
+        "sources": sources,
+    })))
+}
+
 fn main() {
     // Logging goes to stderr so it never pollutes the JSON-RPC stdout channel.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -2747,6 +2849,84 @@ fn main() {
                         },
                     },
                     {
+                        "name": "minerva_scansort_session_open_vault",
+                        "description": "B1: Register an opened vault in the in-process session under a caller-chosen label. Returns {ok, label}. Errors if the label is already open.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "description": "Short human-readable label for this vault (e.g. vault filename stem). Must be unique within the session's vault set."},
+                                "path":  {"type": "string", "description": "Absolute path to the vault file."},
+                            },
+                            "required": ["label", "path"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_session_close_vault",
+                        "description": "B1: Deregister a vault from the in-process session by label. Returns {ok}. Errors if the label is not present.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "description": "Label that was passed to session_open_vault."},
+                            },
+                            "required": ["label"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_session_open_directory",
+                        "description": "B1: Register an opened directory destination in the in-process session under a caller-chosen label. Returns {ok, label}. Errors if the label is already open.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "description": "Short human-readable label for this directory. Must be unique within the session's dirs set."},
+                                "path":  {"type": "string", "description": "Absolute path to the directory."},
+                            },
+                            "required": ["label", "path"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_session_close_directory",
+                        "description": "B1: Deregister a directory from the in-process session by label. Returns {ok}. Errors if the label is not present.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "description": "Label that was passed to session_open_directory."},
+                            },
+                            "required": ["label"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_session_open_source",
+                        "description": "B1: Register the active source directory in the in-process session under a caller-chosen label. Returns {ok, label}. Errors if the label is already open.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "description": "Short human-readable label for this source directory (e.g. its basename). Must be unique within the session's sources set."},
+                                "path":  {"type": "string", "description": "Absolute path to the source directory."},
+                            },
+                            "required": ["label", "path"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_session_close_source",
+                        "description": "B1: Deregister a source directory from the in-process session by label. Returns {ok}. Errors if the label is not present.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "description": "Label that was passed to session_open_source."},
+                            },
+                            "required": ["label"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_session_state",
+                        "description": "B1: Return the current in-process session state — which vaults, directories, and source directories are currently open — as label-only lists. Paths are never included. Returns {ok, vaults: [{label}], dirs: [{label}], sources: [{label}]}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "required": [],
+                        },
+                    },
+                    {
                         "name": "minerva_scansort_audit_append",
                         "description": "W9: Append one or more rows to the append-only CSV audit log. Creates the file with a header row on first write; never truncates. The toggle (audit_log_enabled) is checked by the panel — call this tool only when the toggle is ON. Non-fatal: if log_path is unwritable, returns {ok:false, error:...} without panicking. W10 MUST treat audit failure as non-fatal. CSV columns: timestamp, event, source_sha256, source_filename, rule_label, destination_id, destination_kind, resolved_path, disposition, detail. Returns {ok, log_path, rows_written}.",
                         "inputSchema": {
@@ -2944,6 +3124,27 @@ fn main() {
                     }
                     "minerva_scansort_audit_append" => {
                         handle_audit_append(&req.params, req.id)
+                    }
+                    "minerva_scansort_session_open_vault" => {
+                        handle_session_open_vault(&req.params, req.id)
+                    }
+                    "minerva_scansort_session_close_vault" => {
+                        handle_session_close_vault(&req.params, req.id)
+                    }
+                    "minerva_scansort_session_open_directory" => {
+                        handle_session_open_directory(&req.params, req.id)
+                    }
+                    "minerva_scansort_session_close_directory" => {
+                        handle_session_close_directory(&req.params, req.id)
+                    }
+                    "minerva_scansort_session_open_source" => {
+                        handle_session_open_source(&req.params, req.id)
+                    }
+                    "minerva_scansort_session_close_source" => {
+                        handle_session_close_source(&req.params, req.id)
+                    }
+                    "minerva_scansort_session_state" => {
+                        handle_session_state(&req.params, req.id)
                     }
                     other => err_response(req.id, -32601, format!("unknown tool: {other}")),
                 }
