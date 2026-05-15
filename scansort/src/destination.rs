@@ -132,8 +132,16 @@ pub fn place_on_disk_with_issuer(
         doc_date.to_string()
     };
 
+    // Build template values (only year/date/issuer known here; rest default to "").
+    let tv = TemplateValues {
+        year: &year_val,
+        date: &date_val,
+        issuer,
+        ..TemplateValues::default()
+    };
+
     // Resolve and sanitise subfolder.
-    let resolved_subfolder = resolve_and_sanitise(subfolder, &year_val, &date_val, issuer)?;
+    let resolved_subfolder = resolve_and_sanitise(subfolder, &tv)?;
 
     // Build target directory.
     let target_dir = if resolved_subfolder.is_empty() {
@@ -161,7 +169,7 @@ pub fn place_on_disk_with_issuer(
 
     // Determine the base name (without extension).
     let base_stem: String = match rename_pattern.filter(|p| !p.is_empty()) {
-        Some(pattern) => resolve_and_sanitise(pattern, &year_val, &date_val, issuer)?,
+        Some(pattern) => resolve_and_sanitise(pattern, &tv)?,
         None => src_path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -280,20 +288,55 @@ fn parse_year(doc_date: &str) -> String {
     }
 }
 
-/// Apply `{year}` / `{date}` / `{issuer}` templates to `s`, then sanitise each
-/// `/`-delimited path component so no component is `..` or contains a literal `/`.
+/// All template values used by `resolve_and_sanitise`.
+///
+/// Construct with `TemplateValues { field: value, ..TemplateValues::default() }`.
+/// All fields default to `""` (empty string).
+#[derive(Debug, Clone, Default)]
+pub struct TemplateValues<'a> {
+    pub year: &'a str,
+    pub date: &'a str,
+    pub issuer: &'a str,
+    pub doc_type: &'a str,
+    pub description: &'a str,
+    pub amount: &'a str,
+    pub category: &'a str,
+}
+
+/// Apply template tokens to `s`, then sanitise each `/`-delimited path
+/// component so no component is `..` or contains a literal `/`.
 /// Public for use by the placement engine (W6).
 ///
-/// `{sender}` is accepted as a backward-compat alias for `{issuer}`.
+/// Tokens expanded (in order):
+///   `{year}`, `{date}`, `{issuer}`, `{sender}` (alias for issuer),
+///   `{doc_type}`, `{description}` (capped at 60 chars), `{amount}`, `{category}`
+///
+/// Empty-value fallback: if a field is empty, substitutes `"unknown"`.
 ///
 /// We split on `/`, resolve templates in each component, reject traversal, and
 /// rejoin with the OS separator.
-pub fn resolve_and_sanitise(s: &str, year: &str, date: &str, issuer: &str) -> VaultResult<String> {
+pub fn resolve_and_sanitise(s: &str, vals: &TemplateValues<'_>) -> VaultResult<String> {
+    // Compute per-token effective values (empty → "unknown").
+    let year_v = if vals.year.is_empty() { "unknown" } else { vals.year };
+    let date_v = if vals.date.is_empty() { "unknown" } else { vals.date };
+    let issuer_v = if vals.issuer.is_empty() { "unknown" } else { vals.issuer };
+    let doc_type_v = if vals.doc_type.is_empty() { "unknown" } else { vals.doc_type };
+    // Description: cap at 60 chars before applying the empty fallback.
+    // Use chars().take() to avoid panicking on multi-byte codepoint boundaries.
+    let desc_capped: String = vals.description.chars().take(60).collect();
+    let description_v: &str = if desc_capped.is_empty() { "unknown" } else { &desc_capped };
+    let amount_v = if vals.amount.is_empty() { "unknown" } else { vals.amount };
+    let category_v = if vals.category.is_empty() { "unknown" } else { vals.category };
+
     let replaced = s
-        .replace("{year}", year)
-        .replace("{date}", date)
-        .replace("{issuer}", issuer)
-        .replace("{sender}", issuer); // backward-compat alias
+        .replace("{year}", year_v)
+        .replace("{date}", date_v)
+        .replace("{issuer}", issuer_v)
+        .replace("{sender}", issuer_v) // backward-compat alias
+        .replace("{doc_type}", doc_type_v)
+        .replace("{description}", description_v)
+        .replace("{amount}", amount_v)
+        .replace("{category}", category_v);
 
     // Validate each path component.
     let mut parts: Vec<String> = Vec::new();
@@ -763,5 +806,79 @@ mod tests {
         assert_eq!(parse_year(""), "unknown");
         assert_eq!(parse_year("not-a-date"), "unknown");
         assert_eq!(parse_year("20"), "unknown"); // too short
+    }
+
+    // -----------------------------------------------------------------------
+    // New token tests (P0 bug fix: {doc_type}, {description}, {amount}, {category})
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_doc_type_token() {
+        let vals = TemplateValues {
+            year: "2024",
+            doc_type: "w-2",
+            ..TemplateValues::default()
+        };
+        let result = resolve_and_sanitise("{doc_type}_{year}", &vals).unwrap();
+        assert_eq!(result, "w-2_2024");
+    }
+
+    #[test]
+    fn resolve_description_token_capped_at_60_chars() {
+        let long_desc: String = "a".repeat(100);
+        let vals = TemplateValues {
+            description: &long_desc,
+            year: "2024",
+            ..TemplateValues::default()
+        };
+        let result = resolve_and_sanitise("{description}", &vals).unwrap();
+        assert_eq!(result.len(), 60, "description should be capped at 60 chars");
+        assert_eq!(&result, &"a".repeat(60));
+    }
+
+    #[test]
+    fn resolve_amount_and_category_tokens() {
+        let vals = TemplateValues {
+            amount: "123.45",
+            category: "invoice",
+            ..TemplateValues::default()
+        };
+        let result = resolve_and_sanitise("{category}_{amount}", &vals).unwrap();
+        assert_eq!(result, "invoice_123.45");
+    }
+
+    #[test]
+    fn empty_doc_type_falls_back_to_unknown() {
+        let vals = TemplateValues {
+            doc_type: "",
+            year: "2024",
+            ..TemplateValues::default()
+        };
+        let result = resolve_and_sanitise("{doc_type}_{year}", &vals).unwrap();
+        assert_eq!(result, "unknown_2024");
+    }
+
+    #[test]
+    fn default_rename_pattern_fully_resolves() {
+        use crate::rules_file::DEFAULT_RENAME_PATTERN;
+        let vals = TemplateValues {
+            year: "2024",
+            date: "2024-03-15",
+            issuer: "ACME",
+            doc_type: "invoice",
+            description: "March services",
+            amount: "500.00",
+            category: "business",
+        };
+        let result = resolve_and_sanitise(DEFAULT_RENAME_PATTERN, &vals).unwrap();
+        // No literal {…} tokens should remain.
+        assert!(
+            !result.contains('{'),
+            "unresolved token found in: {result}"
+        );
+        // The pattern is {{date}}_{{issuer}}_{{description}} → check key parts present.
+        assert!(result.contains("2024-03-15"), "date missing in: {result}");
+        assert!(result.contains("ACME"), "issuer missing in: {result}");
+        assert!(result.contains("March services"), "description missing in: {result}");
     }
 }

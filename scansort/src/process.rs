@@ -432,6 +432,8 @@ pub fn run(
                 source_path: abs_path.clone(),
                 rule_snapshot: String::new(),
                 sha256: sha256.clone(),
+                doc_type: classification.doc_type.clone(),
+                amount: classification.amount.clone(),
             };
 
             let placements = placement::fan_out(

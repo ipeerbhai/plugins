@@ -301,15 +301,28 @@ pub fn resolve_template(pattern: &str, classification: &Classification) -> Strin
     };
     let issuer = &classification.issuer;
 
-    // Use the shared helper from destination.rs via a local reimplementation
-    // (destination::resolve_and_sanitise is private). Mirror it inline to
-    // avoid coupling rule_engine to vault I/O details.
-    let replaced = pattern
-        .replace("{year}", &year_val)
-        .replace("{date}", &date_val)
-        .replace("{issuer}", issuer)
-        .replace("{sender}", issuer); // backward-compat alias
-    replaced
+    // Mirror token expansion inline — rule_engine stays pure, no vault I/O coupling.
+    // Empty-value fallback: substitute "unknown" for any empty field.
+    let year_v = if year_val.is_empty() { "unknown".to_string() } else { year_val };
+    let date_v = if date_val.is_empty() { "unknown".to_string() } else { date_val };
+    let issuer_v = if issuer.is_empty() { "unknown" } else { issuer };
+    let doc_type_v = if classification.doc_type.is_empty() { "unknown" } else { &classification.doc_type };
+    // Description: cap at 60 chars before empty fallback.
+    // Use chars().take() to avoid panicking on multi-byte codepoint boundaries.
+    let desc_capped: String = classification.description.chars().take(60).collect();
+    let description_v: &str = if desc_capped.is_empty() { "unknown" } else { &desc_capped };
+    let amount_v = if classification.amount.is_empty() { "unknown" } else { &classification.amount };
+    let category_v = if classification.category.is_empty() { "unknown" } else { &classification.category };
+
+    pattern
+        .replace("{year}", &year_v)
+        .replace("{date}", &date_v)
+        .replace("{issuer}", issuer_v)
+        .replace("{sender}", issuer_v) // backward-compat alias
+        .replace("{doc_type}", doc_type_v)
+        .replace("{description}", description_v)
+        .replace("{amount}", amount_v)
+        .replace("{category}", category_v)
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,6 +1142,29 @@ mod tests {
         let outcome = run(&c, &f, &[rule]);
         assert_eq!(outcome.fired[0].resolved_subfolder, "2024/taxes");
         assert_eq!(outcome.fired[0].resolved_rename_pattern, "2024-03-15_IRS");
+    }
+
+    #[test]
+    fn resolve_template_expands_doc_type_and_description() {
+        let long_desc = "A long description ".repeat(6); // 114 chars — over the 60-char cap
+        let c = Classification {
+            doc_type: "1099".to_string(),
+            description: long_desc.clone(),
+            issuer: "Payer".to_string(),
+            doc_date: "2024-01-01".to_string(),
+            year: 2024,
+            ..Classification::default()
+        };
+        let result = resolve_template("{doc_type}_{description}", &c);
+        // doc_type must appear.
+        assert!(result.contains("1099"), "doc_type missing: {result}");
+        // description must be capped at 60 chars.
+        let desc_part = result.strip_prefix("1099_").unwrap_or(&result);
+        assert_eq!(
+            desc_part.len(),
+            60,
+            "description should be capped at 60 chars, got: {desc_part:?}"
+        );
     }
 
     // =========================================================================

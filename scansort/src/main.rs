@@ -1837,6 +1837,16 @@ fn handle_place_fanout(params: &Value, id: Value) -> RpcResponse {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
+        doc_type: args
+            .get("doc_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        amount: args
+            .get("amount")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
     };
 
     let results = placement::fan_out(
@@ -3083,6 +3093,8 @@ fn main() {
                                 "dhash": {"type": "string", "description": "Perceptual dhash. Default: 0000000000000000."},
                                 "source_path": {"type": "string", "description": "Original source directory path for provenance."},
                                 "rule_snapshot": {"type": "string", "description": "JSON snapshot of the rule that fired."},
+                                "doc_type": {"type": "string", "description": "Short document type string (e.g. 'invoice', 'W-2'). Used for {doc_type} token in rename/subfolder patterns. Default: ''."},
+                                "amount": {"type": "string", "description": "Monetary amount extracted from the document. Used for {amount} token. Default: ''."},
                             },
                             "required": ["file_path", "registry_path", "copy_to"],
                         },

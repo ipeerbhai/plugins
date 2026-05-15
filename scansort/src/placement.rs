@@ -43,7 +43,7 @@
 //! provided for in-process callers (W10 Process All) that want to reuse scan
 //! results within a single run.
 
-use crate::destination::{collision_safe_path, resolve_and_sanitise};
+use crate::destination::{collision_safe_path, resolve_and_sanitise, TemplateValues};
 use crate::destinations::{find_by_id, DestinationRegistry};
 use crate::documents::insert_document;
 use crate::fingerprints::check_sha256 as vault_check_sha256;
@@ -112,6 +112,10 @@ pub struct DocMeta {
     /// Pre-computed content sha256 hex string.  When empty the fan-out will
     /// compute it from `file_path`.
     pub sha256: String,
+    /// Short document type string ("invoice", "W-2", …).  Empty when unknown.
+    pub doc_type: String,
+    /// Monetary amount extracted from the document.  Empty when not present.
+    pub amount: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -234,9 +238,9 @@ fn resolve_directory_target(
     resolved_subfolder: &str,
     resolved_rename_pattern: &str,
     file_path: &str,
-    doc_date: &str,
-    issuer: &str,
+    meta: &DocMeta,
 ) -> VaultResult<PathBuf> {
+    let doc_date = &meta.doc_date;
     // year/date for sanitise pass (tokens already expanded by W3; we still
     // need year/date for the sanitiser to resolve any residual tokens that
     // slipped through, and to strip path-traversal attempts).
@@ -247,10 +251,19 @@ fn resolve_directory_target(
     };
     let date_val = if doc_date.is_empty() { "undated".to_string() } else { doc_date.to_string() };
 
+    let tv = TemplateValues {
+        year: &year_val,
+        date: &date_val,
+        issuer: &meta.issuer,
+        doc_type: &meta.doc_type,
+        description: &meta.description,
+        amount: &meta.amount,
+        category: &meta.category,
+    };
+
     // Sanitise the already-expanded subfolder (guards against ../ injected
     // via rule template values).
-    let sanitised_subfolder =
-        resolve_and_sanitise(resolved_subfolder, &year_val, &date_val, issuer)?;
+    let sanitised_subfolder = resolve_and_sanitise(resolved_subfolder, &tv)?;
 
     // Build target directory.
     let target_dir = if sanitised_subfolder.is_empty() {
@@ -269,7 +282,7 @@ fn resolve_directory_target(
 
     // Determine the base stem (from rename pattern or original filename).
     let base_stem: String = if !resolved_rename_pattern.is_empty() {
-        resolve_and_sanitise(resolved_rename_pattern, &year_val, &date_val, issuer)?
+        resolve_and_sanitise(resolved_rename_pattern, &tv)?
     } else {
         src_path
             .file_stem()
@@ -468,8 +481,7 @@ pub fn fan_out(
                     resolved_subfolder,
                     resolved_rename_pattern,
                     file_path,
-                    &meta.doc_date,
-                    &meta.issuer,
+                    meta,
                 ) {
                     Ok(target_path) => {
                         // Copy the file.
@@ -604,6 +616,8 @@ mod tests {
             source_path: String::new(),
             rule_snapshot: String::new(),
             sha256: sha256.to_string(),
+            doc_type: String::new(),
+            amount: String::new(),
         }
     }
 
