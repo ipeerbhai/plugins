@@ -3,7 +3,7 @@ extends AcceptDialog
 ## Ported from ccsandbox experiments/scansort/scripts/ui/password_dialog.gd.
 ##
 ## Two modes:
-##   SET   — new password + confirm + hint (first-time vault password setup)
+##   SET   — optional new password + confirm + hint (first-time vault password setup)
 ##   ENTER — show hint + single password field (unlock existing vault)
 ##
 ## The caller is responsible for performing the actual MCP tool call
@@ -103,7 +103,7 @@ func _build_set_form() -> void:
 	_password_field = LineEdit.new()
 	_password_field.secret = true
 	_password_field.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_password_field.placeholder_text = "Enter password"
+	_password_field.placeholder_text = "Optional password"
 	pw_row.add_child(_password_field)
 	_vbox.add_child(pw_row)
 
@@ -116,7 +116,7 @@ func _build_set_form() -> void:
 	_confirm_field = LineEdit.new()
 	_confirm_field.secret = true
 	_confirm_field.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_confirm_field.placeholder_text = "Re-enter password"
+	_confirm_field.placeholder_text = "Re-enter optional password"
 	cf_row.add_child(_confirm_field)
 	_vbox.add_child(cf_row)
 
@@ -171,11 +171,6 @@ func _on_ok() -> void:
 		var pw: String = _password_field.text if _password_field != null else ""
 		var confirm: String = _confirm_field.text if _confirm_field != null else ""
 		var hint: String = _hint_field.text.strip_edges() if _hint_field != null else ""
-
-		if pw.is_empty():
-			_show_error("Password cannot be empty.")
-			popup_centered()
-			return
 
 		if pw != confirm:
 			_show_error("Passwords do not match.")

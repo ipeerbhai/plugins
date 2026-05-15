@@ -162,7 +162,8 @@ var _dest_containers:  Array = []
 var _dest_scroll_content: VBoxContainer = null
 
 ## W5: registry_path required by destination_add/list/remove tools.
-## Provided at vault-open time (or via settings). Empty = feature unavailable.
+## Lazily defaults to a machine-local per-user file so directory destinations
+## can be managed before any vault is open.
 var _registry_path: String = ""
 
 ## W5b: Two-area splitter layout — Vault area + Directory area, each backed
@@ -205,6 +206,7 @@ var _process_cancelled: bool = false
 ## Classification confidence below which a processed doc is flagged as
 ## low-confidence.
 const LOW_CONFIDENCE_THRESHOLD := 0.5
+const DESTINATION_REGISTRY_FILENAME := "dest_registry.json"
 var _status_panel: HBoxContainer = null
 
 ## U7: per-run counters shared across concurrent coroutines (Dictionary reference
@@ -304,9 +306,18 @@ func _build_ui() -> void:
 	source_col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	source_col.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	source_col.custom_minimum_size.x = 200
+	var source_hdr := HBoxContainer.new()
 	var source_header := Label.new()
 	source_header.text = "Source"
-	source_col.add_child(source_header)
+	source_header.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	source_hdr.add_child(source_header)
+	var source_add_btn := Button.new()
+	source_add_btn.text = "+"
+	source_add_btn.tooltip_text = "Pick the incoming source directory…"
+	source_add_btn.flat = false
+	source_add_btn.pressed.connect(_on_source_add_pressed)
+	source_hdr.add_child(source_add_btn)
+	source_col.add_child(source_hdr)
 	_source_tree = _ScanTree.new()
 	source_col.add_child(_source_tree)
 	columns.add_child(source_col)
@@ -341,6 +352,7 @@ func _build_ui() -> void:
 	_extract_marked_menu.text = "Extract Marked To"
 	_extract_marked_menu.tooltip_text = "Extract checked vault documents to a registered directory destination."
 	_extract_marked_menu.disabled = true
+	_extract_marked_menu.size_flags_horizontal = Control.SIZE_SHRINK_END
 	var extract_popup := _extract_marked_menu.get_popup()
 	extract_popup.about_to_popup.connect(_populate_extract_marked_popup)
 	extract_popup.id_pressed.connect(_on_extract_marked_menu_id_pressed)
@@ -349,7 +361,8 @@ func _build_ui() -> void:
 	vault_add_btn.text = "+"
 	vault_add_btn.tooltip_text = "Add a vault destination…"
 	vault_add_btn.flat = false
-	vault_add_btn.pressed.connect(func() -> void: _on_dest_add_for_kind("vault"))
+	vault_add_btn.custom_minimum_size.x = 30
+	vault_add_btn.pressed.connect(_on_dest_add_for_kind.bind("vault"))
 	vault_hdr.add_child(vault_add_btn)
 	vault_area.add_child(vault_hdr)
 
@@ -386,7 +399,8 @@ func _build_ui() -> void:
 	dir_add_btn.text = "+"
 	dir_add_btn.tooltip_text = "Add a directory destination…"
 	dir_add_btn.flat = false
-	dir_add_btn.pressed.connect(func() -> void: _on_dest_add_for_kind("directory"))
+	dir_add_btn.custom_minimum_size.x = 30
+	dir_add_btn.pressed.connect(_on_dest_add_for_kind.bind("directory"))
 	dir_hdr.add_child(dir_add_btn)
 	dir_area.add_child(dir_hdr)
 
@@ -709,10 +723,10 @@ func _on_vault_opened_r2(path: String, open_result: Dictionary) -> void:
 		_source_tree.set_provider(_source_provider)
 		await _source_tree.refresh()
 
-	# W5: derive registry_path from vault path (sibling .registry.json).
-	var base_dir: String = path.get_base_dir()
-	var stem: String     = path.get_file().get_basename()
-	_registry_path = "%s/%s.registry.json" % [base_dir, stem]
+	# W5: destination routing is machine-local, not vault-local.  Keep any
+	# registry path already chosen by no-vault directory setup; otherwise use
+	# the default per-user destination registry.
+	_ensure_destination_registry_path()
 
 	# W5c: auto-register the open vault as a machine-local routing target.
 	# This is idempotent — "already registered" errors are treated as success.
@@ -945,10 +959,10 @@ func _refresh_area_trees(conn: Object) -> void:
 ## W5b: handler for dest_button_pressed emitted by either area tree.
 ## Resolves dest_id and dispatches to the appropriate action.
 func _on_area_dest_button_pressed(dest_id: String, action: String) -> void:
-	if not _vault_is_open:
-		return
 	var conn = _get_connection()
 	if conn == null:
+		return
+	if not _ensure_destination_registry_path():
 		return
 	# Find the destination dict for label + locked state from either provider.
 	var dest_dict: Dictionary = _find_dest_by_id(dest_id)
@@ -1409,23 +1423,61 @@ func _find_item_recursive(item: TreeItem, key: String) -> TreeItem:
 	return null
 
 
+## "+" on the Source pane: picks an incoming directory and calls set_source_dir.
+## Refreshes the source tree if a provider is bound (i.e. a vault is open).
+func _on_source_add_pressed() -> void:
+	var conn = _get_connection()
+	if conn == null:
+		set_status("ERROR: scansort plugin not running.")
+		return
+
+	var picker := FileDialog.new()
+	_UiScale.apply_to(picker)
+	picker.access = FileDialog.ACCESS_FILESYSTEM
+	picker.file_mode = FileDialog.FILE_MODE_OPEN_DIR
+	picker.title = "Select Incoming Source Directory"
+
+	picker.dir_selected.connect(func(p: String) -> void:
+		picker.queue_free()
+		_do_set_source_dir(conn, p)
+	)
+	picker.canceled.connect(func() -> void: picker.queue_free())
+	add_child(picker)
+	picker.popup_centered(Vector2i(700, 500))
+
+
+func _do_set_source_dir(conn: Object, path: String) -> void:
+	set_status("Setting source directory…")
+	var result: Dictionary = await conn.call_tool(
+		"minerva_scansort_set_source_dir",
+		{"path": path, "recursive": true},
+	)
+	if not result.get("ok", false):
+		set_status("Set source directory failed: %s" % result.get("error", "unknown"))
+		return
+	set_status("Source directory: %s" % path)
+	if _source_tree != null and is_instance_valid(_source_tree) and _source_provider != null:
+		await _source_tree.refresh()
+
+
 ## W5b: per-kind Add button handler — opens the add-destination dialog
 ## pre-set to the given kind ("vault" or "directory").
 func _on_dest_add_for_kind(kind: String) -> void:
-	if not _vault_is_open:
-		set_status("Open a vault first.")
+	if kind == "vault" and not _vault_is_open:
+		_on_new_vault_pressed()
 		return
 	var conn = _get_connection()
 	if conn == null:
 		set_status("ERROR: scansort plugin not running.")
 		return
-	if _registry_path.is_empty():
-		set_status("No registry path — open a vault first.")
+	if not _ensure_destination_registry_path():
+		set_status("No destination registry path.")
 		return
 
+	set_status("Adding %s destination..." % ("vault" if kind == "vault" else "directory"))
 	var dlg := AcceptDialog.new()
 	dlg.title = "Add %s Destination" % ("Vault" if kind == "vault" else "Directory")
-	dlg.min_size = Vector2i(440, 180)
+	dlg.min_size = Vector2i(520, 220)
 	_UiScale.apply_to(dlg)
 
 	var vbox := VBoxContainer.new()
@@ -1498,20 +1550,17 @@ func _on_dest_add_for_kind(kind: String) -> void:
 		dlg.queue_free()
 	)
 	dlg.canceled.connect(func() -> void: dlg.queue_free())
-	dlg.popup_centered()
+	dlg.popup_centered(Vector2i(520, 220))
 
 
 ## "+" add-destination button handler. Shows a simple dialog to pick kind + path.
 func _on_dest_add_pressed() -> void:
-	if not _vault_is_open:
-		set_status("Open a vault first.")
-		return
 	var conn = _get_connection()
 	if conn == null:
 		set_status("ERROR: scansort plugin not running.")
 		return
-	if _registry_path.is_empty():
-		set_status("No registry path — open a vault first.")
+	if not _ensure_destination_registry_path():
+		set_status("No destination registry path.")
 		return
 
 	# Build a simple inline add-destination dialog (AcceptDialog + VBoxContainer).
@@ -1607,6 +1656,9 @@ func _on_dest_add_pressed() -> void:
 
 ## Call destination_add then refresh the pane.
 func _do_add_destination(conn: Object, kind: String, path: String, label: String) -> void:
+	if not _ensure_destination_registry_path():
+		set_status("No destination registry path.")
+		return
 	set_status("Adding destination…")
 	var result: Dictionary = await conn.call_tool(
 		"minerva_scansort_destination_add",
@@ -1627,12 +1679,10 @@ func _do_add_destination(conn: Object, kind: String, path: String, label: String
 
 ## "×" remove-destination button handler.
 func _on_dest_remove_pressed(dest_id: String) -> void:
-	if not _vault_is_open:
-		return
 	var conn = _get_connection()
 	if conn == null:
 		return
-	if _registry_path.is_empty():
+	if not _ensure_destination_registry_path():
 		return
 
 	set_status("Removing destination…")
@@ -1655,12 +1705,10 @@ func _on_dest_remove_pressed(dest_id: String) -> void:
 ## Called when the user clicks the ⟳ button on a destination's header.
 ## MUST show a confirm dialog before doing anything destructive.
 func _on_dest_reprocess_pressed(dest_id: String, dest_label: String) -> void:
-	if not _vault_is_open:
-		return
 	var conn = _get_connection()
 	if conn == null:
 		return
-	if _registry_path.is_empty():
+	if not _ensure_destination_registry_path():
 		return
 
 	# Show confirm dialog — do NOT call the backend without explicit user confirmation.
@@ -1713,12 +1761,10 @@ func _on_dest_reprocess_pressed(dest_id: String, dest_label: String) -> void:
 ## W8: Locked toggle handler — calls set_destination_locked and updates the
 ## Reprocess button's disabled state immediately (no full pane refresh needed).
 func _on_dest_locked_toggled(dest_id: String, locked: bool, reprocess_btn: Button) -> void:
-	if not _vault_is_open:
-		return
 	var conn = _get_connection()
 	if conn == null:
 		return
-	if _registry_path.is_empty():
+	if not _ensure_destination_registry_path():
 		return
 
 	var result: Dictionary = await conn.call_tool(
@@ -2582,6 +2628,31 @@ func _vault_rules_path() -> String:
 ## it survives across vaults and across project tree moves.
 func _library_rules_path() -> String:
 	return OS.get_user_data_dir() + "/scansort_rules.json"
+
+
+## Machine-local destination registry path.  This is intentionally not stored
+## next to a vault: directories can be configured before any vault is open.
+func _default_destination_registry_path() -> String:
+	var env_path: String = OS.get_environment("SCANSORT_DESTINATION_REGISTRY")
+	if env_path.is_empty():
+		env_path = OS.get_environment("SCANSORT_DEST_REGISTRY")
+	if not env_path.is_empty():
+		return env_path
+
+	var user_dir: String = OS.get_user_data_dir()
+	if not user_dir.is_empty():
+		return user_dir.path_join(DESTINATION_REGISTRY_FILENAME)
+
+	var home_dir: String = OS.get_environment("HOME")
+	if not home_dir.is_empty():
+		return home_dir.path_join(".config").path_join("scansort").path_join(DESTINATION_REGISTRY_FILENAME)
+	return "/tmp/%s" % DESTINATION_REGISTRY_FILENAME
+
+
+func _ensure_destination_registry_path() -> bool:
+	if _registry_path.is_empty():
+		_registry_path = _default_destination_registry_path()
+	return not _registry_path.is_empty()
 
 
 ## Called when user picks "Vault Rules Editor…" from the File menu (id 4).
