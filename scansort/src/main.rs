@@ -41,6 +41,7 @@ mod rule_engine;
 mod rules;
 mod rules_file;
 mod schema;
+mod library;
 mod session;
 mod source;
 mod types;
@@ -2080,6 +2081,180 @@ fn handle_session_state(_params: &Value, id: Value) -> RpcResponse {
     })))
 }
 
+// ---------------------------------------------------------------------------
+// B2: Library handlers — path-free global rules library
+// ---------------------------------------------------------------------------
+
+fn handle_library_insert_rule(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
+    if label.is_empty() {
+        return ok_response(id, tool_err("label is required"));
+    }
+    let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let instruction = args.get("instruction").and_then(|v| v.as_str()).unwrap_or("");
+    let signals: Vec<String> = args.get("signals")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let subfolder = args.get("subfolder").and_then(|v| v.as_str()).unwrap_or("");
+    let rename_pattern = args.get("rename_pattern").and_then(|v| v.as_str()).unwrap_or("");
+    let confidence_threshold = args.get("confidence_threshold").and_then(|v| v.as_f64()).unwrap_or(0.6);
+    let encrypt = args.get("encrypt").and_then(|v| v.as_bool()).unwrap_or(false);
+    let enabled = args.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    let is_default = args.get("is_default").and_then(|v| v.as_bool()).unwrap_or(false);
+    let conditions: Option<types::ConditionNode> = args.get("conditions")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let exceptions: Option<types::ConditionNode> = args.get("exceptions")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let order = args.get("order").and_then(|v| v.as_i64()).unwrap_or(0);
+    let stop_processing = args.get("stop_processing").and_then(|v| v.as_bool()).unwrap_or(false);
+    let copy_to: Vec<String> = args.get("copy_to")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    let rule = rules_file::FileRule {
+        label: label.to_string(),
+        name: name.to_string(),
+        instruction: instruction.to_string(),
+        signals,
+        subfolder: subfolder.to_string(),
+        rename_pattern: rename_pattern.to_string(),
+        confidence_threshold,
+        encrypt,
+        enabled,
+        is_default,
+        conditions,
+        exceptions,
+        order,
+        stop_processing,
+        copy_to,
+    };
+    match library::library_insert(rule) {
+        Ok(r) => match serde_json::to_value(&r) {
+            Ok(v) => ok_response(id, tool_ok(json!({"ok": true, "rule": v}))),
+            Err(e) => ok_response(id, tool_err(&e.to_string())),
+        },
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_library_list_rules(_params: &Value, id: Value) -> RpcResponse {
+    match library::library_list() {
+        Ok(rules) => match serde_json::to_value(&rules) {
+            Ok(v) => ok_response(id, tool_ok(json!({"ok": true, "rules": v, "count": rules.len()}))),
+            Err(e) => ok_response(id, tool_err(&e.to_string())),
+        },
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_library_get_rule(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
+    if label.is_empty() {
+        return ok_response(id, tool_err("label is required"));
+    }
+    match library::library_get(label) {
+        Ok(Some(r)) => match serde_json::to_value(&r) {
+            Ok(v) => ok_response(id, tool_ok(json!({"ok": true, "rule": v}))),
+            Err(e) => ok_response(id, tool_err(&e.to_string())),
+        },
+        Ok(None) => ok_response(id, tool_ok(json!({"ok": false, "error": format!("Rule not found: {label}")}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_library_update_rule(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
+    if label.is_empty() {
+        return ok_response(id, tool_err("label is required"));
+    }
+
+    // Load current rule, apply partial field updates, save back.
+    let mut file = match library::library_load() {
+        Ok(f) => f,
+        Err(e) => return ok_response(id, tool_err(&e.message)),
+    };
+    let idx = match rules_file::index_of(&file, label) {
+        Some(i) => i,
+        None => return ok_response(id, tool_ok(json!({"ok": false, "error": format!("Rule not found: {label}")}))),
+    };
+    let rule = &mut file.rules[idx];
+
+    if let Some(v) = args.get("name").and_then(|x| x.as_str()) { rule.name = v.to_string(); }
+    if let Some(v) = args.get("instruction").and_then(|x| x.as_str()) { rule.instruction = v.to_string(); }
+    if let Some(v) = args.get("subfolder").and_then(|x| x.as_str()) { rule.subfolder = v.to_string(); }
+    if let Some(v) = args.get("rename_pattern").and_then(|x| x.as_str()) { rule.rename_pattern = v.to_string(); }
+    if let Some(v) = args.get("confidence_threshold").and_then(|x| x.as_f64()) { rule.confidence_threshold = v; }
+    if let Some(v) = args.get("encrypt").and_then(|x| x.as_bool()) { rule.encrypt = v; }
+    if let Some(v) = args.get("enabled").and_then(|x| x.as_bool()) { rule.enabled = v; }
+    if let Some(v) = args.get("is_default").and_then(|x| x.as_bool()) { rule.is_default = v; }
+    if let Some(v) = args.get("signals").and_then(|x| x.as_array()) {
+        rule.signals = v.iter().filter_map(|s| s.as_str().map(String::from)).collect();
+    }
+    if let Some(v) = args.get("conditions") {
+        rule.conditions = serde_json::from_value(v.clone()).ok();
+    }
+    if let Some(v) = args.get("exceptions") {
+        rule.exceptions = serde_json::from_value(v.clone()).ok();
+    }
+    if let Some(v) = args.get("order").and_then(|x| x.as_i64()) { rule.order = v; }
+    if let Some(v) = args.get("stop_processing").and_then(|x| x.as_bool()) { rule.stop_processing = v; }
+    if let Some(v) = args.get("copy_to").and_then(|x| x.as_array()) {
+        rule.copy_to = v.iter().filter_map(|s| s.as_str().map(String::from)).collect();
+    }
+
+    let updated_rule = file.rules[idx].clone();
+    if let Err(e) = library::library_save(&file) {
+        return ok_response(id, tool_err(&e.message));
+    }
+    match serde_json::to_value(&updated_rule) {
+        Ok(v) => ok_response(id, tool_ok(json!({"ok": true, "rule": v}))),
+        Err(e) => ok_response(id, tool_err(&e.to_string())),
+    }
+}
+
+fn handle_library_delete_rule(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
+    if label.is_empty() {
+        return ok_response(id, tool_err("label is required"));
+    }
+    match library::library_delete(label) {
+        Ok(deleted) => ok_response(id, tool_ok(json!({"ok": true, "deleted": deleted}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_library_enable_rule(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
+    if label.is_empty() {
+        return ok_response(id, tool_err("label is required"));
+    }
+    match library::library_set_enabled(label, true) {
+        Ok(true) => ok_response(id, tool_ok(json!({"ok": true, "enabled": true}))),
+        Ok(false) => ok_response(id, tool_ok(json!({"ok": false, "error": format!("Rule not found: {label}")}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_library_disable_rule(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
+    if label.is_empty() {
+        return ok_response(id, tool_err("label is required"));
+    }
+    match library::library_set_enabled(label, false) {
+        Ok(true) => ok_response(id, tool_ok(json!({"ok": true, "enabled": false}))),
+        Ok(false) => ok_response(id, tool_ok(json!({"ok": false, "error": format!("Rule not found: {label}")}))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
 fn main() {
     // Logging goes to stderr so it never pollutes the JSON-RPC stdout channel.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -2927,6 +3102,109 @@ fn main() {
                         },
                     },
                     {
+                        "name": "minerva_scansort_library_insert_rule",
+                        "description": "B2: Upsert a rule into the global library (OS app-data path, no vault required). If a rule with the same label exists it is replaced. Returns {ok, rule}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "label":                {"type": "string",  "description": "Unique rule label (primary key). Required."},
+                                "name":                 {"type": "string",  "description": "Human-readable display name."},
+                                "instruction":          {"type": "string",  "description": "LLM classification instruction."},
+                                "signals":              {"type": "array",   "items": {"type": "string"}, "description": "Keywords / signals that trigger this rule."},
+                                "subfolder":            {"type": "string",  "description": "Destination subfolder override."},
+                                "rename_pattern":       {"type": "string",  "description": "Output filename pattern (e.g. {date}_{issuer}_{description})."},
+                                "confidence_threshold": {"type": "number",  "description": "Minimum LLM confidence to apply the rule (0.0–1.0, default 0.6)."},
+                                "encrypt":              {"type": "boolean", "description": "Encrypt matching documents."},
+                                "enabled":              {"type": "boolean", "description": "Whether the rule is active (default true)."},
+                                "is_default":           {"type": "boolean", "description": "Mark as the catch-all default rule."},
+                                "order":                {"type": "integer", "description": "Evaluation order — lower values sort first."},
+                                "stop_processing":      {"type": "boolean", "description": "Stop evaluating subsequent rules after this one matches."},
+                                "copy_to":              {"type": "array",   "items": {"type": "string"}, "description": "Additional destination IDs to copy the document to."},
+                                "conditions":           {"type": "object",  "description": "Deterministic gate (ConditionNode) evaluated before LLM classification."},
+                                "exceptions":           {"type": "object",  "description": "When this evaluates true, the rule match is negated."},
+                            },
+                            "required": ["label"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_library_list_rules",
+                        "description": "B2: List all rules in the global library in stable insertion order. Returns {ok, rules: [FileRule], count}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "required": [],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_library_get_rule",
+                        "description": "B2: Get a single rule from the global library by label. Returns {ok:true, rule} if found or {ok:false, error} if not found.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "description": "Label of the rule to retrieve."},
+                            },
+                            "required": ["label"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_library_update_rule",
+                        "description": "B2: Apply partial field updates to a rule in the global library by label. Only provided fields are changed. Returns {ok:true, rule} if found or {ok:false, error} if not found.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "label":                {"type": "string",  "description": "Label of the rule to update. Required."},
+                                "name":                 {"type": "string"},
+                                "instruction":          {"type": "string"},
+                                "signals":              {"type": "array", "items": {"type": "string"}},
+                                "subfolder":            {"type": "string"},
+                                "rename_pattern":       {"type": "string"},
+                                "confidence_threshold": {"type": "number"},
+                                "encrypt":              {"type": "boolean"},
+                                "enabled":              {"type": "boolean"},
+                                "is_default":           {"type": "boolean"},
+                                "order":                {"type": "integer"},
+                                "stop_processing":      {"type": "boolean"},
+                                "copy_to":              {"type": "array", "items": {"type": "string"}},
+                                "conditions":           {"type": "object"},
+                                "exceptions":           {"type": "object"},
+                            },
+                            "required": ["label"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_library_delete_rule",
+                        "description": "B2: Remove a rule from the global library by label. Returns {ok:true, deleted:true} if removed, {ok:true, deleted:false} if the label was not found.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "description": "Label of the rule to delete."},
+                            },
+                            "required": ["label"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_library_enable_rule",
+                        "description": "B2: Set enabled=true on a rule in the global library by label. Returns {ok:true, enabled:true} if found, {ok:false, error} if not found.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "description": "Label of the rule to enable."},
+                            },
+                            "required": ["label"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_library_disable_rule",
+                        "description": "B2: Set enabled=false on a rule in the global library by label. Returns {ok:true, enabled:false} if found, {ok:false, error} if not found.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "description": "Label of the rule to disable."},
+                            },
+                            "required": ["label"],
+                        },
+                    },
+                    {
                         "name": "minerva_scansort_audit_append",
                         "description": "W9: Append one or more rows to the append-only CSV audit log. Creates the file with a header row on first write; never truncates. The toggle (audit_log_enabled) is checked by the panel — call this tool only when the toggle is ON. Non-fatal: if log_path is unwritable, returns {ok:false, error:...} without panicking. W10 MUST treat audit failure as non-fatal. CSV columns: timestamp, event, source_sha256, source_filename, rule_label, destination_id, destination_kind, resolved_path, disposition, detail. Returns {ok, log_path, rows_written}.",
                         "inputSchema": {
@@ -3145,6 +3423,27 @@ fn main() {
                     }
                     "minerva_scansort_session_state" => {
                         handle_session_state(&req.params, req.id)
+                    }
+                    "minerva_scansort_library_insert_rule" => {
+                        handle_library_insert_rule(&req.params, req.id)
+                    }
+                    "minerva_scansort_library_list_rules" => {
+                        handle_library_list_rules(&req.params, req.id)
+                    }
+                    "minerva_scansort_library_get_rule" => {
+                        handle_library_get_rule(&req.params, req.id)
+                    }
+                    "minerva_scansort_library_update_rule" => {
+                        handle_library_update_rule(&req.params, req.id)
+                    }
+                    "minerva_scansort_library_delete_rule" => {
+                        handle_library_delete_rule(&req.params, req.id)
+                    }
+                    "minerva_scansort_library_enable_rule" => {
+                        handle_library_enable_rule(&req.params, req.id)
+                    }
+                    "minerva_scansort_library_disable_rule" => {
+                        handle_library_disable_rule(&req.params, req.id)
                     }
                     other => err_response(req.id, -32601, format!("unknown tool: {other}")),
                 }
