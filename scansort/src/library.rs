@@ -4,7 +4,7 @@
 //! Resolved via the `directories` crate using:
 //!   qualifier = "" (empty), organization = "Minerva", application = "Scansort"
 //!
-//! Seven MCP tools in main.rs wrap the functions here:
+//! Nine MCP tools in main.rs wrap the functions here:
 //!   • minerva_scansort_library_insert_rule
 //!   • minerva_scansort_library_list_rules
 //!   • minerva_scansort_library_get_rule
@@ -12,9 +12,14 @@
 //!   • minerva_scansort_library_delete_rule
 //!   • minerva_scansort_library_enable_rule
 //!   • minerva_scansort_library_disable_rule
+//!   • minerva_scansort_library_export_to_sidecar  (B5)
+//!   • minerva_scansort_library_import_from_sidecar (B5)
 //!
 //! Design notes:
-//!   - No caching: every call hits the file. (B7 adds caching/hot-reload.)
+//!   - B7 cache: `CACHE` holds an `Option<CachedLibrary>` protected by a
+//!     `Mutex` inside an `OnceLock`. Every read checks the file's mtime;
+//!     on change (or empty cache) the file is reloaded. Every write updates
+//!     the cache so in-process changes are immediately consistent.
 //!   - Parent dirs are created on first save via `fs::create_dir_all`.
 //!   - Test builds use a Mutex-guarded path override to isolate from the real
 //!     OS data directory. Production builds always use `directories`.
@@ -24,6 +29,8 @@ use crate::types::{VaultError, VaultResult};
 use directories::ProjectDirs;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 // ---------------------------------------------------------------------------
 // Path resolution
@@ -62,34 +69,193 @@ pub fn library_path() -> VaultResult<PathBuf> {
 static TEST_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
 /// Point the library at a tmpdir for testing. Must be cleared after use.
+/// Also clears the B7 cache so the new path starts fresh.
 #[cfg(test)]
 pub fn set_library_path_for_test(path: PathBuf) {
     *TEST_PATH.lock().unwrap() = Some(path);
+    // Clear the cache so the next read uses the new test path.
+    *cache().lock().unwrap() = None;
 }
 
 /// Clear the test override, restoring normal `directories`-based resolution.
+/// Also clears the B7 cache so no stale test data bleeds into later tests.
 #[cfg(test)]
 pub fn clear_library_path_for_test() {
     *TEST_PATH.lock().unwrap() = None;
+    *cache().lock().unwrap() = None;
 }
 
 // ---------------------------------------------------------------------------
-// Thin wrappers — load / save
+// B7: In-memory cache with mtime-based hot-reload
 // ---------------------------------------------------------------------------
 
-/// Load the library file, or return an empty default if it doesn't exist yet.
+/// In-memory snapshot of the library file with the mtime at which it was read.
+struct CachedLibrary {
+    mtime: SystemTime,
+    file: RulesFile,
+}
+
+/// Global cache — initialized once; the inner `Option` is `None` until the
+/// first read, and is cleared whenever the path changes (test path override).
+static CACHE: OnceLock<Mutex<Option<CachedLibrary>>> = OnceLock::new();
+
+/// Accessor — always returns the same `Mutex<Option<CachedLibrary>>`.
+fn cache() -> &'static Mutex<Option<CachedLibrary>> {
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+// ---------------------------------------------------------------------------
+// Thin wrappers — load / save (B7-cached)
+// ---------------------------------------------------------------------------
+
+/// Load the library file with mtime-based hot-reload caching.
+///
+/// Algorithm:
+/// 1. stat(library_path). On IO error (file missing) → return `RulesFile::default()`,
+///    clear cache, log a one-time warning.
+/// 2. Compare file mtime to cache mtime.
+///    - Cache empty OR mtime changed → reload from disk, update cache.
+///    - mtime unchanged → return cached clone.
+/// 3. On disk-parse failure (corrupt JSON mid-write) → keep cached value,
+///    log warning, return cached clone. Next read retries.
 pub fn library_load() -> VaultResult<RulesFile> {
     let path = library_path()?;
-    rules_file::load_or_init(&path)
+
+    // Stat the file first.
+    let meta = match fs::metadata(&path) {
+        Ok(m) => m,
+        Err(_) => {
+            // File missing (or unreadable). Return default; clear cache.
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!(
+                    "library_load: file not found at {}; returning empty defaults",
+                    path.display()
+                );
+            }
+            *cache().lock().unwrap() = None;
+            return Ok(RulesFile::default());
+        }
+    };
+
+    let file_mtime = match meta.modified() {
+        Ok(t) => t,
+        Err(_) => {
+            // Platform doesn't support mtime — fall through to always-reload.
+            SystemTime::UNIX_EPOCH
+        }
+    };
+
+    let mut guard = cache().lock().unwrap();
+
+    // Cache hit when mtime matches.
+    if let Some(ref cached) = *guard {
+        if cached.mtime == file_mtime {
+            return Ok(cached.file.clone());
+        }
+    }
+
+    // Cache miss — reload from disk.
+    match rules_file::load_or_init(&path) {
+        Ok(file) => {
+            *guard = Some(CachedLibrary {
+                mtime: file_mtime,
+                file: file.clone(),
+            });
+            Ok(file)
+        }
+        Err(e) => {
+            // Corrupt JSON mid-write: keep the prior cached value if any.
+            if let Some(ref cached) = *guard {
+                log::warn!(
+                    "library_load: disk read failed ({}); returning stale cached value",
+                    e.message
+                );
+                return Ok(cached.file.clone());
+            }
+            Err(e)
+        }
+    }
 }
 
-/// Save the library file. Creates parent directories as needed.
+/// Save the library file and update the in-memory cache so subsequent reads
+/// see the new content without a disk round-trip.
 pub fn library_save(file: &RulesFile) -> VaultResult<()> {
     let path = library_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    rules_file::save(&path, file)
+    rules_file::save(&path, file)?;
+    // Update cache with the freshly written mtime.
+    if let Ok(meta) = fs::metadata(&path) {
+        if let Ok(mtime) = meta.modified() {
+            *cache().lock().unwrap() = Some(CachedLibrary {
+                mtime,
+                file: file.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// B5: Sidecar export / import helpers
+// ---------------------------------------------------------------------------
+
+/// Export the global library to the per-vault sidecar path
+/// (`<vault-stem>.rules.json` next to the vault).
+///
+/// `vault_path` must be a valid path to the vault file (existence not
+/// required — only the path shape is used for `sibling_path`).
+/// Returns `(sidecar_path, count)` on success.
+pub fn library_export_to_sidecar(vault_path: &std::path::Path) -> VaultResult<(PathBuf, usize)> {
+    let lib = library_load()?;
+    let count = lib.rules.len();
+    let sidecar = rules_file::sibling_path(vault_path);
+    // Write directly — sidecar is NOT cached through the library cache.
+    rules_file::save(&sidecar, &lib)?;
+    Ok((sidecar, count))
+}
+
+/// Import rules from the per-vault sidecar into the global library.
+///
+/// Each rule in the sidecar is upserted (last-write-wins). Returns
+/// `(sidecar_path, imported, conflicts, total_after)` where `conflicts` is
+/// the number of rules whose label already existed in the library with
+/// *different* content before the import.
+pub fn library_import_from_sidecar(
+    vault_path: &std::path::Path,
+) -> VaultResult<(PathBuf, usize, usize, usize)> {
+    let sidecar = rules_file::sibling_path(vault_path);
+    if !sidecar.exists() {
+        return Err(VaultError::new(format!(
+            "sidecar not found at {}",
+            sidecar.display()
+        )));
+    }
+    let sidecar_file = rules_file::load(&sidecar)?;
+    let imported = sidecar_file.rules.len();
+
+    // Load the current library to check for conflicts before overwriting.
+    let current = library_load()?;
+
+    let mut conflicts: usize = 0;
+    for incoming in &sidecar_file.rules {
+        if let Some(existing) = rules_file::find_by_label(&current.rules, &incoming.label) {
+            // Conflict = same label, different content (compare by serialization).
+            let ex_json = serde_json::to_string(existing).unwrap_or_default();
+            let in_json = serde_json::to_string(incoming).unwrap_or_default();
+            if ex_json != in_json {
+                conflicts += 1;
+            }
+        }
+        // Upsert into the library (last-write-wins).
+        library_insert(incoming.clone())?;
+    }
+
+    let total_after = library_list()?.len();
+    Ok((sidecar, imported, conflicts, total_after))
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +538,239 @@ mod tests {
             assert_eq!(rules2.len(), 2);
             assert_eq!(rules2[0].label, "first");
             assert_eq!(rules2[1].label, "third");
+
+            clear_library_path_for_test();
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // B7 and B5 sub-tests — called here so they share the same
+        // serialized execution context as the existing 8 scenarios above.
+        b7_cache_subtests();
+        b5_sidecar_subtests();
+    }
+
+    // ----------------------------------------------------------------
+    // B7: Cache hot-reload tests — run inside library_all_tests to avoid
+    // Mutex / CACHE contention with parallel test runners.
+    // Call this from library_all_tests, not as a standalone #[test].
+    // ----------------------------------------------------------------
+    fn b7_cache_subtests() {
+        // B7-1: Write via library_insert → subsequent library_list returns
+        // correct, consistent data (cache populated after write).
+        {
+            let dir = unique_tmp("b7_cache_hit");
+            let path = dir.join("library.rules.json");
+            set_library_path_for_test(path.clone());
+
+            library_insert(sample_rule("alpha")).expect("insert");
+
+            let r1 = library_list().expect("list 1");
+            assert_eq!(r1.len(), 1);
+            assert_eq!(r1[0].label, "alpha");
+
+            // Second list — cache hit, same data.
+            let r2 = library_list().expect("list 2");
+            assert_eq!(r2.len(), 1);
+            assert_eq!(r2[0].label, "alpha");
+
+            clear_library_path_for_test();
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // B7-2: Out-of-band file change is auto-detected via mtime delta.
+        // The cache is warm after the first list; we sleep past mtime granularity
+        // before the OOB write so the next library_list() observes a different
+        // mtime and reloads from disk WITHOUT any manual cache reset.
+        {
+            let dir = unique_tmp("b7_oob_reload");
+            let path = dir.join("library.rules.json");
+            set_library_path_for_test(path.clone());
+
+            // Populate cache via an insert.
+            library_insert(sample_rule("beta")).expect("insert beta");
+            let r1 = library_list().expect("list before oob write");
+            assert_eq!(r1.len(), 1);
+
+            // Sleep past mtime granularity so the OOB write produces a strictly
+            // newer mtime than the cached value. ext4/HFS+/NTFS all resolve at
+            // ≤ 10 ms; 100 ms is a comfortable margin.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            // Write new content out-of-band (simulates hand-edit).
+            let mut new_file = crate::rules_file::RulesFile::default();
+            new_file.rules.push(sample_rule("beta"));
+            new_file.rules.push(sample_rule("gamma_oob"));
+            let text = serde_json::to_string_pretty(&new_file).unwrap();
+            fs::write(&path, &text).expect("oob write");
+
+            // NO cache reset. library_list() must auto-detect mtime delta
+            // and reload from disk — this is the whole point of B7.
+            let r2 = library_list().expect("list after oob write");
+            assert_eq!(r2.len(), 2, "mtime auto-reload must pick up gamma_oob");
+            let labels: Vec<&str> = r2.iter().map(|r| r.label.as_str()).collect();
+            assert!(labels.contains(&"gamma_oob"), "gamma_oob must appear after auto-reload");
+
+            clear_library_path_for_test();
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // B7-3: Delete the file between calls → next read returns empty, no panic.
+        // No manual cache reset — the stat-on-read path must observe the missing
+        // file and fall back to RulesFile::default().
+        {
+            let dir = unique_tmp("b7_file_deleted");
+            let path = dir.join("library.rules.json");
+            set_library_path_for_test(path.clone());
+
+            library_insert(sample_rule("delta")).expect("insert");
+            let r1 = library_list().expect("list before delete");
+            assert_eq!(r1.len(), 1);
+
+            // Delete the file out-of-band — no cache reset.
+            fs::remove_file(&path).expect("remove file");
+
+            // Next read should observe missing file via stat error,
+            // return RulesFile::default() (empty), and not panic.
+            let r2 = library_list().expect("list after file deleted");
+            assert!(r2.is_empty(), "missing-file path must return empty without panic");
+
+            clear_library_path_for_test();
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // B7-4: Corrupt JSON with a warm cache → library_load() detects the
+        // mtime delta, attempts to parse, fails, and returns the prior cached
+        // value. Deterministic via explicit sleep past mtime granularity.
+        {
+            let dir = unique_tmp("b7_corrupt");
+            let path = dir.join("library.rules.json");
+            set_library_path_for_test(path.clone());
+
+            library_insert(sample_rule("epsilon")).expect("insert");
+            let r1 = library_list().expect("list before corrupt");
+            assert_eq!(r1.len(), 1);
+            assert_eq!(r1[0].label, "epsilon");
+
+            // Sleep past mtime granularity so the corrupt write is a true delta.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            // Write corrupt JSON — different mtime, unparseable content.
+            fs::write(&path, b"not valid json").expect("write corrupt");
+
+            // The cache is warm with "epsilon". stat sees a newer mtime,
+            // load_or_init fails on parse, and the B7 fallback returns the
+            // prior cached clone. Result must contain exactly "epsilon".
+            let r2 = library_list().expect("stale cache must be returned on corrupt parse");
+            assert_eq!(r2.len(), 1, "stale-cache fallback must return prior content");
+            assert_eq!(r2[0].label, "epsilon", "corrupt parse must not leak partial data");
+
+            clear_library_path_for_test();
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // B5: Sidecar export / import tests — run inside library_all_tests.
+    // ----------------------------------------------------------------
+    fn b5_sidecar_subtests() {
+        // B5-1: Export library to sidecar — sidecar file created at sibling path.
+        {
+            let dir = unique_tmp("b5_export");
+            let lib_path = dir.join("library.rules.json");
+            set_library_path_for_test(lib_path.clone());
+
+            library_insert(sample_rule("zeta")).expect("insert zeta");
+            library_insert(sample_rule("eta")).expect("insert eta");
+
+            let vault_path = dir.join("taxes.ssort");
+            let (sidecar, count) = library_export_to_sidecar(&vault_path).expect("export");
+            assert_eq!(count, 2);
+            let expected_sidecar = dir.join("taxes.rules.json");
+            assert_eq!(sidecar, expected_sidecar);
+            assert!(sidecar.exists(), "sidecar file must be written");
+
+            let loaded = crate::rules_file::load(&sidecar).expect("load sidecar");
+            assert_eq!(loaded.rules.len(), 2);
+            let labels: Vec<&str> = loaded.rules.iter().map(|r| r.label.as_str()).collect();
+            assert!(labels.contains(&"zeta"));
+            assert!(labels.contains(&"eta"));
+
+            clear_library_path_for_test();
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // B5-2: Import from sidecar → rules upserted into library.
+        {
+            let dir = unique_tmp("b5_import");
+            let lib_path = dir.join("library.rules.json");
+            set_library_path_for_test(lib_path.clone());
+
+            // Pre-populate library with one rule.
+            library_insert(sample_rule("theta")).expect("insert theta");
+
+            // Write a sidecar with two rules (one overlap with existing).
+            let vault_path = dir.join("docs.ssort");
+            let sidecar = crate::rules_file::sibling_path(&vault_path);
+            let mut sidecar_file = crate::rules_file::RulesFile::default();
+            sidecar_file.rules.push(sample_rule("theta")); // overlap, same content → no conflict
+            sidecar_file.rules.push(sample_rule("iota"));  // new
+            crate::rules_file::save(&sidecar, &sidecar_file).expect("write sidecar");
+
+            let (_, imported, conflicts, total_after) =
+                library_import_from_sidecar(&vault_path).expect("import");
+            assert_eq!(imported, 2, "2 rules in sidecar");
+            assert_eq!(conflicts, 0, "theta content identical — no conflict");
+            assert_eq!(total_after, 2, "library should have theta + iota");
+
+            clear_library_path_for_test();
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // B5-3: Import from sidecar with conflicting rule → conflict counted, last-write-wins.
+        {
+            let dir = unique_tmp("b5_import_conflict");
+            let lib_path = dir.join("library.rules.json");
+            set_library_path_for_test(lib_path.clone());
+
+            let mut existing = sample_rule("kappa");
+            existing.instruction = "Original instruction".to_string();
+            library_insert(existing).expect("insert kappa");
+
+            let vault_path = dir.join("vault.ssort");
+            let sidecar = crate::rules_file::sibling_path(&vault_path);
+            let mut sidecar_file = crate::rules_file::RulesFile::default();
+            let mut incoming = sample_rule("kappa");
+            incoming.instruction = "DIFFERENT instruction from sidecar".to_string();
+            sidecar_file.rules.push(incoming);
+            crate::rules_file::save(&sidecar, &sidecar_file).expect("write sidecar");
+
+            let (_, imported, conflicts, total_after) =
+                library_import_from_sidecar(&vault_path).expect("import");
+            assert_eq!(imported, 1);
+            assert_eq!(conflicts, 1, "one conflict: kappa instruction differs");
+            assert_eq!(total_after, 1, "still one rule");
+
+            // Last-write-wins: library should have the sidecar's instruction.
+            let rule = library_get("kappa").expect("get").expect("found");
+            assert_eq!(rule.instruction, "DIFFERENT instruction from sidecar");
+
+            clear_library_path_for_test();
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // B5-4: Import from sidecar when sidecar doesn't exist → error.
+        {
+            let dir = unique_tmp("b5_import_missing");
+            let lib_path = dir.join("library.rules.json");
+            set_library_path_for_test(lib_path.clone());
+
+            let vault_path = dir.join("nonexistent.ssort");
+            let err = library_import_from_sidecar(&vault_path).expect_err("must error");
+            assert!(
+                err.message.contains("sidecar not found"),
+                "unexpected error: {}",
+                err.message
+            );
 
             clear_library_path_for_test();
             fs::remove_dir_all(&dir).ok();

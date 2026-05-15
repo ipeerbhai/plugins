@@ -997,26 +997,26 @@ fn handle_classify_document(
         .unwrap_or("default");
     let model_spec = args.get("model_spec").cloned();
     let vault_id = args.get("vault_id").and_then(|v| v.as_str());
-    // Optional user-level rules path (host-provided). Layer 1 (sibling) is
-    // resolved automatically from vault_path. If both layers miss, classify
-    // errors out with a clear "no rules file" message.
-    let user_rules_path: Option<std::path::PathBuf> = args
-        .get("user_rules_path")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from);
-
-    // 1. Load rules from external file (sibling > user-level fallback).
-    //    Suppresses use of the legacy embedded `rules` table for new classifies.
-    let rules_file_doc = match rules_file::load_for_vault(
-        std::path::Path::new(vault_path),
-        user_rules_path.as_deref(),
-    ) {
-        Ok((_, f)) => f,
-        Err(e) => return ok_response(id, tool_err(&format!("Failed to load rules: {}", e.message))),
-    };
-    let rule_list: Vec<types::Rule> = rules_file_doc.to_rules();
+    // user_rules_path is accepted for back-compat but silently ignored.
+    // B5: classify_document now reads rules exclusively from the global library.
+    // To populate the library from a per-vault sidecar, call
+    // library_import_from_sidecar first.
+    let _user_rules_path_deprecated = args.get("user_rules_path");
     let _ = password; // legacy param accepted for back-compat but no longer used here
+
+    // 1. Load rules from the global library (B2/B7 cached path).
+    //    Only enabled rules are sent to the LLM — disabled rules must not
+    //    influence classification prompts (matches process.rs:177).
+    let rule_file_rules: Vec<rules_file::FileRule> = match library::library_list() {
+        Ok(rules) => rules.into_iter().filter(|r| r.enabled).collect(),
+        Err(e) => return ok_response(id, tool_err(&format!("Failed to load library rules: {}", e.message))),
+    };
+    // Build a synthetic RulesFile so existing snapshot/find helpers still work.
+    let rules_file_doc = rules_file::RulesFile {
+        rules: rule_file_rules.clone(),
+        ..rules_file::RulesFile::default()
+    };
+    let rule_list: Vec<types::Rule> = rule_file_rules.into_iter().map(|r| r.into_rule()).collect();
 
     // 2. Build messages
     let messages: Vec<Value> = match mode {
@@ -2258,6 +2258,59 @@ fn handle_library_disable_rule(params: &Value, id: Value) -> RpcResponse {
 }
 
 // ---------------------------------------------------------------------------
+// B5: Sidecar export / import handlers
+// ---------------------------------------------------------------------------
+
+fn handle_library_export_to_sidecar(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let vault_label = args.get("vault_label").and_then(|v| v.as_str()).unwrap_or("");
+    if vault_label.is_empty() {
+        return ok_response(id, tool_err("vault_label is required"));
+    }
+    // Resolve vault label → path (must be a Vault kind, not a Directory).
+    let (_, vault_path, kind) = match session::resolve_label(vault_label) {
+        Some(t) => t,
+        None => return ok_response(id, tool_err("vault label not in session")),
+    };
+    if kind != session::EntryKind::Vault {
+        return ok_response(id, tool_err("vault label not in session"));
+    }
+    match library::library_export_to_sidecar(&vault_path) {
+        Ok((sidecar_path, count)) => ok_response(id, tool_ok(json!({
+            "ok": true,
+            "sidecar_path": sidecar_path.to_string_lossy(),
+            "count": count,
+        }))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+fn handle_library_import_from_sidecar(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let vault_label = args.get("vault_label").and_then(|v| v.as_str()).unwrap_or("");
+    if vault_label.is_empty() {
+        return ok_response(id, tool_err("vault_label is required"));
+    }
+    let (_, vault_path, kind) = match session::resolve_label(vault_label) {
+        Some(t) => t,
+        None => return ok_response(id, tool_err("vault label not in session")),
+    };
+    if kind != session::EntryKind::Vault {
+        return ok_response(id, tool_err("vault label not in session"));
+    }
+    match library::library_import_from_sidecar(&vault_path) {
+        Ok((sidecar_path, imported, conflicts, total_after)) => ok_response(id, tool_ok(json!({
+            "ok": true,
+            "sidecar_path": sidecar_path.to_string_lossy(),
+            "imported": imported,
+            "conflicts": conflicts,
+            "total_after": total_after,
+        }))),
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // B3: process() pipeline handler
 // ---------------------------------------------------------------------------
 
@@ -2629,7 +2682,7 @@ fn main() {
                     },
                     {
                         "name": "minerva_scansort_insert_rule",
-                        "description": "Insert or replace a classification rule in the rules file. Pass `rules_path` (preferred) — the new external rules JSON. Legacy `path`/`password` args are accepted for back-compat but write operations against the embedded vault rules table are no longer supported (returns an error pointing at rules_path).",
+                        "description": "Deprecated for direct LLM use — prefer library_* tools. Path-driven CRUD is retained as the implementation of library_export_to_sidecar / library_import_from_sidecar. Insert or replace a classification rule in the rules file. Pass `rules_path` (preferred) — the new external rules JSON. Legacy `path`/`password` args are accepted for back-compat but write operations against the embedded vault rules table are no longer supported (returns an error pointing at rules_path).",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -2652,7 +2705,7 @@ fn main() {
                     },
                     {
                         "name": "minerva_scansort_list_rules",
-                        "description": "List classification rules from a rules file (preferred) or the legacy embedded vault rules table (read-only, deprecated). Returns {ok, rules, count, rules_path?, deprecated?}.",
+                        "description": "Deprecated for direct LLM use — prefer library_* tools. Path-driven CRUD is retained as the implementation of library_export_to_sidecar / library_import_from_sidecar. List classification rules from a rules file (preferred) or the legacy embedded vault rules table (read-only, deprecated). Returns {ok, rules, count, rules_path?, deprecated?}.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -2664,7 +2717,7 @@ fn main() {
                     },
                     {
                         "name": "minerva_scansort_get_rule",
-                        "description": "Get a single classification rule. Use rules_path + label (preferred) or the legacy embedded-table read path. Returns {ok, rule}.",
+                        "description": "Deprecated for direct LLM use — prefer library_* tools. Path-driven CRUD is retained as the implementation of library_export_to_sidecar / library_import_from_sidecar. Get a single classification rule. Use rules_path + label (preferred) or the legacy embedded-table read path. Returns {ok, rule}.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -2678,7 +2731,7 @@ fn main() {
                     },
                     {
                         "name": "minerva_scansort_update_rule",
-                        "description": "Update fields of an existing classification rule by label. Pass rules_path (preferred). Legacy path returns deprecation error.",
+                        "description": "Deprecated for direct LLM use — prefer library_* tools. Path-driven CRUD is retained as the implementation of library_export_to_sidecar / library_import_from_sidecar. Update fields of an existing classification rule by label. Pass rules_path (preferred). Legacy path returns deprecation error.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -2693,7 +2746,7 @@ fn main() {
                     },
                     {
                         "name": "minerva_scansort_delete_rule",
-                        "description": "Delete a classification rule by label. Refuses to delete rules marked is_default. Pass rules_path (preferred).",
+                        "description": "Deprecated for direct LLM use — prefer library_* tools. Path-driven CRUD is retained as the implementation of library_export_to_sidecar / library_import_from_sidecar. Delete a classification rule by label. Refuses to delete rules marked is_default. Pass rules_path (preferred).",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -2707,7 +2760,7 @@ fn main() {
                     },
                     {
                         "name": "minerva_scansort_import_rules_from_json",
-                        "description": "Bulk import classification rules into a rules file. json_text accepts a full RulesFile object (replaces file content), a bare array, or an object with a 'rules'/'categories' key (upserts entries into the existing or new file). Returns {ok, count, mode, rules_path}.",
+                        "description": "Deprecated for direct LLM use — prefer library_* tools. Path-driven CRUD is retained as the implementation of library_export_to_sidecar / library_import_from_sidecar. Bulk import classification rules into a rules file. json_text accepts a full RulesFile object (replaces file content), a bare array, or an object with a 'rules'/'categories' key (upserts entries into the existing or new file). Returns {ok, count, mode, rules_path}.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -2721,13 +2774,13 @@ fn main() {
                     },
                     {
                         "name": "minerva_scansort_classify_document",
-                        "description": "Classify a document using LLM via host.providers.chat. Loads rules from a sibling <vault-stem>.rules.json or a host-provided user_rules_path (in that order), builds classification messages, calls the LLM, and returns {ok, classification, rule_snapshot}. The rule_snapshot JSON should be passed to insert_document so the vault stays self-describing.",
+                        "description": "B5: Classify a document using LLM via host.providers.chat. Rules are loaded from the plugin's global library (B2). To populate the library from a per-vault sidecar, call library_import_from_sidecar first. Builds classification messages, calls the LLM, and returns {ok, classification, rule_snapshot}. The rule_snapshot JSON should be passed to insert_document so the vault stays self-describing.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "vault_path": {"type": "string", "description": "Absolute path to the vault file (used to resolve sibling <stem>.rules.json)."},
+                                "vault_path": {"type": "string", "description": "Absolute path to the vault file (used for context; rules now come from the global library, not a sibling sidecar)."},
                                 "password": {"type": "string", "description": "Vault password (accepted for back-compat; no longer used for rule loading)."},
-                                "user_rules_path": {"type": "string", "description": "Optional user-level rules JSON path (layer 2 fallback if no sibling exists)."},
+                                "user_rules_path": {"type": "string", "description": "Deprecated — silently ignored. Rules are loaded from the global library. Call library_import_from_sidecar to bring sidecar rules into the library."},
                                 "mode": {"type": "string", "description": "'text' (default) or 'vision'."},
                                 "document_text": {"type": "string", "description": "Extracted document text (required for text mode)."},
                                 "page_images": {"type": "array", "description": "Array of {page_num, base64} objects (required for vision mode).", "items": {"type": "object"}},
@@ -3252,6 +3305,28 @@ fn main() {
                         },
                     },
                     {
+                        "name": "minerva_scansort_library_export_to_sidecar",
+                        "description": "B5: Export all rules from the global library to the per-vault sidecar file (<vault-stem>.rules.json next to the vault). vault_label must be open in the current session (kind=Vault). Returns {ok, sidecar_path, count}. Use this to snapshot the library for a specific vault or to share rules with external tools.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "vault_label": {"type": "string", "description": "Session label of an open vault. The sidecar is written to <vault-stem>.rules.json next to the vault file."},
+                            },
+                            "required": ["vault_label"],
+                        },
+                    },
+                    {
+                        "name": "minerva_scansort_library_import_from_sidecar",
+                        "description": "B5: Import rules from a per-vault sidecar file (<vault-stem>.rules.json) into the global library. vault_label must be open in the current session (kind=Vault). Each rule is upserted (last-write-wins). Returns {ok, sidecar_path, imported, conflicts, total_after} where conflicts counts rules whose label already existed with different content (informational only — import still proceeds).",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "vault_label": {"type": "string", "description": "Session label of an open vault. The sidecar path is <vault-stem>.rules.json next to the vault file. Error if the sidecar doesn't exist."},
+                            },
+                            "required": ["vault_label"],
+                        },
+                    },
+                    {
                         "name": "minerva_scansort_process",
                         "description": "B3: Path-free process() pipeline. Zero arguments. Reads all state from the in-process session (open sources + open destinations) and the global library (enabled rules). For every file under every open source: (1) skips files already processed (B4 manifest), (2) extracts text, (3) classifies via host.providers.chat, (4) runs the deterministic rule engine, (5) fans out to matching open destinations resolved by label, (6) records per-file outcome in the B4 source state manifest. Returns {ok, summary:{moved,conflicts,unprocessable,skipped_already_processed}, by_rule:{<rule_label>:count}, by_destination:{<dest_label>:count}, items:[{source_label,source_path_relative,status,rule_label?,target_labels,reason?}]}.",
                         "inputSchema": {
@@ -3500,6 +3575,12 @@ fn main() {
                     }
                     "minerva_scansort_library_disable_rule" => {
                         handle_library_disable_rule(&req.params, req.id)
+                    }
+                    "minerva_scansort_library_export_to_sidecar" => {
+                        handle_library_export_to_sidecar(&req.params, req.id)
+                    }
+                    "minerva_scansort_library_import_from_sidecar" => {
+                        handle_library_import_from_sidecar(&req.params, req.id)
                     }
                     "minerva_scansort_process" => {
                         handle_process(req.id, &mut out, &mut lines, &mut next_id)
