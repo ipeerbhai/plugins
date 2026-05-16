@@ -154,6 +154,7 @@ pub fn apply_rule_engine(
 /// - `lines`   — stdin line iterator (for capability responses).
 /// - `next_id` — monotonically-increasing request-id counter.
 /// - `model`   — model name to pass to host.providers.chat (default "default").
+/// - `model_spec` — optional structured provider spec (wins over `model` when present).
 ///
 /// # Returns
 /// `Ok(ProcessResult)` on success.  Individual file errors are recorded in
@@ -163,6 +164,7 @@ pub fn run(
     lines: &mut impl Iterator<Item = Result<String, io::Error>>,
     next_id: &mut u64,
     model: &str,
+    model_spec: Option<Value>,
 ) -> VaultResult<ProcessResult> {
     let mut result = ProcessResult::default();
 
@@ -259,10 +261,18 @@ pub fn run(
             let rule_objs: Vec<Rule> = enabled_rules.iter().map(|r| r.clone().into_rule()).collect();
             let messages = classifier::build_messages(&full_text, 4000, &rule_objs);
 
-            let chat_args = json!({
+            let mut chat_args = json!({
                 "messages": messages,
                 "model": model,
             });
+            // Forward model_spec when caller supplied a non-empty object.
+            // Broker rejects empty {} as 'unknown kind', so guard here.
+            if let Some(ref spec) = model_spec {
+                let is_empty_obj = spec.as_object().map_or(false, |o| o.is_empty());
+                if !spec.is_null() && !is_empty_obj {
+                    chat_args["model_spec"] = spec.clone();
+                }
+            }
 
             let chat_response = match request_capability(out, lines, next_id, "host.providers.chat", chat_args) {
                 Ok(v) => v,
@@ -299,10 +309,26 @@ pub fn run(
                 .unwrap_or("");
 
             if response_text.is_empty() {
+                // Surface the broker error envelope when present so per-file reasons
+                // point at the real failure (schema, model not found, provider crash)
+                // instead of the generic "empty LLM response".
+                let reason_str = if chat_response.get("success").and_then(|v| v.as_bool()) == Some(false) {
+                    let msg = chat_response.get("error_message").and_then(|v| v.as_str()).unwrap_or("broker error");
+                    let detail = chat_response.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+                    let code = chat_response.get("error_code").and_then(|v| v.as_str()).unwrap_or("");
+                    let suffix = if detail.is_empty() { String::new() } else { format!(": {detail}") };
+                    let code_prefix = if code.is_empty() { String::new() } else { format!("[{code}] ") };
+                    format!("classify_error: {code_prefix}{msg}{suffix}")
+                } else if let Some(err_val) = chat_response.get("error") {
+                    let err_str = err_val.as_str().map(String::from).unwrap_or_else(|| err_val.to_string());
+                    format!("classify_error: LLM error: {err_str}")
+                } else {
+                    "classify_error: empty LLM response".to_string()
+                };
                 let entry = source_state::make_entry(
                     rel_path.clone(),
                     "unprocessable",
-                    Some("classify_error: empty LLM response".to_string()),
+                    Some(reason_str.clone()),
                     None,
                     vec![],
                 );
@@ -314,7 +340,7 @@ pub fn run(
                     status: "unprocessable".to_string(),
                     rule_label: None,
                     target_labels: vec![],
-                    reason: Some("classify_error: empty LLM response".to_string()),
+                    reason: Some(reason_str),
                 });
                 continue;
             }

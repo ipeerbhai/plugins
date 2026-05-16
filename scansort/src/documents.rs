@@ -39,6 +39,7 @@ pub fn insert_document(
     source_path: &str,
     rule_snapshot: &str,
     password: &str,
+    display_name: &str,
 ) -> VaultResult<i64> {
     let fp = Path::new(file_path);
     if !fp.exists() {
@@ -98,15 +99,16 @@ pub fn insert_document(
 
     let conn = db::connect(path)?;
 
-    // Insert document row
+    // Insert document row. display_name is stored when non-empty; vault_inventory
+    // falls back to original_filename when the column is empty.
     let doc_id: i64 = match conn.execute(
         "INSERT INTO documents \
          (original_filename, file_ext, category, confidence, issuer, \
           description, doc_date, classified_at, sha256, simhash, dhash, \
           status, file_data, file_size, compression, encryption_iv, encryption_tag, \
-          source_path, rule_snapshot) \
+          source_path, rule_snapshot, display_name) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'zstd', \
-                 ?15, ?16, ?17, ?18)",
+                 ?15, ?16, ?17, ?18, ?19)",
         params![
             original_filename,
             file_ext,
@@ -126,6 +128,7 @@ pub fn insert_document(
             enc_tag,
             effective_source,
             rule_snapshot,
+            display_name,
         ],
     ) {
         Ok(_) => conn.last_insert_rowid(),
@@ -712,6 +715,7 @@ mod tests {
             "",
             "",
             password,
+            "",
         )
         .expect("insert_document")
     }

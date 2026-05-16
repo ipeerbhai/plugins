@@ -17,13 +17,27 @@ use std::path::Path;
 /// Creates the parent directory if needed, initialises the schema, and
 /// populates the project table with default metadata.
 pub fn create_vault(path: &str, name: &str) -> VaultResult<()> {
+    let p = Path::new(path);
     // Ensure parent directory exists
-    if let Some(parent) = Path::new(path).parent() {
+    if let Some(parent) = p.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 VaultError::new(format!("Cannot create directory {}: {e}", parent.display()))
             })?;
         }
+    }
+
+    // Replace-on-create: if the target file already exists, remove it so a
+    // fresh schema can be applied. Caller is expected to have confirmed
+    // overwrite intent (Godot's FileDialog SAVE_FILE prompts the user before
+    // firing file_selected). Without this, db::connect_new opens the existing
+    // DB, SCHEMA_SQL fails on duplicate tables, and the error-path cleanup at
+    // the bottom of this function deletes the file — leaving the user with
+    // neither the old vault nor a new one.
+    if p.exists() {
+        std::fs::remove_file(path).map_err(|e| {
+            VaultError::new(format!("Cannot replace existing file {path}: {e}"))
+        })?;
     }
 
     let conn = match db::connect_new(path) {

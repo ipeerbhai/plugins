@@ -515,6 +515,7 @@ mod tests {
             "",
             "",
             "",
+            "",
         )
         .expect("insert_document");
         assert!(doc_id > 0);

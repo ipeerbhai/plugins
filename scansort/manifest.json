@@ -211,7 +211,7 @@
     },
     {
       "name": "minerva_scansort_process",
-      "description": "Run the path-free pipeline against the current session + enabled library rules. Zero arguments. Iterates every file in every open source, classifies via host.providers.chat, runs the deterministic rule engine, fans out to destinations whose labels match in session, marks unprocessable files in the source manifest. Returns {ok, summary, by_rule, by_destination, items}."
+      "description": "Run the path-free pipeline against the current session + enabled library rules. Optional args: model (string, default 'default') and model_spec (object, structured provider spec — wins over 'model'). Iterates every file in every open source, classifies via host.providers.chat, runs the deterministic rule engine, fans out to destinations whose labels match in session, marks unprocessable files in the source manifest. Returns {ok, summary, by_rule, by_destination, items}."
     }
   ],
   "ui": {

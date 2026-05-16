@@ -1510,7 +1510,15 @@ func _do_set_source_dir(conn: Object, path: String) -> void:
 		set_status("Set source directory failed: %s" % result.get("error", "unknown"))
 		return
 	set_status("Source directory: %s" % path)
-	if _source_tree != null and is_instance_valid(_source_tree) and _source_provider != null:
+	# P0: the source pane must populate even if no vault is open yet.
+	# _source_provider was historically created only inside _on_vault_opened_r2,
+	# leaving the left pane empty when the user sets source-dir first.
+	if _source_provider == null:
+		_source_provider = _SourceProvider.new()
+		_source_provider.init(conn, _active_vault_path)
+		if _source_tree != null and is_instance_valid(_source_tree):
+			_source_tree.set_provider(_source_provider)
+	if _source_tree != null and is_instance_valid(_source_tree):
 		await _source_tree.refresh()
 
 	# B1: register this source directory in the session (close old one first if present).

@@ -233,6 +233,59 @@ pub fn scan_directory_hashes(dir: &Path) -> VaultResult<HashSet<String>> {
 // Resolve the target path for a directory destination
 // ---------------------------------------------------------------------------
 
+/// Build a TemplateValues + (year_val, date_val) owned strings for use with
+/// `resolve_and_sanitise`. Both vault and directory placement branches need
+/// the same expansion context (year fallback "unknown", date fallback
+/// "undated"); centralising avoids drift.
+fn build_template_context(meta: &DocMeta) -> (String, String) {
+    let doc_date = &meta.doc_date;
+    let year_val = if doc_date.len() >= 4 && doc_date[..4].chars().all(|c| c.is_ascii_digit()) {
+        doc_date[..4].to_string()
+    } else {
+        "unknown".to_string()
+    };
+    let date_val = if doc_date.is_empty() {
+        "undated".to_string()
+    } else {
+        doc_date.to_string()
+    };
+    (year_val, date_val)
+}
+
+/// Resolve the rename_pattern + source extension into a display_name string
+/// suitable for the vault's display_name column. Returns empty string when
+/// pattern is empty (caller's choice: vault_inventory falls back to
+/// original_filename in that case).
+fn resolve_display_name(
+    resolved_rename_pattern: &str,
+    file_path: &str,
+    meta: &DocMeta,
+) -> String {
+    if resolved_rename_pattern.is_empty() {
+        return String::new();
+    }
+    let (year_val, date_val) = build_template_context(meta);
+    let tv = TemplateValues {
+        year: &year_val,
+        date: &date_val,
+        issuer: &meta.issuer,
+        doc_type: &meta.doc_type,
+        description: &meta.description,
+        amount: &meta.amount,
+        category: &meta.category,
+    };
+    let stem = match resolve_and_sanitise(resolved_rename_pattern, &tv) {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+    let ext = Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+    format!("{stem}{ext}")
+}
+
 fn resolve_directory_target(
     dest_path: &str,
     resolved_subfolder: &str,
@@ -240,17 +293,7 @@ fn resolve_directory_target(
     file_path: &str,
     meta: &DocMeta,
 ) -> VaultResult<PathBuf> {
-    let doc_date = &meta.doc_date;
-    // year/date for sanitise pass (tokens already expanded by W3; we still
-    // need year/date for the sanitiser to resolve any residual tokens that
-    // slipped through, and to strip path-traversal attempts).
-    let year_val = if doc_date.len() >= 4 && doc_date[..4].chars().all(|c| c.is_ascii_digit()) {
-        doc_date[..4].to_string()
-    } else {
-        "unknown".to_string()
-    };
-    let date_val = if doc_date.is_empty() { "undated".to_string() } else { doc_date.to_string() };
-
+    let (year_val, date_val) = build_template_context(meta);
     let tv = TemplateValues {
         year: &year_val,
         date: &date_val,
@@ -417,6 +460,13 @@ pub fn fan_out(
                     meta.rule_snapshot.clone()
                 };
 
+                // Bridge: vault branch now mirrors the directory branch by
+                // resolving the rename_pattern into display_name. Empty pattern
+                // → empty display_name → vault_inventory falls back to the
+                // original filename (preserves prior behaviour for rules
+                // without a rename_pattern).
+                let display_name = resolve_display_name(resolved_rename_pattern, file_path, meta);
+
                 match insert_document(
                     &dest.path,
                     file_path,
@@ -435,6 +485,7 @@ pub fn fan_out(
                     // `encrypt` flag is recorded in rule_snapshot only. Pass an
                     // empty password so the blob is stored plaintext-compressed.
                     "",
+                    &display_name,
                 ) {
                     Ok(doc_id) => {
                         results.push(PlacementResult {

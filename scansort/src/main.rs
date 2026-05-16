@@ -424,10 +424,11 @@ fn handle_insert_document(params: &Value, id: Value) -> RpcResponse {
     let source_path = args.get("source_path").and_then(|v| v.as_str()).unwrap_or("");
     let rule_snapshot = args.get("rule_snapshot").and_then(|v| v.as_str()).unwrap_or("");
     let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
+    let display_name = args.get("display_name").and_then(|v| v.as_str()).unwrap_or("");
     match documents::insert_document(
         vault_path, file_path, category, confidence, issuer,
         description, doc_date, status, sha256, simhash, dhash, source_path,
-        rule_snapshot, password,
+        rule_snapshot, password, display_name,
     ) {
         Ok(doc_id) => ok_response(id, tool_ok(json!({"ok": true, "doc_id": doc_id}))),
         Err(e) => ok_response(id, tool_err(&e.message)),
@@ -1076,7 +1077,17 @@ fn handle_classify_document(
         .unwrap_or("");
 
     if response_text.is_empty() {
-        // If the broker returned an error envelope, pass it through
+        // Broker error envelope: {success:false, error_code, error_message, detail}.
+        // Detect by explicit success:false (avoid false positives from absent key).
+        if chat_response.get("success").and_then(|v| v.as_bool()) == Some(false) {
+            let msg = chat_response.get("error_message").and_then(|v| v.as_str()).unwrap_or("broker error");
+            let detail = chat_response.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+            let code = chat_response.get("error_code").and_then(|v| v.as_str()).unwrap_or("");
+            let suffix = if detail.is_empty() { String::new() } else { format!(": {detail}") };
+            let code_prefix = if code.is_empty() { String::new() } else { format!("[{code}] ") };
+            return ok_response(id, tool_err(&format!("{code_prefix}{msg}{suffix}")));
+        }
+        // Legacy single-key error envelope.
         if let Some(err_val) = chat_response.get("error") {
             let err_str = err_val.as_str().map(String::from).unwrap_or_else(|| err_val.to_string());
             return ok_response(id, tool_err(&format!("LLM error: {err_str}")));
@@ -2326,11 +2337,19 @@ fn handle_library_import_from_sidecar(params: &Value, id: Value) -> RpcResponse 
 
 fn handle_process(
     id: Value,
+    params: &Value,
     out: &mut impl Write,
     lines: &mut impl Iterator<Item = Result<String, io::Error>>,
     next_id: &mut u64,
 ) -> RpcResponse {
-    match process::run(out, lines, next_id, "default") {
+    // Resolves bug 019e2d82ca72: caller can pin classifier model via `model`
+    // (string) or `model_spec` (structured). `model_spec` wins when present.
+    // Empty/absent → "default" for back-compat.
+    let args = params.get("arguments").unwrap_or(params);
+    let model = args.get("model").and_then(|v| v.as_str())
+        .unwrap_or("default");
+    let model_spec = args.get("model_spec").cloned();
+    match process::run(out, lines, next_id, model, model_spec) {
         Err(e) => ok_response(id, tool_err(&e.message)),
         Ok(result) => {
             let items_json: Vec<Value> = result.items.iter().map(|item| {
@@ -2579,6 +2598,7 @@ fn main() {
                                 "source_path": {"type": "string", "description": "Original source path (defaults to file_path)."},
                                 "rule_snapshot": {"type": "string", "description": "JSON blob from classify_document.rule_snapshot — captures the rule revision that produced this classification. Optional; empty means \"no rule recorded\"."},
                                 "password": {"type": "string", "description": "Optional vault password. If set, the compressed blob is encrypted with AES-256-GCM using the vault's stored KDF + salt. The vault must already have a password set."},
+                                "display_name": {"type": "string", "description": "Optional resolved display name for the vault (e.g., from a rule's rename_pattern). Empty means vault_inventory falls back to original_filename."},
                             },
                             "required": ["vault_path", "file_path"],
                         },
@@ -3340,10 +3360,13 @@ fn main() {
                     },
                     {
                         "name": "minerva_scansort_process",
-                        "description": "B3: Path-free process() pipeline. Zero arguments. Reads all state from the in-process session (open sources + open destinations) and the global library (enabled rules). For every file under every open source: (1) skips files already processed (B4 manifest), (2) extracts text, (3) classifies via host.providers.chat, (4) runs the deterministic rule engine, (5) fans out to matching open destinations resolved by label, (6) records per-file outcome in the B4 source state manifest. Returns {ok, summary:{moved,conflicts,unprocessable,skipped_already_processed}, by_rule:{<rule_label>:count}, by_destination:{<dest_label>:count}, items:[{source_label,source_path_relative,status,rule_label?,target_labels,reason?}]}.",
+                        "description": "B3: Path-free process() pipeline. Reads all state from the in-process session (open sources + open destinations) and the global library (enabled rules). For every file under every open source: (1) skips files already processed (B4 manifest), (2) extracts text, (3) classifies via host.providers.chat, (4) runs the deterministic rule engine, (5) fans out to matching open destinations resolved by label, (6) records per-file outcome in the B4 source state manifest. Returns {ok, summary:{moved,conflicts,unprocessable,skipped_already_processed}, by_rule:{<rule_label>:count}, by_destination:{<dest_label>:count}, items:[{source_label,source_path_relative,status,rule_label?,target_labels,reason?}]}.",
                         "inputSchema": {
                             "type": "object",
-                            "properties": {},
+                            "properties": {
+                                "model": {"type": "string", "description": "Optional model identifier to pass to host.providers.chat (default 'default' = TurnRock Core)."},
+                                "model_spec": {"type": "object", "description": "Optional structured provider spec (wins over 'model' when present). Use {kind:'core_action', service_client_id:'model-chat', action_name:'<model>'} to route through a specific Core service."},
+                            },
                             "required": [],
                         },
                     },
@@ -3595,7 +3618,7 @@ fn main() {
                         handle_library_import_from_sidecar(&req.params, req.id)
                     }
                     "minerva_scansort_process" => {
-                        handle_process(req.id, &mut out, &mut lines, &mut next_id)
+                        handle_process(req.id, &req.params, &mut out, &mut lines, &mut next_id)
                     }
                     other => err_response(req.id, -32601, format!("unknown tool: {other}")),
                 }
