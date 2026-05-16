@@ -351,6 +351,7 @@ mod tests {
             order: 0,
             stop_processing: false,
             copy_to: Vec::new(),
+            subtypes: Vec::new(),
         }
     }
 

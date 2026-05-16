@@ -33,6 +33,7 @@
 
 use crate::classifier;
 use crate::destinations::{Destination, DestinationRegistry};
+use crate::doc_type_normalizer;
 use crate::extract;
 use crate::library;
 use crate::placement::{self, DirHashCache, DocMeta, PlacementStatus};
@@ -155,6 +156,7 @@ pub fn apply_rule_engine(
 /// - `next_id` — monotonically-increasing request-id counter.
 /// - `model`   — model name to pass to host.providers.chat (default "default").
 /// - `model_spec` — optional structured provider spec (wins over `model` when present).
+/// - `doc_type_strategy` — B8 doc_type normalization: `"none" | "enum" | "canonicalize" | "both"`.
 ///
 /// # Returns
 /// `Ok(ProcessResult)` on success.  Individual file errors are recorded in
@@ -165,6 +167,7 @@ pub fn run(
     next_id: &mut u64,
     model: &str,
     model_spec: Option<Value>,
+    doc_type_strategy: &str,
 ) -> VaultResult<ProcessResult> {
     let mut result = ProcessResult::default();
 
@@ -259,7 +262,9 @@ pub fn run(
 
             // Classify via host.providers.chat.
             let rule_objs: Vec<Rule> = enabled_rules.iter().map(|r| r.clone().into_rule()).collect();
-            let messages = classifier::build_messages(&full_text, 4000, &rule_objs);
+            let messages = classifier::build_messages_with_strategy(
+                &full_text, 4000, &rule_objs, doc_type_strategy,
+            );
 
             let mut chat_args = json!({
                 "messages": messages,
@@ -345,7 +350,7 @@ pub fn run(
                 continue;
             }
 
-            let classification = classifier::parse_response(response_text, &rule_objs);
+            let mut classification = classifier::parse_response(response_text, &rule_objs);
 
             // Run rule engine.
             let ext = Path::new(abs_path)
@@ -401,6 +406,21 @@ pub fn run(
                 for lbl in &action.copy_to {
                     if !all_labels.contains(lbl) {
                         all_labels.push(lbl.clone());
+                    }
+                }
+            }
+
+            // B8: canonicalize doc_type against the winning rule's subtypes.
+            // Applied for `canonicalize` and `both` strategies. No-op when the
+            // winning rule has no subtypes or no token matches.
+            let canon_active = doc_type_strategy == "canonicalize" || doc_type_strategy == "both";
+            if canon_active {
+                if let Some(ref winning_label) = first_rule_label {
+                    if let Some(winning_rule) = enabled_rules.iter().find(|r| &r.label == winning_label) {
+                        classification.doc_type = doc_type_normalizer::canonicalize(
+                            &classification.doc_type,
+                            &winning_rule.subtypes,
+                        );
                     }
                 }
             }
@@ -693,6 +713,7 @@ mod tests {
             order: 0,
             stop_processing: false,
             copy_to: copy_to.into_iter().map(String::from).collect(),
+            subtypes: Vec::new(),
         }
     }
 

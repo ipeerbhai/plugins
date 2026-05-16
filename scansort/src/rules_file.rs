@@ -6,7 +6,7 @@
 //! `user://scansort_rules.json` format so files port forward.
 
 use crate::db;
-use crate::types::{now_iso, ConditionNode, Rule, VaultError, VaultResult};
+use crate::types::{now_iso, ConditionNode, Rule, Subtype, VaultError, VaultResult};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -67,6 +67,9 @@ pub struct FileRule {
     /// W1 stores as opaque strings; resolution is a later work-item.
     #[serde(default)]
     pub copy_to: Vec<String>,
+    /// Document subtypes within this rule (B8 doc_type normalization).
+    #[serde(default)]
+    pub subtypes: Vec<Subtype>,
 }
 
 impl From<Rule> for FileRule {
@@ -87,6 +90,7 @@ impl From<Rule> for FileRule {
             order: r.order,
             stop_processing: r.stop_processing,
             copy_to: r.copy_to,
+            subtypes: r.subtypes,
         }
     }
 }
@@ -112,6 +116,7 @@ impl FileRule {
             order: self.order,
             stop_processing: self.stop_processing,
             copy_to: self.copy_to,
+            subtypes: self.subtypes,
         }
     }
 }
@@ -349,6 +354,7 @@ fn read_embedded_rules(conn: &Connection) -> VaultResult<Vec<FileRule>> {
             order: 0,
             stop_processing: false,
             copy_to: Vec::new(),
+            subtypes: Vec::new(),
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
@@ -584,6 +590,7 @@ mod tests {
             order: 0,
             stop_processing: false,
             copy_to: Vec::new(),
+            subtypes: Vec::new(),
         }
     }
 
@@ -1023,6 +1030,7 @@ mod tests {
                 order: 0,
                 stop_processing: false,
                 copy_to: Vec::new(),
+                subtypes: Vec::new(),
             }],
         };
         save(&sibling, &pre_existing).unwrap();
@@ -1070,6 +1078,7 @@ mod tests {
                 order: 0,
                 stop_processing: false,
                 copy_to: Vec::new(),
+                subtypes: Vec::new(),
             }],
         };
         save(&sibling, &diverging).unwrap();

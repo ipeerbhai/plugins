@@ -212,6 +212,20 @@ pub struct ChecklistItem {
 }
 
 // ---------------------------------------------------------------------------
+// Subtype — variant within a rule's category (B8 doc_type normalization)
+// ---------------------------------------------------------------------------
+
+/// A document subtype within a rule. The `name` is the canonical token the
+/// rename_pattern's `{doc_type}` resolves to; `also_known_as` lists aliases
+/// the LLM might produce instead (used by the canonicalize strategy).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Subtype {
+    pub name: String,
+    #[serde(default)]
+    pub also_known_as: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Rule — classification rule stored in the rules table (T6 R3+)
 // ---------------------------------------------------------------------------
 
@@ -246,6 +260,11 @@ pub struct Rule {
     /// W1 stores as opaque strings; resolution is a later work-item.
     #[serde(default)]
     pub copy_to: Vec<String>,
+    /// Document subtypes within this rule (B8 doc_type normalization).
+    /// Used by the enum strategy (prompt augmentation) and canonicalize
+    /// strategy (post-LLM alias→name mapping).
+    #[serde(default)]
+    pub subtypes: Vec<Subtype>,
 }
 
 // ---------------------------------------------------------------------------

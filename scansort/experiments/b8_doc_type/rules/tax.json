@@ -1,0 +1,64 @@
+{
+  "label": "tax",
+  "name": "Tax documents",
+  "instruction": "Federal or state tax forms, returns, statements, and related correspondence. Includes W-2 wage statements, 1099 income forms, 1040 returns, K-1 partnership statements, property tax bills, estimated-tax vouchers, and tax-prep documents. The `issuer` field MUST be the financial firm, employer, or government agency that produced the document (e.g. 'Fidelity', 'Microsoft', 'IRS', 'Morgan Stanley'). Prefer the short common name over the full legal name when both appear.",
+  "signals": ["tax", "W-2", "1099", "1040", "K-1", "IRS", "return", "wage", "dividend", "interest", "withholding", "schedule", "estimated tax", "EIN", "SSN", "tax year"],
+  "subfolder": "tax",
+  "rename_pattern": "{year}_{issuer}_{doc_type}",
+  "confidence_threshold": 0.5,
+  "encrypt": false,
+  "enabled": true,
+  "is_default": false,
+  "order": 10,
+  "stop_processing": false,
+  "copy_to": ["test"],
+  "subtypes": [
+    {
+      "name": "1099",
+      "also_known_as": [
+        "1099-DIV", "1099-INT", "1099-MISC", "1099-B", "1099-NEC", "1099-R", "1099-G", "1099-K",
+        "Consolidated 1099", "Consolidated Form 1099", "1099-DIV/INT", "1099 form",
+        "form 1099", "1099 statement"
+      ]
+    },
+    {
+      "name": "W-2",
+      "also_known_as": [
+        "W2", "form W-2", "form W2", "wage and tax statement", "W-2 statement", "W2 statement"
+      ]
+    },
+    {
+      "name": "1040",
+      "also_known_as": [
+        "form 1040", "individual tax return", "1040-SR", "1040-ES",
+        "IL-1040", "M1", "M-1", "1040 return", "tax return", "tax return summary"
+      ]
+    },
+    {
+      "name": "K-1",
+      "also_known_as": [
+        "K1", "schedule K-1", "partnership K-1", "S-corp K-1", "form K-1"
+      ]
+    },
+    {
+      "name": "W-9",
+      "also_known_as": [
+        "W9", "form W-9", "request for taxpayer identification"
+      ]
+    },
+    {
+      "name": "property_tax",
+      "also_known_as": [
+        "property tax", "property tax bill", "real estate tax",
+        "real estate tax bill", "assessor", "tax assessment"
+      ]
+    },
+    {
+      "name": "tax_correspondence",
+      "also_known_as": [
+        "IRS letter", "notice", "tax notice", "tax letter", "audit letter",
+        "balance due notice"
+      ]
+    }
+  ]
+}

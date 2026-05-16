@@ -14,7 +14,18 @@ use serde_json::{json, Value};
 
 /// Build OpenAI-format messages for text-mode classification.
 pub fn build_messages(document_text: &str, max_chars: usize, rules: &[Rule]) -> Vec<Value> {
-    let system_prompt = rules::build_prompt_context(rules);
+    build_messages_with_strategy(document_text, max_chars, rules, "none")
+}
+
+/// Variant of `build_messages` that threads the B8 `doc_type_strategy` to the
+/// prompt builder (used by process()).
+pub fn build_messages_with_strategy(
+    document_text: &str,
+    max_chars: usize,
+    rules: &[Rule],
+    doc_type_strategy: &str,
+) -> Vec<Value> {
+    let system_prompt = rules::build_prompt_context_with_strategy(rules, doc_type_strategy);
 
     let truncated = if document_text.len() > max_chars {
         let mut s = document_text[..max_chars].to_string();

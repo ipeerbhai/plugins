@@ -1,0 +1,61 @@
+{
+  "label": "utility",
+  "name": "Utility bills",
+  "instruction": "Periodic bills for residential utilities: electricity, water, natural gas, sewer, garbage, internet/cable, telephone. Usually contains an account number, billing period, usage (kWh, therms, gallons, GB), and amount due. The `issuer` MUST be the utility company / service provider name (e.g. 'PSE', 'Comcast', 'City of Seattle Water'). Prefer the short common name.",
+  "signals": ["utility", "bill", "electric", "water", "gas", "sewer", "garbage", "internet", "cable", "kWh", "therms", "gallons", "billing period", "account number", "amount due", "service period", "meter"],
+  "subfolder": "utility",
+  "rename_pattern": "{year}_{issuer}_{doc_type}",
+  "confidence_threshold": 0.5,
+  "encrypt": false,
+  "enabled": true,
+  "is_default": false,
+  "order": 20,
+  "stop_processing": false,
+  "copy_to": ["test"],
+  "subtypes": [
+    {
+      "name": "electric",
+      "also_known_as": [
+        "electricity", "power", "PSE", "Puget Sound Energy", "light bill",
+        "electric bill", "electricity bill", "power bill"
+      ]
+    },
+    {
+      "name": "water",
+      "also_known_as": [
+        "water bill", "water and sewer", "water utility", "water service"
+      ]
+    },
+    {
+      "name": "gas",
+      "also_known_as": [
+        "natural gas", "gas bill", "gas utility", "gas service"
+      ]
+    },
+    {
+      "name": "sewer",
+      "also_known_as": [
+        "sewer bill", "sewer service", "wastewater", "wastewater bill"
+      ]
+    },
+    {
+      "name": "garbage",
+      "also_known_as": [
+        "garbage bill", "trash", "trash service", "waste collection", "refuse", "recycling"
+      ]
+    },
+    {
+      "name": "internet",
+      "also_known_as": [
+        "ISP", "cable", "broadband", "internet bill", "internet service",
+        "comcast", "xfinity", "fiber"
+      ]
+    },
+    {
+      "name": "phone",
+      "also_known_as": [
+        "telephone", "phone bill", "mobile bill", "cellular", "cell phone bill", "wireless"
+      ]
+    }
+  ]
+}

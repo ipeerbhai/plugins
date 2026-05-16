@@ -1,0 +1,5 @@
+ledger*.jsonl
+ledger*.jsonl.bak
+report*.md
+*.log
+__pycache__/

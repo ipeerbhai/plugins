@@ -30,6 +30,7 @@ mod db;
 mod dedup;
 mod destination;
 mod destinations;
+mod doc_type_normalizer;
 mod documents;
 mod extract;
 mod fingerprints;
@@ -647,6 +648,9 @@ fn handle_insert_rule(params: &Value, id: Value) -> RpcResponse {
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default();
+        let subtypes: Vec<types::Subtype> = args.get("subtypes")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
 
         let rule = rules_file::FileRule {
             label: label.to_string(),
@@ -664,6 +668,7 @@ fn handle_insert_rule(params: &Value, id: Value) -> RpcResponse {
             order,
             stop_processing,
             copy_to,
+            subtypes,
         };
         let idx = rules_file::upsert(&mut file, rule);
         if let Err(e) = rules_file::save(p, &file) {
@@ -2136,6 +2141,9 @@ fn handle_library_insert_rule(params: &Value, id: Value) -> RpcResponse {
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
+    let subtypes: Vec<types::Subtype> = args.get("subtypes")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
 
     let rule = rules_file::FileRule {
         label: label.to_string(),
@@ -2153,6 +2161,7 @@ fn handle_library_insert_rule(params: &Value, id: Value) -> RpcResponse {
         order,
         stop_processing,
         copy_to,
+        subtypes,
     };
     match library::library_insert(rule) {
         Ok(r) => match serde_json::to_value(&r) {
@@ -2349,7 +2358,9 @@ fn handle_process(
     let model = args.get("model").and_then(|v| v.as_str())
         .unwrap_or("default");
     let model_spec = args.get("model_spec").cloned();
-    match process::run(out, lines, next_id, model, model_spec) {
+    let doc_type_strategy = args.get("doc_type_strategy").and_then(|v| v.as_str())
+        .unwrap_or("none");
+    match process::run(out, lines, next_id, model, model_spec, doc_type_strategy) {
         Err(e) => ok_response(id, tool_err(&e.message)),
         Ok(result) => {
             let items_json: Vec<Value> = result.items.iter().map(|item| {
@@ -3254,6 +3265,7 @@ fn main() {
                                 "copy_to":              {"type": "array",   "items": {"type": "string"}, "description": "Additional destination IDs to copy the document to."},
                                 "conditions":           {"type": "object",  "description": "Deterministic gate (ConditionNode) evaluated before LLM classification."},
                                 "exceptions":           {"type": "object",  "description": "When this evaluates true, the rule match is negated."},
+                                "subtypes":             {"type": "array",   "items": {"type": "object"}, "description": "B8 document subtypes: [{name, also_known_as: [alias...]}]. Used by process() doc_type_strategy=enum|both to constrain prompt, and canonicalize|both to normalize raw LLM output."},
                             },
                             "required": ["label"],
                         },
@@ -3366,6 +3378,7 @@ fn main() {
                             "properties": {
                                 "model": {"type": "string", "description": "Optional model identifier to pass to host.providers.chat (default 'default' = TurnRock Core)."},
                                 "model_spec": {"type": "object", "description": "Optional structured provider spec (wins over 'model' when present). Use {kind:'core_action', service_client_id:'model-chat', action_name:'<model>'} to route through a specific Core service."},
+                                "doc_type_strategy": {"type": "string", "enum": ["none", "enum", "canonicalize", "both"], "description": "B8 doc_type normalization strategy. 'none' (default): raw LLM output. 'enum': prompt is augmented with the winning rule's allowed subtypes. 'canonicalize': post-LLM alias→canonical map applied. 'both': enum prompt + canonicalize safety net."},
                             },
                             "required": [],
                         },

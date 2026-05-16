@@ -1,0 +1,59 @@
+{
+  "label": "boat",
+  "name": "Boat / marine documents",
+  "instruction": "Documents about boats and marine vessels — owner manuals, registration / title paperwork, marine surveys, insurance policies, USCG documentation, slip / mooring agreements, maintenance records. The `issuer` MUST be the manufacturer, surveyor, insurer, or agency that produced the document (e.g. 'Beneteau', 'USCG', 'BoatUS'). Prefer the short common name.",
+  "signals": ["boat", "vessel", "yacht", "marine", "sailboat", "powerboat", "hull", "HIN", "USCG", "documentation", "survey", "owner manual", "rigging", "outboard", "inboard", "marina", "slip", "mooring", "engine model"],
+  "subfolder": "boat",
+  "rename_pattern": "{year}_{issuer}_{doc_type}",
+  "confidence_threshold": 0.5,
+  "encrypt": false,
+  "enabled": true,
+  "is_default": false,
+  "order": 30,
+  "stop_processing": false,
+  "copy_to": ["test"],
+  "subtypes": [
+    {
+      "name": "owner_manual",
+      "also_known_as": [
+        "owners manual", "owner's manual", "user manual", "manual", "operator manual",
+        "operating manual", "handbook", "skipper guide", "skipper's guide"
+      ]
+    },
+    {
+      "name": "registration",
+      "also_known_as": [
+        "registration", "title", "vessel registration", "vessel title",
+        "USCG documentation", "documentation certificate", "state registration"
+      ]
+    },
+    {
+      "name": "survey",
+      "also_known_as": [
+        "marine survey", "survey report", "pre-purchase survey", "insurance survey",
+        "condition and valuation", "condition & valuation"
+      ]
+    },
+    {
+      "name": "insurance",
+      "also_known_as": [
+        "marine insurance", "boat insurance", "yacht insurance", "policy",
+        "insurance policy", "declarations page", "coverage summary"
+      ]
+    },
+    {
+      "name": "moorage",
+      "also_known_as": [
+        "slip agreement", "mooring agreement", "marina contract", "moorage agreement",
+        "berth assignment", "slip lease"
+      ]
+    },
+    {
+      "name": "maintenance",
+      "also_known_as": [
+        "maintenance log", "service record", "haul out", "haul-out",
+        "bottom paint", "engine service", "survey punch list"
+      ]
+    }
+  ]
+}

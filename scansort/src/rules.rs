@@ -39,6 +39,7 @@ fn row_to_rule(row: &rusqlite::Row) -> Result<Rule, rusqlite::Error> {
         order: 0,
         stop_processing: false,
         copy_to: Vec::new(),
+        subtypes: Vec::new(),
     })
 }
 
@@ -400,6 +401,15 @@ pub fn is_valid_label(rules: &[Rule], label: &str) -> bool {
 /// conditions, exceptions, stop_processing).  The LLM must NOT pick a winner
 /// — it must score every listed rule independently.
 pub fn build_prompt_context(rules: &[Rule]) -> String {
+    build_prompt_context_with_strategy(rules, "none")
+}
+
+/// Variant of `build_prompt_context` that augments per-rule sections with
+/// `Allowed doc_type values:` lines when the B8 `enum`/`both` strategy is
+/// active and the rule has `subtypes`. Soft constraint (prompt-only); the
+/// canonicalizer is the post-LLM safety net for `both`.
+pub fn build_prompt_context_with_strategy(rules: &[Rule], doc_type_strategy: &str) -> String {
+    let enum_active = doc_type_strategy == "enum" || doc_type_strategy == "both";
     // Collect enabled rule labels for the score-array schema example.
     let enabled_labels: Vec<&str> = rules
         .iter()
@@ -459,6 +469,13 @@ pub fn build_prompt_context(rules: &[Rule]) -> String {
         }
         if !r.signals.is_empty() {
             lines.push(format!("Keywords: {}", r.signals.join(", ")));
+        }
+        if enum_active && !r.subtypes.is_empty() {
+            let names: Vec<&str> = r.subtypes.iter().map(|s| s.name.as_str()).collect();
+            lines.push(format!(
+                "Allowed `doc_type` values when this rule wins: {}. Use EXACTLY one of these tokens.",
+                names.join(", ")
+            ));
         }
         lines.push(String::new());
     }
