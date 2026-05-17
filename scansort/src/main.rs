@@ -2291,6 +2291,27 @@ fn handle_library_disable_rule(params: &Value, id: Value) -> RpcResponse {
     }
 }
 
+/// W3 (DCR 019e33bf): bulk-reorder rules. Accepts `{order: [label, ...]}`
+/// — must be exactly the current label set, no extras, no duplicates.
+/// Returns `{ok: true, new_order: [{label, order}, ...]}` on success.
+fn handle_library_reorder_rules(params: &Value, id: Value) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let order: Vec<String> = match args.get("order").and_then(|v| v.as_array()) {
+        Some(arr) => arr.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+        None => return ok_response(id, tool_err("order is required (array of rule labels)")),
+    };
+    match library::library_reorder(&order) {
+        Ok(pairs) => {
+            let arr: Vec<Value> = pairs
+                .into_iter()
+                .map(|(label, order)| json!({"label": label, "order": order}))
+                .collect();
+            ok_response(id, tool_ok(json!({"ok": true, "new_order": arr})))
+        }
+        Err(e) => ok_response(id, tool_err(&e.message)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // B5: Sidecar export / import handlers
 // ---------------------------------------------------------------------------
@@ -3353,6 +3374,21 @@ fn main() {
                         },
                     },
                     {
+                        "name": "minerva_scansort_library_reorder_rules",
+                        "description": "W3 (DCR 019e33bf): Bulk-reorder rules in the global library. Reassigns each rule's `order` field to its index in the supplied array (gap-10 spacing for future single-rule inserts). The `order` array must contain exactly the set of labels currently in the library — no extras, no missing, no duplicates. Returns {ok:true, new_order:[{label, order}, ...]} on success, or {ok:false, error:'...'} if validation fails.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "order": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Rule labels in the desired new order. Must match the current library's label set exactly."
+                                },
+                            },
+                            "required": ["order"],
+                        },
+                    },
+                    {
                         "name": "minerva_scansort_library_export_to_sidecar",
                         "description": "B5: Export all rules from the global library to the per-vault sidecar file (<vault-stem>.rules.json next to the vault). vault_label must be open in the current session (kind=Vault). Returns {ok, sidecar_path, count}. Use this to snapshot the library for a specific vault or to share rules with external tools.",
                         "inputSchema": {
@@ -3624,6 +3660,9 @@ fn main() {
                     }
                     "minerva_scansort_library_enable_rule" => {
                         handle_library_enable_rule(&req.params, req.id)
+                    }
+                    "minerva_scansort_library_reorder_rules" => {
+                        handle_library_reorder_rules(&req.params, req.id)
                     }
                     "minerva_scansort_library_disable_rule" => {
                         handle_library_disable_rule(&req.params, req.id)

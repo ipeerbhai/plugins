@@ -339,6 +339,59 @@ pub fn library_list() -> VaultResult<Vec<FileRule>> {
     Ok(file.rules)
 }
 
+/// W3 (DCR 019e33bf): reorder rules by reassigning each rule's `order` field
+/// to its index in the supplied array. Spaces values with a gap of 10 to
+/// leave room for future single-rule inserts without re-walking the whole
+/// library.
+///
+/// `order` must contain exactly the set of labels currently in the library —
+/// no extras, no missing, no duplicates. Returns the resulting
+/// `[(label, order), ...]` pairs in their new order on success.
+pub fn library_reorder(order: &[String]) -> VaultResult<Vec<(String, i64)>> {
+    let mut file = library_load()?;
+
+    let existing: std::collections::HashSet<&str> =
+        file.rules.iter().map(|r| r.label.as_str()).collect();
+    let input_set: std::collections::HashSet<&str> = order.iter().map(String::as_str).collect();
+
+    if input_set.len() != order.len() {
+        return Err(VaultError::new(
+            "order array contains duplicate labels".to_string(),
+        ));
+    }
+
+    let missing: Vec<&str> = existing.difference(&input_set).copied().collect();
+    let extra: Vec<&str> = input_set.difference(&existing).copied().collect();
+
+    if !missing.is_empty() || !extra.is_empty() {
+        let mut msg = String::from(
+            "order array must contain exactly the set of labels currently in the library",
+        );
+        if !missing.is_empty() {
+            let mut m: Vec<&str> = missing;
+            m.sort();
+            msg.push_str(&format!("; missing labels: {}", m.join(", ")));
+        }
+        if !extra.is_empty() {
+            let mut e: Vec<&str> = extra;
+            e.sort();
+            msg.push_str(&format!("; unknown labels: {}", e.join(", ")));
+        }
+        return Err(VaultError::new(msg));
+    }
+
+    let mut new_order: Vec<(String, i64)> = Vec::with_capacity(order.len());
+    for (i, label) in order.iter().enumerate() {
+        let assigned = (i as i64) * 10;
+        if let Some(idx) = rules_file::index_of(&file, label) {
+            file.rules[idx].order = assigned;
+        }
+        new_order.push((label.clone(), assigned));
+    }
+    library_save(&file)?;
+    Ok(new_order)
+}
+
 /// Set `enabled` on a rule by label. Returns true if the rule existed and was
 /// updated, false if not found.
 pub fn library_set_enabled(label: &str, enabled: bool) -> VaultResult<bool> {
@@ -1010,6 +1063,120 @@ mod tests {
             assert_eq!(
                 mtime_before, mtime_after,
                 "new-shape file must not be rewritten by migration probe"
+            );
+
+            clear_library_path_for_test();
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // ------------------------------------------------------------------
+        // W3 (DCR 019e33bf): library_reorder rule reordering
+        // ------------------------------------------------------------------
+
+        // W3-1: happy path — 3 rules reordered, order field persisted to disk.
+        {
+            let dir = unique_tmp("w3_happy");
+            let path = dir.join("library.rules.json");
+            set_library_path_for_test(path.clone());
+
+            library_insert(sample_rule("aaa")).expect("insert");
+            library_insert(sample_rule("bbb")).expect("insert");
+            library_insert(sample_rule("ccc")).expect("insert");
+
+            let new_order: Vec<String> =
+                vec!["ccc".to_string(), "aaa".to_string(), "bbb".to_string()];
+            let result = library_reorder(&new_order).expect("reorder");
+            assert_eq!(result.len(), 3);
+            assert_eq!(result[0], ("ccc".to_string(), 0));
+            assert_eq!(result[1], ("aaa".to_string(), 10));
+            assert_eq!(result[2], ("bbb".to_string(), 20));
+
+            // Confirm persisted to disk (re-read from file).
+            *cache().lock().unwrap() = None;
+            let rules = library_list().expect("list after reorder");
+            let by_label: std::collections::HashMap<&str, i64> =
+                rules.iter().map(|r| (r.label.as_str(), r.order)).collect();
+            assert_eq!(by_label["ccc"], 0);
+            assert_eq!(by_label["aaa"], 10);
+            assert_eq!(by_label["bbb"], 20);
+
+            clear_library_path_for_test();
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // W3-2: rejection — missing label.
+        {
+            let dir = unique_tmp("w3_missing");
+            let path = dir.join("library.rules.json");
+            set_library_path_for_test(path.clone());
+
+            library_insert(sample_rule("alpha")).expect("insert");
+            library_insert(sample_rule("beta")).expect("insert");
+
+            let err = library_reorder(&[String::from("alpha")]).expect_err("missing must reject");
+            assert!(
+                err.message.contains("missing labels: beta"),
+                "expected missing-label error, got: {}",
+                err.message
+            );
+
+            clear_library_path_for_test();
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // W3-3: rejection — unknown extra label.
+        {
+            let dir = unique_tmp("w3_extra");
+            let path = dir.join("library.rules.json");
+            set_library_path_for_test(path.clone());
+
+            library_insert(sample_rule("alpha")).expect("insert");
+
+            let err = library_reorder(&[String::from("alpha"), String::from("ghost")])
+                .expect_err("extra must reject");
+            assert!(
+                err.message.contains("unknown labels: ghost"),
+                "expected unknown-label error, got: {}",
+                err.message
+            );
+
+            clear_library_path_for_test();
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // W3-4: rejection — duplicate input.
+        {
+            let dir = unique_tmp("w3_dup");
+            let path = dir.join("library.rules.json");
+            set_library_path_for_test(path.clone());
+
+            library_insert(sample_rule("alpha")).expect("insert");
+            library_insert(sample_rule("beta")).expect("insert");
+
+            let err =
+                library_reorder(&["alpha".into(), "alpha".into()]).expect_err("dup must reject");
+            assert!(
+                err.message.contains("duplicate"),
+                "expected duplicate-label error, got: {}",
+                err.message
+            );
+
+            clear_library_path_for_test();
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // W3-5: empty input on non-empty library — treated as missing every label.
+        {
+            let dir = unique_tmp("w3_empty");
+            let path = dir.join("library.rules.json");
+            set_library_path_for_test(path.clone());
+
+            library_insert(sample_rule("solo")).expect("insert");
+            let err = library_reorder(&[]).expect_err("empty on non-empty must reject");
+            assert!(
+                err.message.contains("missing labels: solo"),
+                "expected missing-label error, got: {}",
+                err.message
             );
 
             clear_library_path_for_test();
