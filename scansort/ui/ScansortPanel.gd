@@ -2646,12 +2646,11 @@ func _on_edit_doc_pressed(doc_id: int) -> void:
 
 	var doc: Dictionary = doc_result.get("document", {})
 
-	# Fetch rules for category dropdown.
-	var rules_args: Dictionary = {"path": _active_vault_path}
-	if not _vault_password.is_empty():
-		rules_args["password"] = _vault_password
-
-	var rules_result: Dictionary = await conn.call_tool("minerva_scansort_list_rules", rules_args)
+	# W12 (DCR 019e33bf): fetch rules for the category dropdown from the
+	# global library rather than the deprecated path-driven list_rules tool.
+	# The library tool is session/path-free and is the canonical surface
+	# after the path-free DCR (019e2cc988ec, superseded by 019e33bf).
+	var rules_result: Dictionary = await conn.call_tool("minerva_scansort_library_list_rules", {})
 	var rules: Array = []
 	if rules_result.get("ok", false):
 		rules = rules_result.get("rules", [])
