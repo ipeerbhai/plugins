@@ -213,6 +213,11 @@ pub struct ChecklistItem {
 
 // ---------------------------------------------------------------------------
 // Subtype — variant within a rule's category (B8 doc_type normalization)
+//
+// Deprecated by DCR 019e33bf — kept for the W1+W5 transition window so legacy
+// library files still deserialize while W5's migration converts them to the
+// new `stages` shape. W2 removes the field from `Rule`/`FileRule` and the
+// engine; the type itself is retained as long as on-disk legacy files need it.
 // ---------------------------------------------------------------------------
 
 /// A document subtype within a rule. The `name` is the canonical token the
@@ -223,6 +228,58 @@ pub struct Subtype {
     pub name: String,
     #[serde(default)]
     pub also_known_as: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// SlotValues — closed taxonomy or open natural-language constraint
+// (DCR 019e33bf — new rule schema)
+// ---------------------------------------------------------------------------
+
+/// What an extraction slot is allowed to produce.
+///
+/// - `Closed(["yes", "no"])`  — JSON array; the LLM must pick from the list.
+/// - `Open("a 4-digit year")` — JSON string; natural-language constraint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum SlotValues {
+    Closed(Vec<String>),
+    Open(String),
+}
+
+impl Default for SlotValues {
+    fn default() -> Self {
+        SlotValues::Closed(Vec::new())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Slot — one named extraction within a stage's `classify` map
+// ---------------------------------------------------------------------------
+
+/// A single extraction slot. `description` is the human/LLM-readable label;
+/// `values` constrains what the LLM may return for this slot.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Slot {
+    pub description: String,
+    pub values: SlotValues,
+}
+
+// ---------------------------------------------------------------------------
+// Stage — one LLM round (one `ask` + named slots) inside a rule's pipeline
+// ---------------------------------------------------------------------------
+
+/// One stage of a rule's classification pipeline.
+///
+/// Serializes as `{"ask": "...", "classify": {...}, "keep_when": "..."}`.
+/// `classify` slot names are unique per rule (validated across all stages by
+/// `Rule::validate`); `BTreeMap` gives stable alphabetical key ordering on
+/// serialization so on-disk JSON round-trips deterministically.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Stage {
+    pub ask: String,
+    pub classify: std::collections::BTreeMap<String, Slot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_when: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -263,8 +320,41 @@ pub struct Rule {
     /// Document subtypes within this rule (B8 doc_type normalization).
     /// Used by the enum strategy (prompt augmentation) and canonicalize
     /// strategy (post-LLM alias→name mapping).
+    ///
+    /// Deprecated by DCR 019e33bf (W1). Kept on the struct for the W1+W5
+    /// transition window so legacy `library.rules.json` files still deserialize
+    /// before W5's migration rewrites them into `stages`. W2 removes this field
+    /// and the engine code that reads it.
     #[serde(default)]
     pub subtypes: Vec<Subtype>,
+    /// W1 (DCR 019e33bf): per-rule classification pipeline. Each stage is one
+    /// LLM round. Slot names are unique across all stages (enforced by
+    /// `validate`). Empty until W2 wires the engine to read it; legacy rules
+    /// have this populated by W5 migration on first load.
+    #[serde(default)]
+    pub stages: Vec<Stage>,
+}
+
+impl Rule {
+    /// Reject duplicate `classify` slot names across stages (DCR 019e33bf
+    /// invariant). Called from `library_insert` callers; returns the first
+    /// offending slot name in its error message.
+    pub fn validate(&self) -> VaultResult<()> {
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (i, stage) in self.stages.iter().enumerate() {
+            for slot_name in stage.classify.keys() {
+                if let Some(prev) = seen.get(slot_name) {
+                    return Err(VaultError::new(format!(
+                        "slot name '{}' is declared in stage {} but already declared in stage {}; \
+                         classify slot names must be unique across all stages of a rule",
+                        slot_name, i, prev
+                    )));
+                }
+                seen.insert(slot_name.clone(), i);
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

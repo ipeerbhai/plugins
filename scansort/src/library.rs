@@ -158,9 +158,47 @@ pub fn library_load() -> VaultResult<RulesFile> {
 
     // Cache miss — reload from disk.
     match rules_file::load_or_init(&path) {
-        Ok(file) => {
+        Ok(mut file) => {
+            // W5 — DCR 019e33bf: detect legacy markers (`signals`/`subtypes`/
+            // built-in template tokens with no `stages`) and rewrite each
+            // rule into the new shape, then persist the migrated file so the
+            // next read is a no-op.
+            let any_legacy = file.rules.iter().any(crate::migrate::is_legacy);
+            if any_legacy {
+                let mut changed = 0usize;
+                for rule in &mut file.rules {
+                    if crate::migrate::migrate_rule(rule) {
+                        changed += 1;
+                    }
+                }
+                if changed > 0 {
+                    log::info!(
+                        "library_load: migrated {} of {} rules to new schema; rewriting {}",
+                        changed,
+                        file.rules.len(),
+                        path.display()
+                    );
+                    if let Err(e) = rules_file::save(&path, &file) {
+                        log::warn!(
+                            "library_load: migration succeeded in memory but write-back failed: {}; \
+                             returning migrated copy without persisting",
+                            e.message
+                        );
+                    }
+                }
+            }
+
+            // Re-stat after possible write-back so the cached mtime matches disk.
+            let cached_mtime = if any_legacy {
+                fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(file_mtime)
+            } else {
+                file_mtime
+            };
+
             *guard = Some(CachedLibrary {
-                mtime: file_mtime,
+                mtime: cached_mtime,
                 file: file.clone(),
             });
             Ok(file)
@@ -265,6 +303,9 @@ pub fn library_import_from_sidecar(
 /// Upsert a rule by label into the library. Returns the resulting FileRule
 /// (post-save, so the on-disk state is canonical).
 pub fn library_insert(rule: FileRule) -> VaultResult<FileRule> {
+    // W1 (DCR 019e33bf): reject duplicate classify slot names across stages
+    // at insert time so the on-disk library never contains a malformed rule.
+    rule.validate()?;
     let mut file = library_load()?;
     rules_file::upsert(&mut file, rule.clone());
     library_save(&file)?;
@@ -335,11 +376,14 @@ mod tests {
     }
 
     fn sample_rule(label: &str) -> FileRule {
+        // Migration-neutral fixture for library CRUD tests: no signals/subtypes
+        // and no built-in tokens in templates, so library_load does NOT rewrite
+        // the file. W5 has its own legacy-shape fixtures in `w5_migration_subtests`.
         FileRule {
             label: label.to_string(),
             name: format!("Rule {label}"),
             instruction: format!("Match {label} documents."),
-            signals: vec!["alpha".to_string(), "beta".to_string()],
+            signals: Vec::new(),
             subfolder: format!("out/{label}"),
             rename_pattern: String::new(),
             confidence_threshold: 0.7,
@@ -352,6 +396,7 @@ mod tests {
             stop_processing: false,
             copy_to: Vec::new(),
             subtypes: Vec::new(),
+            stages: Vec::new(),
         }
     }
 
@@ -434,7 +479,7 @@ mod tests {
 
             let found = library_get("receipt").expect("get").expect("found");
             assert_eq!(found.label, "receipt");
-            assert_eq!(found.signals, vec!["alpha", "beta"]);
+            assert_eq!(found.instruction, "Match receipt documents.");
 
             let not_found = library_get("no_such_label").expect("get ok");
             assert!(not_found.is_none());
@@ -548,6 +593,7 @@ mod tests {
         // serialized execution context as the existing 8 scenarios above.
         b7_cache_subtests();
         b5_sidecar_subtests();
+        w5_migration_subtests();
     }
 
     // ----------------------------------------------------------------
@@ -771,6 +817,199 @@ mod tests {
                 err.message.contains("sidecar not found"),
                 "unexpected error: {}",
                 err.message
+            );
+
+            clear_library_path_for_test();
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // W5: Schema migration on library load — DCR 019e33bf
+    // Each sub-test plants a legacy library file on disk, calls
+    // library_load(), and confirms (a) the in-memory result is migrated,
+    // (b) the on-disk file is rewritten, (c) a second load is a no-op.
+    // ----------------------------------------------------------------
+    fn w5_migration_subtests() {
+        use crate::types::SlotValues;
+
+        // Helper — write raw JSON to the test library path.
+        fn plant(path: &PathBuf, body: &str) {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, body).unwrap();
+        }
+
+        // W5-1: signals + rename_pattern with built-in tokens → migrated to
+        // stages + signals-suffixed instruction. On-disk file rewritten.
+        {
+            let dir = unique_tmp("w5_signals_builtins");
+            let path = dir.join("library.rules.json");
+            set_library_path_for_test(path.clone());
+
+            plant(&path, r#"{
+                "schema_version": 2,
+                "default_category": "memories",
+                "confidence_threshold": 0.6,
+                "rename_pattern": "",
+                "rules": [{
+                    "label": "tax",
+                    "name": "Tax docs",
+                    "instruction": "Tax forms and statements.",
+                    "signals": ["W-2", "1099", "withholding"],
+                    "subfolder": "tax/{year}",
+                    "rename_pattern": "{date}_{sender}_{description}.pdf",
+                    "confidence_threshold": 0.7,
+                    "encrypt": false,
+                    "enabled": true,
+                    "is_default": false
+                }]
+            }"#);
+
+            let rules = library_list().expect("list triggers migration");
+            assert_eq!(rules.len(), 1);
+            let r = &rules[0];
+            assert!(r.signals.is_empty(), "signals must be cleared in memory");
+            assert!(
+                r.instruction.contains("typical signals include W-2, 1099, withholding"),
+                "instruction should carry signals; got: {}",
+                r.instruction
+            );
+            assert_eq!(r.stages.len(), 1, "built-in tokens fold into stages[0]");
+            let classify = &r.stages[0].classify;
+            for tok in ["date", "sender", "description", "year"] {
+                assert!(classify.contains_key(tok), "expected slot '{tok}'");
+            }
+            for tok in ["amount", "category", "doc_type", "issuer"] {
+                assert!(!classify.contains_key(tok), "unreferenced slot '{tok}' must not be injected");
+            }
+
+            // On-disk file must be rewritten — signals key gone.
+            let raw = fs::read_to_string(&path).unwrap();
+            assert!(!raw.contains("\"signals\""), "on-disk file must not retain signals key after migration");
+            assert!(raw.contains("\"stages\""), "on-disk file must contain stages after migration");
+
+            // Idempotent — second load must not rewrite.
+            let mtime_after_first = fs::metadata(&path).unwrap().modified().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            // Clear cache so library_load goes back to disk.
+            *cache().lock().unwrap() = None;
+            let _ = library_load().expect("idempotent reload");
+            let mtime_after_second = fs::metadata(&path).unwrap().modified().unwrap();
+            assert_eq!(
+                mtime_after_first, mtime_after_second,
+                "migrated file must not be rewritten on second load"
+            );
+
+            clear_library_path_for_test();
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // W5-2: subtypes-only → injected doc_type slot with closed list.
+        {
+            let dir = unique_tmp("w5_subtypes");
+            let path = dir.join("library.rules.json");
+            set_library_path_for_test(path.clone());
+
+            plant(&path, r#"{
+                "schema_version": 2,
+                "default_category": "memories",
+                "confidence_threshold": 0.6,
+                "rename_pattern": "",
+                "rules": [{
+                    "label": "form_types",
+                    "subfolder": "forms",
+                    "rename_pattern": "form.pdf",
+                    "subtypes": [
+                        {"name": "W-2", "also_known_as": ["w2"]},
+                        {"name": "1099", "also_known_as": []}
+                    ]
+                }]
+            }"#);
+
+            let r = &library_list().expect("list")[0];
+            assert!(r.subtypes.is_empty());
+            assert_eq!(r.stages.len(), 1);
+            let slot = r.stages[0].classify.get("doc_type").expect("doc_type slot");
+            match &slot.values {
+                SlotValues::Closed(v) => {
+                    assert_eq!(v, &vec!["W-2".to_string(), "1099".to_string()]);
+                }
+                other => panic!("expected closed list, got {:?}", other),
+            }
+
+            clear_library_path_for_test();
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // W5-3: combined signals + subtypes + built-ins — single stage,
+        // doc_type from subtypes plus extra slots from templates.
+        {
+            let dir = unique_tmp("w5_combined");
+            let path = dir.join("library.rules.json");
+            set_library_path_for_test(path.clone());
+
+            plant(&path, r#"{
+                "schema_version": 2,
+                "default_category": "memories",
+                "confidence_threshold": 0.6,
+                "rename_pattern": "",
+                "rules": [{
+                    "label": "tax",
+                    "instruction": "Tax materials.",
+                    "signals": ["wages"],
+                    "subtypes": [{"name": "W-2", "also_known_as": []}],
+                    "subfolder": "tax/{year}",
+                    "rename_pattern": "{date}.pdf"
+                }]
+            }"#);
+
+            let r = &library_list().expect("list")[0];
+            assert!(r.signals.is_empty());
+            assert!(r.subtypes.is_empty());
+            assert_eq!(r.stages.len(), 1, "combined migration folds into one stage");
+            let classify = &r.stages[0].classify;
+            assert!(classify.contains_key("doc_type"));
+            assert!(classify.contains_key("year"));
+            assert!(classify.contains_key("date"));
+            assert!(r.instruction.contains("typical signals include wages"));
+
+            clear_library_path_for_test();
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // W5-4: already-new-shape rule is untouched on load.
+        {
+            let dir = unique_tmp("w5_already_new");
+            let path = dir.join("library.rules.json");
+            set_library_path_for_test(path.clone());
+
+            plant(&path, r#"{
+                "schema_version": 2,
+                "default_category": "memories",
+                "confidence_threshold": 0.6,
+                "rename_pattern": "",
+                "rules": [{
+                    "label": "modern",
+                    "instruction": "Already migrated.",
+                    "subfolder": "modern",
+                    "rename_pattern": "file.pdf",
+                    "stages": [{
+                        "ask": "Is this relevant?",
+                        "classify": {"yes": {"description": "yes/no", "values": ["yes", "no"]}},
+                        "keep_when": "yes == 'yes'"
+                    }]
+                }]
+            }"#);
+
+            let mtime_before = fs::metadata(&path).unwrap().modified().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let _ = library_list().expect("list");
+            let mtime_after = fs::metadata(&path).unwrap().modified().unwrap();
+            assert_eq!(
+                mtime_before, mtime_after,
+                "new-shape file must not be rewritten by migration probe"
             );
 
             clear_library_path_for_test();

@@ -496,6 +496,7 @@ mod tests {
             stop_processing: stop,
             copy_to: copy_to.into_iter().map(String::from).collect(),
             subtypes: Vec::new(),
+            stages: Vec::new(),
         }
     }
 
@@ -1197,6 +1198,7 @@ mod tests {
             stop_processing: false,
             copy_to: vec![],
             subtypes: Vec::new(),
+            stages: Vec::new(),
         };
         let invoice_rule = make_rule("invoice", 1, 0.6, false, vec![], "", "", None, None);
         let rules = vec![invoice_rule, default_rule];
@@ -1345,6 +1347,7 @@ mod tests {
                 stop_processing: false,
                 copy_to: vec![],
                 subtypes: Vec::new(),
+                stages: Vec::new(),
             },
         ];
 

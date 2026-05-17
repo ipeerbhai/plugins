@@ -714,6 +714,7 @@ mod tests {
             stop_processing: false,
             copy_to: copy_to.into_iter().map(String::from).collect(),
             subtypes: Vec::new(),
+            stages: Vec::new(),
         }
     }
 

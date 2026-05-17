@@ -40,6 +40,7 @@ fn row_to_rule(row: &rusqlite::Row) -> Result<Rule, rusqlite::Error> {
         stop_processing: false,
         copy_to: Vec::new(),
         subtypes: Vec::new(),
+        stages: Vec::new(),
     })
 }
 

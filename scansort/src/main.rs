@@ -43,6 +43,7 @@ mod rules;
 mod rules_file;
 mod schema;
 mod library;
+mod migrate;
 mod process;
 mod session;
 mod source;
@@ -669,6 +670,7 @@ fn handle_insert_rule(params: &Value, id: Value) -> RpcResponse {
             stop_processing,
             copy_to,
             subtypes,
+            stages: Vec::new(),
         };
         let idx = rules_file::upsert(&mut file, rule);
         if let Err(e) = rules_file::save(p, &file) {
@@ -2162,6 +2164,7 @@ fn handle_library_insert_rule(params: &Value, id: Value) -> RpcResponse {
         stop_processing,
         copy_to,
         subtypes,
+        stages: Vec::new(),
     };
     match library::library_insert(rule) {
         Ok(r) => match serde_json::to_value(&r) {

@@ -6,7 +6,7 @@
 //! `user://scansort_rules.json` format so files port forward.
 
 use crate::db;
-use crate::types::{now_iso, ConditionNode, Rule, Subtype, VaultError, VaultResult};
+use crate::types::{now_iso, ConditionNode, Rule, Stage, Subtype, VaultError, VaultResult};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -35,7 +35,9 @@ pub struct FileRule {
     pub name: String,
     #[serde(default)]
     pub instruction: String,
-    #[serde(default)]
+    /// Deprecated by DCR 019e33bf (W1). Read on load for legacy compatibility;
+    /// `skip_serializing_if` keeps the field out of migrated/new files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub signals: Vec<String>,
     #[serde(default)]
     pub subfolder: String,
@@ -68,8 +70,18 @@ pub struct FileRule {
     #[serde(default)]
     pub copy_to: Vec<String>,
     /// Document subtypes within this rule (B8 doc_type normalization).
-    #[serde(default)]
+    ///
+    /// Deprecated by DCR 019e33bf (W1). Kept on the on-disk shape during the
+    /// W1+W5 transition window so legacy `library.rules.json` files still
+    /// deserialize before W5's migration rewrites them into `stages`. W2
+    /// removes this field after engine adaptation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subtypes: Vec<Subtype>,
+    /// W1 (DCR 019e33bf): per-rule classification pipeline. Each stage is one
+    /// LLM round. Empty until W5 migration runs (for legacy files) or until
+    /// new rules are authored via the focused-chat skill (W9).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<Stage>,
 }
 
 impl From<Rule> for FileRule {
@@ -91,11 +103,32 @@ impl From<Rule> for FileRule {
             stop_processing: r.stop_processing,
             copy_to: r.copy_to,
             subtypes: r.subtypes,
+            stages: r.stages,
         }
     }
 }
 
 impl FileRule {
+    /// Reject duplicate `classify` slot names across stages (DCR 019e33bf
+    /// invariant). Returns the first offending slot in its error message;
+    /// call this from any insert/upsert path before persisting.
+    pub fn validate(&self) -> VaultResult<()> {
+        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (i, stage) in self.stages.iter().enumerate() {
+            for slot_name in stage.classify.keys() {
+                if let Some(&prev) = seen.get(slot_name.as_str()) {
+                    return Err(VaultError::new(format!(
+                        "slot name '{}' is declared in stage {} but already declared in stage {}; \
+                         classify slot names must be unique across all stages of a rule",
+                        slot_name, i, prev
+                    )));
+                }
+                seen.insert(slot_name.as_str(), i);
+            }
+        }
+        Ok(())
+    }
+
     /// Convert into the in-memory Rule shape used by classifier helpers.
     /// `rule_id` is 0 since rules from a file don't have a SQLite PK.
     pub fn into_rule(self) -> Rule {
@@ -117,6 +150,7 @@ impl FileRule {
             stop_processing: self.stop_processing,
             copy_to: self.copy_to,
             subtypes: self.subtypes,
+            stages: self.stages,
         }
     }
 }
@@ -355,6 +389,7 @@ fn read_embedded_rules(conn: &Connection) -> VaultResult<Vec<FileRule>> {
             stop_processing: false,
             copy_to: Vec::new(),
             subtypes: Vec::new(),
+            stages: Vec::new(),
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
@@ -591,6 +626,7 @@ mod tests {
             stop_processing: false,
             copy_to: Vec::new(),
             subtypes: Vec::new(),
+            stages: Vec::new(),
         }
     }
 
@@ -1031,6 +1067,7 @@ mod tests {
                 stop_processing: false,
                 copy_to: Vec::new(),
                 subtypes: Vec::new(),
+                stages: Vec::new(),
             }],
         };
         save(&sibling, &pre_existing).unwrap();
@@ -1073,6 +1110,7 @@ mod tests {
                 encrypt: false,
                 enabled: true,
                 is_default: false,
+                stages: Vec::new(),
                 conditions: None,
                 exceptions: None,
                 order: 0,
@@ -1453,5 +1491,310 @@ mod tests {
         // Column names unchanged.
         assert!(get_doc_columns(&conn).contains(&"issuer".to_string()));
         assert!(!get_doc_columns(&conn).contains(&"sender".to_string()));
+    }
+
+    // =========================================================================
+    // W1 (DCR 019e33bf): new rule schema — stages/classify/keep_when round-trip
+    // =========================================================================
+
+    use crate::types::{Slot, SlotValues, Stage};
+
+    /// Parse the DCR §"The rule schema" tax example verbatim and confirm every
+    /// field survives a save→load round-trip.
+    #[test]
+    fn dcr_tax_example_round_trips_with_two_stages_and_filters() {
+        let dir = unique_tmp("dcr_tax");
+        let path = dir.join("rules.json");
+
+        let json = r#"{
+            "schema_version": 2,
+            "default_category": "memories",
+            "confidence_threshold": 0.6,
+            "rename_pattern": "",
+            "rules": [{
+                "label": "tax_by_client",
+                "name": "Per-client tax filings",
+                "instruction": "Tax forms and statements received from clients.",
+                "confidence_threshold": 0.6,
+                "enabled": true,
+                "is_default": false,
+                "encrypt": false,
+                "order": 10,
+                "stop_processing": false,
+                "stages": [
+                    {
+                        "ask": "Is this a tax-relevant document?",
+                        "classify": {
+                            "is_tax": {"description": "tax-relevant", "values": ["yes", "no"]}
+                        },
+                        "keep_when": "is_tax == 'yes'"
+                    },
+                    {
+                        "ask": "Whose form is this, and what kind?",
+                        "classify": {
+                            "client": {"description": "the recipient's name", "values": "a person's name, or 'unknown'"},
+                            "form":   {"description": "form type", "values": ["1099", "W-2", "1040", "K-1", "other"]},
+                            "year":   {"description": "tax year", "values": "a 4-digit year, or 'unknown'"}
+                        },
+                        "keep_when": "client != 'unknown'"
+                    }
+                ],
+                "subfolder": "{client}/{year}",
+                "rename_pattern": "{form}.pdf",
+                "copy_to": []
+            }]
+        }"#;
+
+        let parsed: RulesFile = serde_json::from_str(json).expect("parse DCR tax example");
+        save(&path, &parsed).expect("save");
+        let loaded = load(&path).expect("load");
+        let r = &loaded.rules[0];
+
+        assert_eq!(r.label, "tax_by_client");
+        assert_eq!(r.stages.len(), 2);
+
+        // Stage 0 — closed-list slot + keep_when
+        let s0 = &r.stages[0];
+        assert_eq!(s0.ask, "Is this a tax-relevant document?");
+        assert_eq!(s0.keep_when.as_deref(), Some("is_tax == 'yes'"));
+        let is_tax = s0.classify.get("is_tax").expect("is_tax slot");
+        match &is_tax.values {
+            SlotValues::Closed(v) => assert_eq!(v, &vec!["yes".to_string(), "no".to_string()]),
+            other => panic!("expected closed list, got {:?}", other),
+        }
+
+        // Stage 1 — mix of open and closed slots
+        let s1 = &r.stages[1];
+        assert_eq!(s1.classify.len(), 3);
+        let client = s1.classify.get("client").expect("client slot");
+        match &client.values {
+            SlotValues::Open(s) => assert!(s.contains("person")),
+            other => panic!("expected open slot, got {:?}", other),
+        }
+        let form = s1.classify.get("form").expect("form slot");
+        match &form.values {
+            SlotValues::Closed(v) => assert!(v.contains(&"W-2".to_string())),
+            other => panic!("expected closed list, got {:?}", other),
+        }
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Persona-2 (Lawyer): multi-stage with filter on stage 1 then no filter.
+    /// Confirms keep_when can be present on some stages and absent on others.
+    #[test]
+    fn dcr_lawyer_persona_two_stage_round_trips() {
+        let dir = unique_tmp("dcr_lawyer");
+        let path = dir.join("rules.json");
+
+        let mut s0_classify = std::collections::BTreeMap::new();
+        s0_classify.insert(
+            "is_witness".to_string(),
+            Slot {
+                description: "witness-related document".to_string(),
+                values: SlotValues::Closed(vec!["yes".to_string(), "no".to_string()]),
+            },
+        );
+        let mut s1_classify = std::collections::BTreeMap::new();
+        s1_classify.insert(
+            "witness".to_string(),
+            Slot {
+                description: "witness name".to_string(),
+                values: SlotValues::Open("a person's name, or 'unknown'".to_string()),
+            },
+        );
+        s1_classify.insert(
+            "case_id".to_string(),
+            Slot {
+                description: "case identifier".to_string(),
+                values: SlotValues::Open("a case number, or 'unknown'".to_string()),
+            },
+        );
+
+        let rule = FileRule {
+            label: "witness_reports".to_string(),
+            name: "Witness reports".to_string(),
+            instruction: "Witness statements and deposition transcripts.".to_string(),
+            signals: Vec::new(),
+            subfolder: "cases/{case_id}".to_string(),
+            rename_pattern: "{witness}.pdf".to_string(),
+            confidence_threshold: 0.65,
+            encrypt: true,
+            enabled: true,
+            is_default: false,
+            conditions: None,
+            exceptions: None,
+            order: 0,
+            stop_processing: false,
+            copy_to: Vec::new(),
+            subtypes: Vec::new(),
+            stages: vec![
+                Stage {
+                    ask: "Is this a witness-related document?".to_string(),
+                    classify: s0_classify,
+                    keep_when: Some("is_witness == 'yes'".to_string()),
+                },
+                Stage {
+                    ask: "Who is the witness and which case?".to_string(),
+                    classify: s1_classify,
+                    keep_when: None,
+                },
+            ],
+        };
+
+        let mut file = RulesFile::default();
+        file.rules.push(rule);
+        save(&path, &file).expect("save");
+        let loaded = load(&path).expect("load");
+        let r = &loaded.rules[0];
+
+        assert_eq!(r.stages.len(), 2);
+        assert!(r.stages[0].keep_when.is_some(), "stage 0 must keep its filter");
+        assert!(r.stages[1].keep_when.is_none(), "stage 1 must round-trip without filter");
+        assert!(r.encrypt, "encrypt flag must survive");
+
+        // keep_when=None serializes-out cleanly (not present in JSON).
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let stages = v["rules"][0]["stages"].as_array().unwrap();
+        assert!(
+            stages[1].get("keep_when").is_none(),
+            "stage with no filter must omit keep_when key from on-disk JSON"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Persona-3 (Citizen): single-stage with open-slot drawings extraction.
+    #[test]
+    fn dcr_citizen_drawings_single_stage_round_trips() {
+        let dir = unique_tmp("dcr_citizen");
+        let path = dir.join("rules.json");
+
+        let mut classify = std::collections::BTreeMap::new();
+        classify.insert(
+            "subject".to_string(),
+            Slot {
+                description: "what the drawing shows".to_string(),
+                values: SlotValues::Open("a 2-5 word phrase".to_string()),
+            },
+        );
+
+        let rule = FileRule {
+            label: "kids_drawings".to_string(),
+            name: "Kids drawings".to_string(),
+            instruction: "Drawings by my children — keep all of them.".to_string(),
+            signals: Vec::new(),
+            subfolder: "kids".to_string(),
+            rename_pattern: "{subject}.png".to_string(),
+            confidence_threshold: 0.5,
+            encrypt: false,
+            enabled: true,
+            is_default: false,
+            conditions: None,
+            exceptions: None,
+            order: 0,
+            stop_processing: false,
+            copy_to: Vec::new(),
+            subtypes: Vec::new(),
+            stages: vec![Stage {
+                ask: "What does this drawing show?".to_string(),
+                classify,
+                keep_when: None,
+            }],
+        };
+
+        let mut file = RulesFile::default();
+        file.rules.push(rule.clone());
+        save(&path, &file).expect("save");
+        let loaded = load(&path).expect("load");
+        let r = &loaded.rules[0];
+
+        assert_eq!(r.stages.len(), 1, "single-stage rules still wrap in a one-element array");
+        let slot = r.stages[0].classify.get("subject").expect("subject slot");
+        match &slot.values {
+            SlotValues::Open(s) => assert_eq!(s, "a 2-5 word phrase"),
+            other => panic!("expected open slot, got {:?}", other),
+        }
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Slot-name collision across stages: validate() must reject before insert.
+    #[test]
+    fn file_rule_validate_rejects_duplicate_slot_across_stages() {
+        let mut s0 = std::collections::BTreeMap::new();
+        s0.insert(
+            "year".to_string(),
+            Slot {
+                description: "year".to_string(),
+                values: SlotValues::Open("YYYY".to_string()),
+            },
+        );
+        let mut s1 = std::collections::BTreeMap::new();
+        s1.insert(
+            "year".to_string(),
+            Slot {
+                description: "year again".to_string(),
+                values: SlotValues::Open("YYYY".to_string()),
+            },
+        );
+
+        let rule = FileRule {
+            label: "bad".to_string(),
+            name: "bad".to_string(),
+            instruction: String::new(),
+            signals: Vec::new(),
+            subfolder: String::new(),
+            rename_pattern: String::new(),
+            confidence_threshold: 0.5,
+            encrypt: false,
+            enabled: true,
+            is_default: false,
+            conditions: None,
+            exceptions: None,
+            order: 0,
+            stop_processing: false,
+            copy_to: Vec::new(),
+            subtypes: Vec::new(),
+            stages: vec![
+                Stage {
+                    ask: "First".to_string(),
+                    classify: s0,
+                    keep_when: None,
+                },
+                Stage {
+                    ask: "Second".to_string(),
+                    classify: s1,
+                    keep_when: None,
+                },
+            ],
+        };
+
+        let err = rule.validate().expect_err("must reject duplicate slot");
+        assert!(
+            err.message.contains("'year'") && err.message.contains("stage 1"),
+            "expected duplicate-slot error mentioning slot name and stage index, got: {}",
+            err.message
+        );
+    }
+
+    /// Single-stage rules in the new schema are always wrapped in a one-element
+    /// `stages` array — there is no flat shortcut. Confirms the DCR design
+    /// choice (single-stage rules always wrapped in `stages: [{...}]`).
+    #[test]
+    fn single_stage_rule_is_always_a_one_element_stages_array() {
+        let json = r#"{
+            "schema_version": 2,
+            "default_category": "x",
+            "confidence_threshold": 0.6,
+            "rename_pattern": "",
+            "rules": [{
+                "label": "r",
+                "stages": [{"ask": "Q?", "classify": {"x": {"description": "x", "values": ["a"]}}}]
+            }]
+        }"#;
+        let f: RulesFile = serde_json::from_str(json).expect("parse");
+        assert_eq!(f.rules[0].stages.len(), 1, "single-stage rule has stages.len() == 1");
     }
 }
