@@ -2426,6 +2426,33 @@ fn handle_process(
     }
 }
 
+/// W4 (DCR 019e33bf): dry-run the full Phase-1 + stage walk for one document
+/// without placing it anywhere. Returns per-rule trace: score, threshold,
+/// fired/filtered/below-threshold, stage-by-stage slot values, resolved
+/// subfolder + filename + would_copy_to. The `Test on…` row-menu action in
+/// W7 calls this tool.
+fn handle_dryrun_one(
+    id: Value,
+    params: &Value,
+    out: &mut impl Write,
+    lines: &mut impl Iterator<Item = Result<String, io::Error>>,
+    next_id: &mut u64,
+) -> RpcResponse {
+    let args = params.get("arguments").unwrap_or(params);
+    let doc_path = args.get("doc_path").and_then(|v| v.as_str()).unwrap_or("");
+    if doc_path.is_empty() {
+        return ok_response(id, tool_err("doc_path is required"));
+    }
+    let rule_label_filter = args.get("rule_label").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let model = args.get("model").and_then(|v| v.as_str()).unwrap_or("default");
+    let model_spec = args.get("model_spec").cloned();
+
+    match process::dryrun_one(out, lines, next_id, doc_path, rule_label_filter, model, model_spec.as_ref()) {
+        Ok(v) => ok_response(id, tool_ok(v)),
+        Err(e) => ok_response(id, tool_err(&e)),
+    }
+}
+
 fn main() {
     // Logging goes to stderr so it never pollutes the JSON-RPC stdout channel.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -3430,6 +3457,20 @@ fn main() {
                         },
                     },
                     {
+                        "name": "minerva_scansort_dryrun_one",
+                        "description": "W4 (DCR 019e33bf): Dry-run the full Phase-1 (rule scoring) + Phase-2 (per-rule stage walk) pipeline for ONE document, WITHOUT placing it anywhere. No filesystem moves, no `placement` trace event. Returns per-rule trace: {rule_label, score, threshold, fired, [reason], stages:[{ask,slot_values,keep_when,kept}], resolved_subfolder|null, resolved_filename|null, would_copy_to:[label,...]}. Used by the W7 row-menu 'Test on…' action.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "doc_path": {"type": "string", "description": "Absolute path to the document to dry-run."},
+                                "rule_label": {"type": "string", "description": "Optional: only evaluate this single enabled rule. When omitted, evaluates every enabled rule."},
+                                "model": {"type": "string", "description": "Optional model identifier for host.providers.chat (default 'default')."},
+                                "model_spec": {"type": "object", "description": "Optional structured provider spec (wins over `model` when present)."}
+                            },
+                            "required": ["doc_path"]
+                        }
+                    },
+                    {
                         "name": "minerva_scansort_audit_append",
                         "description": "W9: Append one or more rows to the append-only CSV audit log. Creates the file with a header row on first write; never truncates. The toggle (audit_log_enabled) is checked by the panel — call this tool only when the toggle is ON. Non-fatal: if log_path is unwritable, returns {ok:false, error:...} without panicking. W10 MUST treat audit failure as non-fatal. CSV columns: timestamp, event, source_sha256, source_filename, rule_label, destination_id, destination_kind, resolved_path, disposition, detail. Returns {ok, log_path, rows_written}.",
                         "inputSchema": {
@@ -3678,6 +3719,9 @@ fn main() {
                     }
                     "minerva_scansort_library_import_from_sidecar" => {
                         handle_library_import_from_sidecar(&req.params, req.id)
+                    }
+                    "minerva_scansort_dryrun_one" => {
+                        handle_dryrun_one(req.id, &req.params, &mut out, &mut lines, &mut next_id)
                     }
                     "minerva_scansort_process" => {
                         handle_process(req.id, &req.params, &mut out, &mut lines, &mut next_id)

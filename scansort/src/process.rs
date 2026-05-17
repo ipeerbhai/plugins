@@ -706,6 +706,192 @@ fn collect_files_inner(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// W4 (DCR 019e33bf): dryrun_one — pre-placement trace for a single doc
+// ---------------------------------------------------------------------------
+
+/// Run extract → Phase-1 classify → per-rule stage walk → template resolve
+/// for one document, WITHOUT placing it anywhere. Returns a structured trace
+/// the UI's "Test on…" affordance and dryrun MCP tool consume.
+///
+/// `rule_label` filter: when Some, only evaluate that single enabled rule;
+/// when None, evaluate every enabled rule. The function does NOT short-circuit
+/// on `stop_processing` since the dry-run shows "what would each rule do".
+///
+/// Trace-log emission: DCR 019e33a2 phases 1+2 (`rule_evaluated`,
+/// `stage_executed`, `template_resolved`) are intended to come from here. They
+/// are NOT yet emitted (trace log unlanded — see pickup §"Stop conditions" #8);
+/// the same data appears in the return value, so consumers can switch from
+/// reading return-shape → reading the trace log without losing information.
+pub fn dryrun_one(
+    out: &mut impl io::Write,
+    lines: &mut impl Iterator<Item = Result<String, io::Error>>,
+    next_id: &mut u64,
+    doc_path: &str,
+    rule_label_filter: Option<&str>,
+    model: &str,
+    model_spec: Option<&Value>,
+) -> Result<Value, String> {
+    use std::path::Path;
+    let path = Path::new(doc_path);
+    if !path.exists() {
+        return Err(format!("doc_path does not exist: {doc_path}"));
+    }
+
+    // 1. SHA-256 (so traces are correlatable to placement later).
+    let sha256 = crate::types::compute_sha256(path).map_err(|e| e.message)?;
+
+    // 2. Text extraction.
+    let extracted = extract::extract_file(doc_path).map_err(|e| e.message)?;
+    let full_text = extracted.full_text;
+
+    // 3. Load enabled rules; optionally filter to a single label.
+    let lib_rules = library::library_list().map_err(|e| e.message)?;
+    let mut enabled_rules: Vec<FileRule> = lib_rules.into_iter().filter(|r| r.enabled).collect();
+    if let Some(filter) = rule_label_filter {
+        enabled_rules.retain(|r| r.label == filter);
+        if enabled_rules.is_empty() {
+            return Err(format!("rule '{filter}' not found or not enabled"));
+        }
+    }
+    if enabled_rules.is_empty() {
+        return Ok(json!({
+            "ok": true,
+            "doc_path": doc_path,
+            "doc_sha256": sha256,
+            "rules_evaluated": [],
+            "note": "no enabled rules in library",
+        }));
+    }
+
+    let rule_objs: Vec<Rule> = enabled_rules.iter().map(|r| r.clone().into_rule()).collect();
+
+    // 4. Phase 1 — single chat to score every enabled rule + extract facts.
+    let messages = classifier::build_messages_with_strategy(&full_text, 4000, &rule_objs, "none");
+    let mut chat_args = json!({"messages": messages, "model": model});
+    if let Some(spec) = model_spec {
+        let is_empty_obj = spec.as_object().map_or(false, |o| o.is_empty());
+        if !spec.is_null() && !is_empty_obj {
+            chat_args["model_spec"] = spec.clone();
+        }
+    }
+    let chat_response =
+        request_capability(out, lines, next_id, "host.providers.chat", chat_args)?;
+    let response_text = chat_response
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    if response_text.is_empty() {
+        return Err("empty Phase-1 LLM response".into());
+    }
+    let classification = classifier::parse_response(&response_text, &rule_objs);
+
+    // 5. File facts.
+    let file_facts = FileFacts {
+        filename: path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string(),
+        extension: path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_string(),
+        size: std::fs::metadata(path).map(|m| m.len() as i64).unwrap_or(0),
+    };
+
+    // 6. Per-rule walk. Use stage_walker directly (not run_with_stages) so we
+    //    can record per-rule outcomes for filtered/below-threshold rules too.
+    let mut caller = CapabilityLlmCaller {
+        out,
+        lines,
+        next_id,
+        model,
+        model_spec,
+    };
+
+    let mut rules_evaluated: Vec<Value> = Vec::with_capacity(rule_objs.len());
+    for rule in &rule_objs {
+        let score = classification
+            .rule_signals
+            .iter()
+            .find(|s| s.label == rule.label)
+            .map(|s| s.score)
+            .unwrap_or(0.0);
+        let passes_threshold = score >= rule.confidence_threshold;
+
+        if !passes_threshold {
+            rules_evaluated.push(json!({
+                "rule_label": rule.label,
+                "score": score,
+                "threshold": rule.confidence_threshold,
+                "fired": false,
+                "reason": "below_threshold",
+                "stages": [],
+                "resolved_subfolder": Value::Null,
+                "resolved_filename": Value::Null,
+                "would_copy_to": [],
+            }));
+            continue;
+        }
+
+        // Walk the stages. Empty-stages rules return a no-op outcome and we
+        // resolve templates against the Phase-1 facts (legacy back-compat).
+        let walk = crate::stage_walker::walk(rule, &full_text, &mut caller);
+
+        if walk.filtered {
+            rules_evaluated.push(json!({
+                "rule_label": rule.label,
+                "score": score,
+                "threshold": rule.confidence_threshold,
+                "fired": false,
+                "reason": "filtered",
+                "stages": walk.stages_executed,
+                "resolved_subfolder": Value::Null,
+                "resolved_filename": Value::Null,
+                "would_copy_to": [],
+            }));
+            continue;
+        }
+
+        let (subfolder, filename) = if !walk.slots.is_empty() {
+            (
+                rule_engine::resolve_template_from_slots(&rule.subfolder, &walk.slots),
+                rule_engine::resolve_template_from_slots(&rule.rename_pattern, &walk.slots),
+            )
+        } else {
+            (
+                rule_engine::resolve_template(&rule.subfolder, &classification),
+                rule_engine::resolve_template(&rule.rename_pattern, &classification),
+            )
+        };
+
+        rules_evaluated.push(json!({
+            "rule_label": rule.label,
+            "score": score,
+            "threshold": rule.confidence_threshold,
+            "fired": true,
+            "stages": walk.stages_executed,
+            "resolved_subfolder": subfolder,
+            "resolved_filename": filename,
+            "would_copy_to": rule.copy_to,
+        }));
+    }
+
+    Ok(json!({
+        "ok": true,
+        "doc_path": doc_path,
+        "doc_sha256": sha256,
+        "rules_evaluated": rules_evaluated,
+    }))
+}
+
 /// Inline capability request helper (same contract as in main.rs).
 fn request_capability(
     out: &mut impl io::Write,
