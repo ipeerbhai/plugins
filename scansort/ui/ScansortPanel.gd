@@ -48,6 +48,7 @@ const _ScanTree:       Script = preload("scan_tree.gd")
 const _SourceProvider: Script = preload("scan_tree_source_provider.gd")
 const _VaultProvider:  Script = preload("scan_tree_vault_provider.gd")
 const _StatusPanel:    Script = preload("status_panel.gd")
+const _RulesPane:      Script = preload("rules_pane.gd")
 
 ## R3: add-document dialog (off-tree: no class_name).
 const _AddDocumentDialog: Script = preload("add_document_dialog.gd")
@@ -221,6 +222,8 @@ var _process_cancelled: bool = false
 const LOW_CONFIDENCE_THRESHOLD := 0.5
 const DESTINATION_REGISTRY_FILENAME := "dest_registry.json"
 var _status_panel: HBoxContainer = null
+# W6 (DCR 019e33bf): rules pane below the columns, above the status bar.
+var _rules_pane: VBoxContainer = null
 
 ## U7: per-run counters shared across concurrent coroutines (Dictionary reference
 ## so coroutines can mutate them without capture-by-value issues).
@@ -466,6 +469,13 @@ func _build_ui() -> void:
 	dest_col.add_child(_dest_scroll_content)
 
 	columns.add_child(dest_col)
+
+	# --- W6: Rules pane (between the columns and the status bar) ---
+	_rules_pane = _RulesPane.new()
+	_rules_pane.name = "RulesPane"
+	_rules_pane.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_rules_pane.custom_minimum_size.y = 160
+	layout.add_child(_rules_pane)
 
 	# --- Status bar along the bottom ---
 	_status_panel = _StatusPanel.new()
@@ -794,6 +804,10 @@ func _on_vault_opened_r2(path: String, open_result: Dictionary) -> void:
 		_status_panel.init(conn)
 		_status_panel.set_vault(vault_name, 0)
 		_status_panel.set_status("Idle")
+
+	# W6: kick off the rules-pane refresh now that we have a live connection.
+	if _rules_pane != null and is_instance_valid(_rules_pane):
+		_rules_pane.init(conn)
 
 	# B1: register this vault in the session.
 	if conn != null:
