@@ -48,6 +48,7 @@ mod process;
 mod session;
 mod source;
 mod source_state;
+mod stage_walker;
 mod types;
 mod vault_lifecycle;
 

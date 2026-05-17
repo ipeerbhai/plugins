@@ -41,6 +41,7 @@ use crate::rule_engine::{self, FileFacts};
 use crate::rules_file::FileRule;
 use crate::session;
 use crate::source_state;
+use crate::stage_walker::LlmCaller;
 use crate::types::{Classification, Rule, VaultError, VaultResult};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -134,7 +135,9 @@ pub fn resolve_labels(
 /// Run the deterministic rule engine against a pre-computed classification
 /// and file facts, using only enabled rules.
 ///
-/// Returns the list of fired rule actions from `rule_engine::run`.
+/// Legacy entry point preserved for tests that don't exercise the W2 stage
+/// pipeline. The runtime path (`run` below) uses `apply_rule_engine_with_llm`
+/// which threads a real `LlmCaller` through to `rule_engine::run_with_stages`.
 pub fn apply_rule_engine(
     classification: &Classification,
     file_facts: &FileFacts,
@@ -142,6 +145,66 @@ pub fn apply_rule_engine(
 ) -> rule_engine::RuleWalkOutcome {
     let rule_objs: Vec<Rule> = rules.iter().map(|r| r.clone().into_rule()).collect();
     rule_engine::run(classification, file_facts, &rule_objs)
+}
+
+/// W2 runtime entry: same as `apply_rule_engine` but invokes
+/// `rule_engine::run_with_stages` so rules with `stages` populated run their
+/// per-stage LLM pipelines through the supplied caller.
+pub fn apply_rule_engine_with_llm(
+    classification: &Classification,
+    file_facts: &FileFacts,
+    rules: &[FileRule],
+    document_text: &str,
+    llm: &mut dyn LlmCaller,
+) -> rule_engine::RuleWalkOutcome {
+    let rule_objs: Vec<Rule> = rules.iter().map(|r| r.clone().into_rule()).collect();
+    rule_engine::run_with_stages(classification, file_facts, &rule_objs, document_text, llm)
+}
+
+/// `LlmCaller` adapter that issues `host.providers.chat` capability requests
+/// through the same JSON-RPC out/stdin pipe `process::run` already uses for
+/// Phase-1 classification. Holds mutable references to the IO streams + the
+/// per-call config (model + optional spec).
+struct CapabilityLlmCaller<'a, W: io::Write, I: Iterator<Item = Result<String, io::Error>>> {
+    out: &'a mut W,
+    lines: &'a mut I,
+    next_id: &'a mut u64,
+    model: &'a str,
+    model_spec: Option<&'a Value>,
+}
+
+impl<'a, W: io::Write, I: Iterator<Item = Result<String, io::Error>>> LlmCaller
+    for CapabilityLlmCaller<'a, W, I>
+{
+    fn call(&mut self, messages: Vec<Value>) -> Result<String, String> {
+        let mut chat_args = json!({"messages": messages, "model": self.model});
+        if let Some(spec) = self.model_spec {
+            let is_empty_obj = spec.as_object().map_or(false, |o| o.is_empty());
+            if !spec.is_null() && !is_empty_obj {
+                chat_args["model_spec"] = spec.clone();
+            }
+        }
+        let response = request_capability(
+            self.out,
+            self.lines,
+            self.next_id,
+            "host.providers.chat",
+            chat_args,
+        )?;
+        let text = response
+            .get("choices")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        if text.is_empty() {
+            return Err("empty LLM response from stage call".into());
+        }
+        Ok(text)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +432,25 @@ pub fn run(
                 size: *file_size as i64,
             };
 
-            let outcome = apply_rule_engine(&classification, &file_facts, &enabled_rules);
+            // W2: run rule engine with the stage pipeline. CapabilityLlmCaller
+            // borrows the same IO streams and request-id counter that the Phase-1
+            // chat above used, so per-stage LLM calls reuse the existing channel.
+            let outcome = {
+                let mut caller = CapabilityLlmCaller {
+                    out,
+                    lines,
+                    next_id,
+                    model: &model,
+                    model_spec: model_spec.as_ref(),
+                };
+                apply_rule_engine_with_llm(
+                    &classification,
+                    &file_facts,
+                    &enabled_rules,
+                    &full_text,
+                    &mut caller,
+                )
+            };
 
             if !outcome.matched {
                 // No rule fired.

@@ -35,9 +35,11 @@
 //! Non-parseable `amount` for numeric op → `false`.
 
 use crate::rules;
+use crate::stage_walker::{self, LlmCaller, StageTrace};
 use crate::types::{Classification, ConditionNode, Rule, RuleSignal};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
 // Public output types
@@ -58,6 +60,15 @@ pub struct FiredRuleAction {
     pub encrypt: bool,
     /// The original rule for callers that need access to the full rule object.
     pub rule: Rule,
+    /// W2: accumulated classify-slot values from the rule's stage walk.
+    /// Empty for legacy rules with no `stages`. Used by dryrun_one trace
+    /// output and DCR 019e33a2 trace events.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub slots: BTreeMap<String, String>,
+    /// W2: stage-by-stage trace from the rule's stage walk.
+    /// Empty for legacy rules with no `stages`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages_executed: Vec<StageTrace>,
 }
 
 /// The outcome of running the rule walk over one document.
@@ -73,6 +84,11 @@ pub struct RuleWalkOutcome {
     pub effective_category: String,
     /// True when the walk was halted by a `stop_processing` flag.
     pub halted: bool,
+    /// W2: number of rules that passed Phase-1 thresholding but were filtered
+    /// out by a stage's `keep_when`. Used to surface "considered but rejected"
+    /// counts in dryrun_one and the trace log.
+    #[serde(default)]
+    pub filtered_count: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +341,32 @@ pub fn resolve_template(pattern: &str, classification: &Classification) -> Strin
         .replace("{category}", category_v)
 }
 
+/// W2 (DCR 019e33bf): expand `{slot_name}` tokens in `pattern` using values
+/// from `slots`. Tokens with no corresponding slot fall back to `"unknown"`
+/// (DCR §"Design choices" — no built-in fallback).
+///
+/// This is the new schema's template resolver. The legacy `resolve_template`
+/// is preserved for rules with no `stages` (back-compat with B8 and earlier).
+pub fn resolve_template_from_slots(pattern: &str, slots: &BTreeMap<String, String>) -> String {
+    if pattern.is_empty() {
+        return String::new();
+    }
+    // Replace `{name}` for each known slot; any leftover `{...}` tokens get
+    // a single-pass "unknown" substitution via regex.
+    let mut out = pattern.to_string();
+    for (k, v) in slots {
+        let placeholder = format!("{{{k}}}");
+        let v = if v.is_empty() { "unknown" } else { v.as_str() };
+        out = out.replace(&placeholder, v);
+    }
+    // Catch any token the rule referenced but no slot populated.
+    if out.contains('{') && out.contains('}') {
+        let re = Regex::new(r"\{[A-Za-z_][A-Za-z0-9_]*\}").unwrap();
+        out = re.replace_all(&out, "unknown").to_string();
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Semantic score lookup
 // ---------------------------------------------------------------------------
@@ -404,6 +446,8 @@ pub fn run(
             resolved_rename_pattern,
             encrypt: rule.encrypt,
             rule: (*rule).clone(),
+            slots: BTreeMap::new(),
+            stages_executed: Vec::new(),
         });
 
         if rule.stop_processing {
@@ -423,6 +467,113 @@ pub fn run(
         effective_category,
         halted,
         fired,
+        filtered_count: 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// W2 (DCR 019e33bf): Rule walk with per-rule stage pipeline
+// ---------------------------------------------------------------------------
+
+/// Same Phase-1 thresholding + conditions/exceptions gates as `run`, but for
+/// each rule that passes the gates this also walks the rule's `stages`
+/// pipeline (one LLM call per fold-group). Rules with empty `stages` are
+/// processed legacy-style (template-resolved against Phase-1 facts), so this
+/// can be called even when the library contains a mix of legacy and new-shape
+/// rules — which it always will during the W5 transition window.
+///
+/// `document_text` is forwarded to every stage's LLM call (the same text that
+/// fed Phase-1). `llm` is the caller's adapter; tests use scripted mocks,
+/// production uses a `host.providers.chat` adapter (`process.rs`).
+pub fn run_with_stages(
+    classification: &Classification,
+    file_facts: &FileFacts,
+    rules: &[Rule],
+    document_text: &str,
+    llm: &mut dyn LlmCaller,
+) -> RuleWalkOutcome {
+    let mut indexed: Vec<(usize, &Rule)> = rules
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.enabled)
+        .collect();
+    indexed.sort_by_key(|(idx, r)| (r.order, *idx as i64));
+
+    let facts = FactSet::new(classification, file_facts);
+    let mut fired: Vec<FiredRuleAction> = Vec::new();
+    let mut halted = false;
+    let mut filtered_count: u32 = 0;
+
+    for (_, rule) in &indexed {
+        let score = rule_score(&rule.label, &classification.rule_signals);
+        if score < rule.confidence_threshold {
+            continue;
+        }
+        if let Some(ref cond) = rule.conditions {
+            if !eval_condition(cond, &facts) {
+                continue;
+            }
+        }
+        if let Some(ref exc) = rule.exceptions {
+            if eval_condition(exc, &facts) {
+                continue;
+            }
+        }
+
+        // Pre-filter passed — walk the stages.
+        let stage_outcome = if rule.stages.is_empty() {
+            stage_walker::StageWalkOutcome::default()
+        } else {
+            stage_walker::walk(rule, document_text, llm)
+        };
+
+        if stage_outcome.filtered {
+            filtered_count += 1;
+            continue; // doc_filtered for THIS rule; keep walking other rules
+        }
+
+        // Template resolution: slot-based when stages produced any, else legacy.
+        let (resolved_subfolder, resolved_rename_pattern) = if !stage_outcome.slots.is_empty() {
+            (
+                resolve_template_from_slots(&rule.subfolder, &stage_outcome.slots),
+                resolve_template_from_slots(&rule.rename_pattern, &stage_outcome.slots),
+            )
+        } else {
+            (
+                resolve_template(&rule.subfolder, classification),
+                resolve_template(&rule.rename_pattern, classification),
+            )
+        };
+
+        fired.push(FiredRuleAction {
+            category: rule.label.clone(),
+            copy_to: rule.copy_to.clone(),
+            resolved_subfolder,
+            resolved_rename_pattern,
+            encrypt: rule.encrypt,
+            rule: (*rule).clone(),
+            slots: stage_outcome.slots,
+            stages_executed: stage_outcome.stages_executed,
+        });
+
+        if rule.stop_processing {
+            halted = true;
+            break;
+        }
+    }
+
+    let effective_category = if let Some(first) = fired.first() {
+        first.category.clone()
+    } else {
+        rules::default_category(rules).to_string()
+    };
+
+    RuleWalkOutcome {
+        matched: !fired.is_empty(),
+        effective_category,
+        halted,
+        fired,
+        filtered_count,
     }
 }
 
@@ -1357,5 +1508,204 @@ mod tests {
         // → treated as score 0.0 ≥ 0.0 → FIRES.
         assert!(outcome.matched);
         assert_eq!(outcome.effective_category, "memories");
+    }
+
+    // =========================================================================
+    // W2 (DCR 019e33bf): slot-based template resolution + run_with_stages
+    // =========================================================================
+
+    use crate::stage_walker::LlmCaller;
+    use crate::types::{Slot, SlotValues, Stage};
+    use serde_json::Value;
+
+    struct ScriptedLlm {
+        responses: Vec<String>,
+        calls: u32,
+    }
+    impl LlmCaller for ScriptedLlm {
+        fn call(&mut self, _: Vec<Value>) -> Result<String, String> {
+            let i = self.calls as usize;
+            self.calls += 1;
+            self.responses
+                .get(i)
+                .cloned()
+                .ok_or_else(|| format!("out of scripted responses at call #{}", i + 1))
+        }
+    }
+
+    fn slot_open(d: &str, c: &str) -> Slot {
+        Slot {
+            description: d.to_string(),
+            values: SlotValues::Open(c.to_string()),
+        }
+    }
+    fn slot_closed(d: &str, vs: &[&str]) -> Slot {
+        Slot {
+            description: d.to_string(),
+            values: SlotValues::Closed(vs.iter().map(|s| s.to_string()).collect()),
+        }
+    }
+    fn mk_stages(specs: Vec<(&str, Vec<(&str, Slot)>, Option<&str>)>) -> Vec<Stage> {
+        specs
+            .into_iter()
+            .map(|(ask, slots, kw)| {
+                let mut classify = BTreeMap::new();
+                for (k, v) in slots {
+                    classify.insert(k.to_string(), v);
+                }
+                Stage {
+                    ask: ask.to_string(),
+                    classify,
+                    keep_when: kw.map(String::from),
+                }
+            })
+            .collect()
+    }
+
+    fn rule_with_stages(
+        label: &str,
+        threshold: f64,
+        subfolder: &str,
+        rename_pattern: &str,
+        stages: Vec<Stage>,
+    ) -> Rule {
+        let mut r = make_rule(label, 0, threshold, false, vec![], subfolder, rename_pattern, None, None);
+        r.stages = stages;
+        r
+    }
+
+    // ----- resolve_template_from_slots --------------------------------------
+
+    #[test]
+    fn slot_template_substitutes_known_tokens() {
+        let mut slots = BTreeMap::new();
+        slots.insert("client".to_string(), "Smith".to_string());
+        slots.insert("year".to_string(), "2024".to_string());
+        assert_eq!(
+            resolve_template_from_slots("{client}/{year}", &slots),
+            "Smith/2024"
+        );
+    }
+
+    #[test]
+    fn slot_template_missing_token_falls_back_to_unknown() {
+        let slots = BTreeMap::new();
+        assert_eq!(
+            resolve_template_from_slots("{client}/{year}", &slots),
+            "unknown/unknown"
+        );
+    }
+
+    #[test]
+    fn slot_template_empty_slot_value_falls_back_to_unknown() {
+        let mut slots = BTreeMap::new();
+        slots.insert("client".to_string(), String::new());
+        assert_eq!(
+            resolve_template_from_slots("{client}", &slots),
+            "unknown"
+        );
+    }
+
+    // ----- run_with_stages: tax rule end-to-end -----------------------------
+
+    #[test]
+    fn run_with_stages_tax_rule_fires_and_uses_slot_resolved_templates() {
+        // Phase 1 passes tax above threshold; stage walk returns is_tax=yes, client=Smith, year=2024.
+        let c = make_classification(0, "", "", "", "", 0.9, vec![("tax_by_client", 0.92)]);
+        let f = default_file_facts();
+        let rule = rule_with_stages(
+            "tax_by_client",
+            0.6,
+            "{client}/{year}",
+            "{form}.pdf",
+            mk_stages(vec![
+                (
+                    "Is this tax-relevant?",
+                    vec![("is_tax", slot_closed("tax?", &["yes", "no"]))],
+                    Some("is_tax == 'yes'"),
+                ),
+                (
+                    "Whose form, what kind?",
+                    vec![
+                        ("client", slot_open("name", "name or 'unknown'")),
+                        ("form", slot_closed("form", &["1099", "W-2", "1040"])),
+                        ("year", slot_open("year", "4-digit year")),
+                    ],
+                    Some("client != 'unknown'"),
+                ),
+            ]),
+        );
+        let mut llm = ScriptedLlm {
+            responses: vec![
+                r#"{"is_tax": "yes"}"#.into(),
+                r#"{"client": "Smith", "form": "1099", "year": "2024"}"#.into(),
+            ],
+            calls: 0,
+        };
+        let outcome = run_with_stages(&c, &f, std::slice::from_ref(&rule), "doc text", &mut llm);
+        assert!(outcome.matched);
+        assert_eq!(outcome.fired.len(), 1);
+        let action = &outcome.fired[0];
+        assert_eq!(action.resolved_subfolder, "Smith/2024");
+        assert_eq!(action.resolved_rename_pattern, "1099.pdf");
+        assert_eq!(action.slots.get("form").map(String::as_str), Some("1099"));
+        assert_eq!(action.stages_executed.len(), 2);
+        assert_eq!(outcome.filtered_count, 0);
+    }
+
+    // ----- run_with_stages: lawyer rule with filter that DROPS the doc ------
+
+    #[test]
+    fn run_with_stages_lawyer_rule_filter_failure_drops_doc() {
+        let c = make_classification(0, "", "", "", "", 0.9, vec![("witness", 0.85)]);
+        let f = default_file_facts();
+        let rule = rule_with_stages(
+            "witness",
+            0.6,
+            "cases",
+            "{name}.pdf",
+            mk_stages(vec![
+                (
+                    "Is this a witness doc?",
+                    vec![("is_witness", slot_closed("yes/no", &["yes", "no"]))],
+                    Some("is_witness == 'yes'"),
+                ),
+                (
+                    "Witness name?",
+                    vec![("name", slot_open("name", "a name"))],
+                    None,
+                ),
+            ]),
+        );
+        // Stage 1 returns "no" → keep_when fails → second LLM call never happens.
+        let mut llm = ScriptedLlm {
+            responses: vec![r#"{"is_witness": "no"}"#.into()],
+            calls: 0,
+        };
+        let outcome = run_with_stages(&c, &f, std::slice::from_ref(&rule), "doc text", &mut llm);
+        assert!(!outcome.matched, "filtered rule does not fire");
+        assert_eq!(outcome.filtered_count, 1, "filter failure must increment counter");
+        assert_eq!(llm.calls, 1, "second stage's LLM call must be skipped after filter");
+    }
+
+    // ----- run_with_stages: legacy rule (empty stages) uses old resolver ---
+
+    #[test]
+    fn run_with_stages_legacy_rule_with_no_stages_uses_classification_resolver() {
+        let c = make_classification(2024, "2024-04-15", "Acme", "", "invoice", 0.9,
+            vec![("legacy", 0.8)]);
+        let f = default_file_facts();
+        let rule = make_rule("legacy", 0, 0.6, false, vec![], "{year}", "{issuer}.pdf", None, None);
+        struct PanicLlm;
+        impl LlmCaller for PanicLlm {
+            fn call(&mut self, _: Vec<Value>) -> Result<String, String> {
+                panic!("legacy rule must not trigger LLM call");
+            }
+        }
+        let mut llm = PanicLlm;
+        let outcome = run_with_stages(&c, &f, std::slice::from_ref(&rule), "doc text", &mut llm);
+        assert!(outcome.matched);
+        assert_eq!(outcome.fired[0].resolved_subfolder, "2024");
+        assert_eq!(outcome.fired[0].resolved_rename_pattern, "Acme.pdf");
     }
 }
