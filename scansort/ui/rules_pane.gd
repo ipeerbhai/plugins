@@ -19,6 +19,8 @@ extends VBoxContainer
 ## No `class_name` — off-tree plugin script; use preload().
 
 const _UiScale := preload("ui_scale.gd")
+const _PasteJsonDialog: Script = preload("paste_json_dialog.gd")
+const _DryrunResultDialog: Script = preload("dryrun_result_dialog.gd")
 
 # ---------------------------------------------------------------------------
 # State
@@ -201,6 +203,23 @@ func _build_row(rule: Dictionary) -> Control:
 	fired.add_theme_color_override("font_color", Color(0.55, 0.55, 0.55))
 	top.add_child(fired)
 
+	# W7: row menu — [⋮]
+	var menu_btn := MenuButton.new()
+	menu_btn.text = "⋮"
+	menu_btn.tooltip_text = "Row actions"
+	var popup := menu_btn.get_popup()
+	popup.add_item("Test on…", 0)
+	popup.add_item("Move up", 1)
+	popup.add_item("Move down", 2)
+	popup.add_separator()
+	popup.add_item("View JSON", 3)
+	popup.add_item("Edit JSON", 4)
+	popup.add_item("Duplicate", 5)
+	popup.add_separator()
+	popup.add_item("Delete…", 6)
+	popup.id_pressed.connect(_on_row_menu_id_pressed.bind(label_key))
+	top.add_child(menu_btn)
+
 	vbox.add_child(top)
 
 	# Instruction excerpt — single line, truncated.
@@ -252,3 +271,183 @@ func _async_set_enabled(label: String, enabled: bool) -> void:
 	# Refresh so the canonical state reflects what the library says, not
 	# what the user clicked (in case the call failed).
 	refresh()
+
+
+# ---------------------------------------------------------------------------
+# W7: Row menu dispatch
+# ---------------------------------------------------------------------------
+
+func _on_row_menu_id_pressed(id: int, label: String) -> void:
+	if _connection == null or label.is_empty():
+		return
+	var rule: Dictionary = _find_rule(label)
+	if rule.is_empty():
+		return
+	match id:
+		0: _row_action_test_on(rule)
+		1: _row_action_move(label, -1)
+		2: _row_action_move(label, +1)
+		3: _row_action_view_json(rule)
+		4: _row_action_edit_json(rule)
+		5: _row_action_duplicate(rule)
+		6: _row_action_delete(label)
+
+
+func _find_rule(label: String) -> Dictionary:
+	for r in _rules:
+		if str(r.get("label", "")) == label:
+			return r
+	return {}
+
+
+# ----- Test on… -----
+
+func _row_action_test_on(rule: Dictionary) -> void:
+	var picker := FileDialog.new()
+	picker.file_mode = FileDialog.FILE_MODE_OPEN_FILE
+	picker.access = FileDialog.ACCESS_FILESYSTEM
+	picker.title = "Pick a document to dry-run against rule '%s'" % str(rule.get("label", ""))
+	picker.filters = PackedStringArray([
+		"*.pdf,*.txt,*.md,*.docx,*.xlsx,*.html ; Documents",
+		"* ; All files",
+	])
+	add_child(picker)
+	picker.file_selected.connect(
+		func(path: String) -> void:
+			picker.queue_free()
+			_async_run_dryrun(rule, path)
+	)
+	picker.canceled.connect(func() -> void: picker.queue_free())
+	picker.popup_centered_ratio(0.7)
+
+
+func _async_run_dryrun(rule: Dictionary, doc_path: String) -> void:
+	var args: Dictionary = {
+		"doc_path": doc_path,
+		"rule_label": str(rule.get("label", "")),
+	}
+	var result: Dictionary = await _connection.call_tool(
+		"minerva_scansort_dryrun_one", args)
+	var dlg = _DryrunResultDialog.new()
+	add_child(dlg)
+	dlg.set_result(result)
+	dlg.confirmed.connect(func() -> void: dlg.queue_free())
+	dlg.canceled.connect(func() -> void: dlg.queue_free())
+	dlg.popup_centered()
+
+
+# ----- Move up / down -----
+
+func _row_action_move(label: String, delta: int) -> void:
+	var idx: int = -1
+	for i in range(_rules.size()):
+		if str(_rules[i].get("label", "")) == label:
+			idx = i
+			break
+	if idx < 0:
+		return
+	var new_idx: int = idx + delta
+	if new_idx < 0 or new_idx >= _rules.size():
+		return
+	var labels: Array[String] = []
+	for r in _rules:
+		labels.append(str(r.get("label", "")))
+	var moved: String = labels[idx]
+	labels.remove_at(idx)
+	labels.insert(new_idx, moved)
+	_async_reorder(labels)
+
+
+func _async_reorder(labels: Array[String]) -> void:
+	var arr: Array = []
+	for l in labels:
+		arr.append(l)
+	var _result: Dictionary = await _connection.call_tool(
+		"minerva_scansort_library_reorder_rules", {"order": arr})
+	refresh()
+
+
+# ----- View / Edit JSON -----
+
+func _row_action_view_json(rule: Dictionary) -> void:
+	var dlg = _PasteJsonDialog.new()
+	add_child(dlg)
+	dlg.configure(_PasteJsonDialog.Mode.MODE_READONLY, JSON.stringify(rule, "\t"))
+	dlg.cancelled.connect(func() -> void: dlg.queue_free())
+	dlg.popup_centered()
+
+
+func _row_action_edit_json(rule: Dictionary) -> void:
+	var dlg = _PasteJsonDialog.new()
+	add_child(dlg)
+	# Save handler: parsed -> Dictionary, mode -> int. Returns {ok, error?}.
+	var save_cb := func(parsed: Dictionary, _mode: int) -> Dictionary:
+		return await _save_rule_via_library(parsed, true, str(rule.get("label", "")))
+	dlg.configure(_PasteJsonDialog.Mode.MODE_EDIT, JSON.stringify(rule, "\t"), save_cb)
+	dlg.saved.connect(func(_parsed: Dictionary) -> void:
+		dlg.queue_free()
+		refresh()
+	)
+	dlg.cancelled.connect(func() -> void: dlg.queue_free())
+	dlg.popup_centered()
+
+
+# ----- Duplicate -----
+
+func _row_action_duplicate(rule: Dictionary) -> void:
+	var copy: Dictionary = rule.duplicate(true)
+	var orig_label: String = str(copy.get("label", "rule"))
+	copy["label"] = "%s_copy" % orig_label
+	_async_insert(copy)
+
+
+func _async_insert(payload: Dictionary) -> void:
+	var result: Dictionary = await _connection.call_tool(
+		"minerva_scansort_library_insert_rule", payload)
+	if not result.get("ok", false):
+		push_warning("[RulesPane] duplicate failed: %s" % str(result.get("error", "?")))
+	refresh()
+
+
+# ----- Delete -----
+
+func _row_action_delete(label: String) -> void:
+	var confirm := ConfirmationDialog.new()
+	confirm.title = "Delete rule?"
+	confirm.dialog_text = "Delete rule '%s'? This cannot be undone." % label
+	add_child(confirm)
+	confirm.confirmed.connect(func() -> void:
+		confirm.queue_free()
+		_async_delete(label)
+	)
+	confirm.canceled.connect(func() -> void: confirm.queue_free())
+	confirm.popup_centered()
+
+
+func _async_delete(label: String) -> void:
+	var _result: Dictionary = await _connection.call_tool(
+		"minerva_scansort_library_delete_rule", {"label": label})
+	refresh()
+
+
+# ----- Shared save helper -----
+
+## Updates an existing rule via library_update_rule when `is_edit=true` and
+## the parsed JSON's `label` matches `original_label`. If the user changed
+## the label in edit mode, we treat it as insert (new label) and the old
+## one stays untouched — the dialog never auto-deletes.
+##
+## Returns the {ok:bool, error?:String} contract that paste_json_dialog
+## expects from its save_callable.
+func _save_rule_via_library(
+		parsed: Dictionary,
+		_is_edit: bool,
+		_original_label: String) -> Dictionary:
+	# library_update_rule only changes named fields; for a full-document
+	# overwrite we use library_insert_rule (upsert) which handles both
+	# new and existing labels identically. Simpler than diffing fields.
+	var result: Dictionary = await _connection.call_tool(
+		"minerva_scansort_library_insert_rule", parsed)
+	if result.get("ok", false):
+		return {"ok": true}
+	return {"ok": false, "error": str(result.get("error", "library_insert_rule failed"))}
