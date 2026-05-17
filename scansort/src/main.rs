@@ -612,6 +612,7 @@ fn handle_render_pages(params: &Value, id: Value) -> RpcResponse {
 // ---------------------------------------------------------------------------
 
 fn handle_insert_rule(params: &Value, id: Value) -> RpcResponse {
+    log::warn!("[DEPRECATED] minerva_scansort_insert_rule called — use minerva_scansort_library_insert_rule instead (W11, DCR 019e33bf)");
     let args = params.get("arguments").unwrap_or(params);
     let rules_path = args.get("rules_path").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -690,6 +691,7 @@ fn handle_insert_rule(params: &Value, id: Value) -> RpcResponse {
 }
 
 fn handle_list_rules(params: &Value, id: Value) -> RpcResponse {
+    log::warn!("[DEPRECATED] minerva_scansort_list_rules called — use minerva_scansort_library_list_rules instead (W11, DCR 019e33bf)");
     let args = params.get("arguments").unwrap_or(params);
     let rules_path = args.get("rules_path").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -733,6 +735,7 @@ fn handle_list_rules(params: &Value, id: Value) -> RpcResponse {
 }
 
 fn handle_get_rule(params: &Value, id: Value) -> RpcResponse {
+    log::warn!("[DEPRECATED] minerva_scansort_get_rule called — use minerva_scansort_library_get_rule instead (W11, DCR 019e33bf)");
     let args = params.get("arguments").unwrap_or(params);
     let rules_path = args.get("rules_path").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -786,6 +789,7 @@ fn handle_get_rule(params: &Value, id: Value) -> RpcResponse {
 }
 
 fn handle_update_rule(params: &Value, id: Value) -> RpcResponse {
+    log::warn!("[DEPRECATED] minerva_scansort_update_rule called — use minerva_scansort_library_update_rule instead (W11, DCR 019e33bf)");
     let args = params.get("arguments").unwrap_or(params);
     let rules_path = args.get("rules_path").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -862,6 +866,7 @@ fn handle_update_rule(params: &Value, id: Value) -> RpcResponse {
 }
 
 fn handle_delete_rule(params: &Value, id: Value) -> RpcResponse {
+    log::warn!("[DEPRECATED] minerva_scansort_delete_rule called — use minerva_scansort_library_delete_rule instead (W11, DCR 019e33bf)");
     let args = params.get("arguments").unwrap_or(params);
     let rules_path = args.get("rules_path").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -900,6 +905,7 @@ fn handle_delete_rule(params: &Value, id: Value) -> RpcResponse {
 }
 
 fn handle_import_rules_from_json(params: &Value, id: Value) -> RpcResponse {
+    log::warn!("[DEPRECATED] minerva_scansort_import_rules_from_json called — use minerva_scansort_library_insert_rule (one per rule) instead (W11, DCR 019e33bf)");
     let args = params.get("arguments").unwrap_or(params);
     let rules_path = args.get("rules_path").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -2748,7 +2754,7 @@ fn main() {
                     },
                     {
                         "name": "minerva_scansort_insert_rule",
-                        "description": "Deprecated for direct LLM use — prefer library_* tools. Path-driven CRUD is retained as the implementation of library_export_to_sidecar / library_import_from_sidecar. Insert or replace a classification rule in the rules file. Pass `rules_path` (preferred) — the new external rules JSON. Legacy `path`/`password` args are accepted for back-compat but write operations against the embedded vault rules table are no longer supported (returns an error pointing at rules_path).",
+                        "description": "[DEPRECATED — use minerva_scansort_library_* instead] Path-driven CRUD is retained as the implementation of library_export_to_sidecar / library_import_from_sidecar; physical removal scheduled for next major. Insert or replace a classification rule in the rules file. Pass `rules_path` (preferred) — the new external rules JSON. Legacy `path`/`password` args are accepted for back-compat but write operations against the embedded vault rules table are no longer supported (returns an error pointing at rules_path).",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -2771,7 +2777,7 @@ fn main() {
                     },
                     {
                         "name": "minerva_scansort_list_rules",
-                        "description": "Deprecated for direct LLM use — prefer library_* tools. Path-driven CRUD is retained as the implementation of library_export_to_sidecar / library_import_from_sidecar. List classification rules from a rules file (preferred) or the legacy embedded vault rules table (read-only, deprecated). Returns {ok, rules, count, rules_path?, deprecated?}.",
+                        "description": "[DEPRECATED — use minerva_scansort_library_* instead] Path-driven CRUD is retained as the implementation of library_export_to_sidecar / library_import_from_sidecar; physical removal scheduled for next major. List classification rules from a rules file (preferred) or the legacy embedded vault rules table (read-only, deprecated). Returns {ok, rules, count, rules_path?, deprecated?}.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -2783,7 +2789,7 @@ fn main() {
                     },
                     {
                         "name": "minerva_scansort_get_rule",
-                        "description": "Deprecated for direct LLM use — prefer library_* tools. Path-driven CRUD is retained as the implementation of library_export_to_sidecar / library_import_from_sidecar. Get a single classification rule. Use rules_path + label (preferred) or the legacy embedded-table read path. Returns {ok, rule}.",
+                        "description": "[DEPRECATED — use minerva_scansort_library_* instead] Path-driven CRUD is retained as the implementation of library_export_to_sidecar / library_import_from_sidecar; physical removal scheduled for next major. Get a single classification rule. Use rules_path + label (preferred) or the legacy embedded-table read path. Returns {ok, rule}.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -2797,7 +2803,7 @@ fn main() {
                     },
                     {
                         "name": "minerva_scansort_update_rule",
-                        "description": "Deprecated for direct LLM use — prefer library_* tools. Path-driven CRUD is retained as the implementation of library_export_to_sidecar / library_import_from_sidecar. Update fields of an existing classification rule by label. Pass rules_path (preferred). Legacy path returns deprecation error.",
+                        "description": "[DEPRECATED — use minerva_scansort_library_* instead] Path-driven CRUD is retained as the implementation of library_export_to_sidecar / library_import_from_sidecar; physical removal scheduled for next major. Update fields of an existing classification rule by label. Pass rules_path (preferred). Legacy path returns deprecation error.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -2812,7 +2818,7 @@ fn main() {
                     },
                     {
                         "name": "minerva_scansort_delete_rule",
-                        "description": "Deprecated for direct LLM use — prefer library_* tools. Path-driven CRUD is retained as the implementation of library_export_to_sidecar / library_import_from_sidecar. Delete a classification rule by label. Refuses to delete rules marked is_default. Pass rules_path (preferred).",
+                        "description": "[DEPRECATED — use minerva_scansort_library_* instead] Path-driven CRUD is retained as the implementation of library_export_to_sidecar / library_import_from_sidecar; physical removal scheduled for next major. Delete a classification rule by label. Refuses to delete rules marked is_default. Pass rules_path (preferred).",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -2826,7 +2832,7 @@ fn main() {
                     },
                     {
                         "name": "minerva_scansort_import_rules_from_json",
-                        "description": "Deprecated for direct LLM use — prefer library_* tools. Path-driven CRUD is retained as the implementation of library_export_to_sidecar / library_import_from_sidecar. Bulk import classification rules into a rules file. json_text accepts a full RulesFile object (replaces file content), a bare array, or an object with a 'rules'/'categories' key (upserts entries into the existing or new file). Returns {ok, count, mode, rules_path}.",
+                        "description": "[DEPRECATED — use minerva_scansort_library_* instead] Path-driven CRUD is retained as the implementation of library_export_to_sidecar / library_import_from_sidecar; physical removal scheduled for next major. Bulk import classification rules into a rules file. json_text accepts a full RulesFile object (replaces file content), a bare array, or an object with a 'rules'/'categories' key (upserts entries into the existing or new file). Returns {ok, count, mode, rules_path}.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
